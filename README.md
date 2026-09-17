@@ -92,6 +92,14 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
 
 ## How ATK uses it
 
+ATK's `install.bat` runs `get_atkdsp.bat` (section 7c): it clones or
+fast-forwards this repo into `vendor\atkdsp`, runs `build.bat` with the
+MSVC tools and the cmake/ninja install.bat already put into ATK's env,
+checks the DLL loads through ATK's own Python, and reports `[OK] atkdsp` or
+`[--] atkdsp` with the reason. A failure never fails the install. Run
+`get_atkdsp.bat` on its own to update, `get_atkdsp.bat /rebuild` to build
+again.
+
 ATK loads it through `atk/core/dsp_native.py`, which looks in
 `vendor\atkdsp\bin\`, then a sibling `..\atkdsp\bin\` checkout, then PATH —
 one discovery order, so there is never a second copy loaded. If the library
@@ -134,4 +142,3 @@ each is its own project with its own verification.
 
 Same terms as ATK. `vendor/pocketfft` is BSD-3 (its `LICENSE.md` is kept
 beside it).
-"# atkdsp" 

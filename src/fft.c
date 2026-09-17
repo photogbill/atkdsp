@@ -163,6 +163,10 @@ ptrdiff_t atkdsp_spectrum_reduce(const atkdsp_fft *p, const atkdsp_cf32 *in,
     int used[MAX_SLOTS];
     memset(used, 0, sizeof used);
     int rc = ATKDSP_OK;
+    /* MSVC implements OpenMP 2.0, which rejects a loop variable DECLARED in
+     * the for-initialiser (error C3015). Declared here, it is made private
+     * to each thread by the pragma. Found on the first Windows build. */
+    long long f;
 
 #ifdef _OPENMP
     int nthreads = atkdsp_get_threads();
@@ -170,7 +174,7 @@ ptrdiff_t atkdsp_spectrum_reduce(const atkdsp_fft *p, const atkdsp_cf32 *in,
     if (nthreads < 1) nthreads = 1;
 #   pragma omp parallel for num_threads(nthreads) schedule(static)
 #endif
-    for (long long f = 0; f < frames; ++f) {
+    for (f = 0; f < frames; ++f) {
         const int s = slot_index(p);
         double *sc = p->scratch + (size_t)s * 2 * n;
         float  *acc = p->acc + (size_t)s * n;

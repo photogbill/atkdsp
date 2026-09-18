@@ -38,7 +38,7 @@ __all__ = [
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 2
+ABI_VERSION = 5
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -684,4 +684,188 @@ class Ddc:
         return out[:got]
 
 
-__all__ += ["design_lowpass", "Ddc"]
+
+
+# -- 11. LTE cell search --------------------------------------------------------
+class _LteCell(C.Structure):
+    _fields_ = [("nid2", C.c_int), ("nid1", C.c_int), ("pci", C.c_int),
+                ("subframe", C.c_int), ("offset", C.c_longlong),
+                ("metric", C.c_float), ("sss_score", C.c_float),
+                ("cfo_hz", C.c_float)]
+
+
+class _LteMib(C.Structure):
+    _fields_ = [("dl_bw_rb", C.c_int), ("phich_dur", C.c_int),
+                ("phich_res", C.c_int), ("sfn", C.c_int), ("n_ports", C.c_int)]
+
+
+class _PrachHit(C.Structure):
+    _fields_ = [("root", C.c_int), ("count", C.c_int),
+                ("metric", C.c_float), ("delay", C.c_int)]
+
+
+LTE_RATE = 1_920_000
+LTE_SYM = 128
+LTE_PSS_PERIOD = 9600
+LTE_FRAME = 19200
+LTE_PBCH_OFFSET = 128
+LTE_PBCH_BLOCK = 549
+PRACH_NZC = 839
+
+
+def _bind_lte(lib) -> None:
+    P = C.POINTER
+    cf = P(_Cf32)
+    lib.atkdsp_lte_create.restype = C.c_void_p
+    lib.atkdsp_lte_destroy.argtypes = [C.c_void_p]
+    lib.atkdsp_lte_pss_symbol.restype = C.c_int
+    lib.atkdsp_lte_pss_symbol.argtypes = [C.c_int, cf]
+    lib.atkdsp_lte_sss_symbol.restype = C.c_int
+    lib.atkdsp_lte_sss_symbol.argtypes = [C.c_int, C.c_int, C.c_int, P(C.c_float)]
+    lib.atkdsp_lte_detect.restype = C.c_ssize_t
+    lib.atkdsp_lte_detect.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_float,
+                                      P(_LteCell), C.c_size_t]
+    lib.atkdsp_lte_gold.restype = C.c_int
+    lib.atkdsp_lte_gold.argtypes = [C.c_uint, C.c_int, P(C.c_byte)]
+    lib.atkdsp_lte_mib_decode.restype = C.c_int
+    lib.atkdsp_lte_mib_decode.argtypes = [C.c_void_p, cf, C.c_int, C.c_double,
+                                          P(_LteMib)]
+    lib.atkdsp_lte_mib_decode_combined.restype = C.c_int
+    lib.atkdsp_lte_mib_decode_combined.argtypes = [C.c_void_p, cf, C.c_int,
+                                          C.c_ssize_t, C.c_int, C.c_double,
+                                          P(_LteMib)]
+    lib.atkdsp_prach_create.restype = C.c_void_p
+    lib.atkdsp_prach_destroy.argtypes = [C.c_void_p]
+    lib.atkdsp_prach_zc.restype = C.c_int
+    lib.atkdsp_prach_zc.argtypes = [C.c_int, cf]
+    lib.atkdsp_prach_detect.restype = C.c_ssize_t
+    lib.atkdsp_prach_detect.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_float,
+                                        P(_PrachHit), C.c_size_t]
+    lib.atkdsp_prach_scan.restype = C.c_ssize_t
+    lib.atkdsp_prach_scan.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_int,
+                                      C.c_float, P(_PrachHit), C.c_size_t]
+
+
+_BIND_EXTRA.append(_bind_lte)
+
+
+def lte_pss_symbol(nid2: int) -> np.ndarray:
+    out = np.empty(LTE_SYM, dtype=np.complex64)
+    _check(load().atkdsp_lte_pss_symbol(int(nid2), _cfp(out)), "lte_pss_symbol")
+    return out
+
+
+def lte_sss_symbol(nid1: int, nid2: int, subframe: int) -> np.ndarray:
+    out = np.empty(62, dtype=np.float32)
+    _check(load().atkdsp_lte_sss_symbol(int(nid1), int(nid2), int(subframe),
+                                        _fp(out)), "lte_sss_symbol")
+    return out
+
+
+def lte_gold(c_init: int, length: int) -> np.ndarray:
+    """36.211 7.2 Gold sequence, length <= 1920 (0/1 as int8)."""
+    out = np.empty(int(length), dtype=np.int8)
+    ptr = out.ctypes.data_as(C.POINTER(C.c_byte))
+    _check(load().atkdsp_lte_gold(int(c_init) & 0xFFFFFFFF, int(length), ptr),
+           "lte_gold")
+    return out
+
+
+class Lte:
+    """LTE cell search. Feed it I/Q at LTE_RATE; it finds cells."""
+
+    def __init__(self):
+        self._lib = load()
+        self._h = self._lib.atkdsp_lte_create()
+        if not self._h:
+            raise AtkDspError("lte_create failed")
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_lte_destroy(h)
+
+    def detect(self, x, min_metric: float = 0.06, max_cells: int = 4) -> list:
+        x = _cf32(x, "x")
+        buf = (_LteCell * int(max_cells))()
+        got = _check(self._lib.atkdsp_lte_detect(self._h, _cfp(x), x.size,
+                                                 float(min_metric), buf,
+                                                 int(max_cells)), "lte_detect")
+        return [{"nid2": c.nid2, "nid1": c.nid1, "pci": c.pci,
+                 "subframe": c.subframe, "offset": int(c.offset),
+                 "metric": float(c.metric), "sss_score": float(c.sss_score),
+                 "cfo_hz": float(c.cfo_hz)} for c in buf[:got]]
+
+    @staticmethod
+    def _mib_dict(m):
+        return {"dl_bw_rb": m.dl_bw_rb, "phich_dur": m.phich_dur,
+                "phich_res": m.phich_res, "sfn": m.sfn, "n_ports": m.n_ports}
+
+    def mib_decode(self, block, n_id: int, cfo_hz: float = 0.0):
+        """Decode the MIB from one PBCH block (>= LTE_PBCH_BLOCK samples).
+        Returns a dict or None."""
+        block = _cf32(block, "block")
+        out = _LteMib()
+        rc = _check(self._lib.atkdsp_lte_mib_decode(self._h, _cfp(block),
+                    int(n_id), float(cfo_hz), C.byref(out)), "lte_mib_decode")
+        return self._mib_dict(out) if rc == 1 else None
+
+    def mib_decode_frames(self, blocks, n_id: int, cfo_hz: float = 0.0):
+        """Soft-combine consecutive PBCH blocks. `blocks` is a list of arrays
+        (each >= LTE_PBCH_BLOCK samples). Returns a dict or None."""
+        buf = np.concatenate([_cf32(b, "block")[:LTE_PBCH_BLOCK] for b in blocks])
+        out = _LteMib()
+        rc = _check(self._lib.atkdsp_lte_mib_decode_combined(self._h, _cfp(buf),
+                    len(blocks), LTE_PBCH_BLOCK, int(n_id), float(cfo_hz),
+                    C.byref(out)), "lte_mib_decode_combined")
+        return self._mib_dict(out) if rc == 1 else None
+
+
+
+def prach_zc(u: int) -> np.ndarray:
+    """Frequency-domain Zadoff-Chu root sequence (839 values)."""
+    out = np.empty(PRACH_NZC, dtype=np.complex64)
+    _check(load().atkdsp_prach_zc(int(u), _cfp(out)), "prach_zc")
+    return out
+
+
+class Prach:
+    """Passive PRACH handset-presence detector. Feed a sequence window
+    (>= PRACH_NZC samples at the PRACH rate); get the preambles present."""
+
+    def __init__(self):
+        self._lib = load()
+        self._h = self._lib.atkdsp_prach_create()
+        if not self._h:
+            raise AtkDspError("prach_create failed")
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_prach_destroy(h)
+
+    def detect(self, seq, min_metric: float = 0.0, max_hits: int = 16) -> list:
+        seq = _cf32(seq, "seq")
+        buf = (_PrachHit * int(max_hits))()
+        got = _check(self._lib.atkdsp_prach_detect(self._h, _cfp(seq), seq.size,
+                     float(min_metric), buf, int(max_hits)), "prach_detect")
+        return [{"root": h.root, "count": h.count,
+                 "metric": float(h.metric), "delay": h.delay}
+                for h in buf[:got]]
+
+    def scan(self, stream, win_step: int = 64, min_metric: float = 0.0,
+             max_hits: int = 16) -> list:
+        """Slide a window across a longer uplink capture; merge by root."""
+        stream = _cf32(stream, "stream")
+        buf = (_PrachHit * int(max_hits))()
+        got = _check(self._lib.atkdsp_prach_scan(self._h, _cfp(stream),
+                     stream.size, int(win_step), float(min_metric), buf,
+                     int(max_hits)), "prach_scan")
+        return [{"root": h.root, "count": h.count,
+                 "metric": float(h.metric), "delay": h.delay}
+                for h in buf[:got]]
+
+
+__all__ += ["design_lowpass", "Ddc", "Lte", "lte_pss_symbol", "lte_sss_symbol",
+            "lte_gold", "LTE_RATE", "LTE_SYM", "LTE_PSS_PERIOD", "LTE_FRAME",
+            "LTE_PBCH_OFFSET", "LTE_PBCH_BLOCK", "Prach", "prach_zc", "PRACH_NZC"]

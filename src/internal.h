@@ -44,4 +44,23 @@ ATK_INLINE double atk_wrap(double ph) {
 void *atk_aligned_malloc(size_t bytes);
 void  atk_aligned_free(void *p);
 
+/* ---- LTE handle -------------------------------------------------------
+ * Defined here, not in the ABI (atkdsp.h exposes only the opaque typedef),
+ * so src/lte.c (PSS/SSS) and src/lte_pbch.c (PBCH->MIB) — and the SIB
+ * decoders to come — share one handle and one cached 128-point FFT plan.
+ * atkdsp_lte_create / _destroy live in src/lte.c and own every field. */
+#define ATK_LTE_VIT_LAPS 3            /* wrap-around laps for the TB Viterbi */
+struct atkdsp_lte {
+    atkdsp_cf32 *pss;         /* 3 * 128  reference symbols, time domain     */
+    atkdsp_cf32 *pss_freq;    /* 3 * 62   reference values, frequency        */
+    float       *sss;         /* 3 * 336 * 62, +1/-1                         */
+    float        pss_energy[3];
+    atkdsp_fft  *sym;         /* a 128-point plan, reused by SSS and PBCH    */
+    atkdsp_fft  *scan;        /* the scan plan and its scratch               */
+    size_t       scan_n;
+    atkdsp_cf32 *X, *P, *Z;   /* scan_n each                                 */
+    double      *energy;      /* scan_n running |x|^2 over 128               */
+    int32_t     *vit_bp;      /* ATK_LTE_VIT_LAPS*40*64 Viterbi backpointers */
+};
+
 #endif

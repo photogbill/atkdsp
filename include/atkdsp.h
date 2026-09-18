@@ -28,7 +28,7 @@
  *      missing symbol rather than the sentence the version check exists to
  *      print. A number that goes up is cheap; a mismatch that reports itself
  *      as something else is not. (Bumped 1 -> 2 on 2026-09-18 for
- *      atkdsp_unpack_dc.)
+ *      atkdsp_unpack_dc.) 2 -> 3 for the LTE cell search.
  *
  * Sample convention: complex float32 as {re, im} pairs (same memory layout as
  * numpy complex64). All sizes are in SAMPLES unless the name says bytes.
@@ -56,8 +56,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 2
-#define ATKDSP_VERSION_STRING "0.3.0"
+#define ATKDSP_ABI_VERSION 5
+#define ATKDSP_VERSION_STRING "0.4.0"
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -291,6 +291,132 @@ ATKDSP_API int atkdsp_ddc_describe(const atkdsp_ddc *d, char *buf, size_t cap);
  * *up / *down are the final resampler ratio (1/1 when none is needed). */
 ATKDSP_API int atkdsp_ddc_plan(const atkdsp_ddc *d, unsigned *factors, unsigned *ntaps,
                                size_t cap, unsigned *up, unsigned *down);
+
+
+/* ---- 11. LTE cell search: PSS, SSS, PCI --------------------------------
+ * Finds LTE downlink cells in a stream that has been brought to
+ * ATKDSP_LTE_RATE — 1.92 MSPS, the 128-point/15 kHz numerology. The caller
+ * does that with a DDC; every LTE cell puts its synchronisation signals in
+ * the middle 1.08 MHz whatever its channel bandwidth, so a 1.4 MHz slice of
+ * a 20 MHz carrier is enough to find and identify it. That is what makes a
+ * survey cheap.
+ *
+ * What it does NOT do, on purpose: decode anything. PBCH -> MIB, blind
+ * PDCCH search and the SIBs are turbo and polar decoding, rate matching and
+ * channel estimation — a different kind of project with mature open
+ * implementations. This answers "is there a cell here, which one, how
+ * strong, how far off frequency", which is the question a survey and a
+ * fake-tower check actually ask.
+ *
+ * `metric` is a normalised correlation, 0..1, so it does not move with gain.
+ * A cell is only reported when the 5 ms PSS repeat is also present, which is
+ * what keeps noise and one-off impulses out (measured: nothing on eight
+ * seeds of pure noise, correct PCI down to -3 dB SNR). */
+#define ATKDSP_LTE_RATE      1920000.0   /* the rate the input must be at */
+#define ATKDSP_LTE_SYM       128         /* samples in one OFDM symbol     */
+#define ATKDSP_LTE_PSS_PERIOD 9600       /* 5 ms: PSS is in slots 0 and 10 */
+
+typedef struct {
+    int       nid2;       /* 0..2, from the PSS                            */
+    int       nid1;       /* 0..167, from the SSS; -1 if it was not read   */
+    int       pci;        /* 3*nid1 + nid2; -1 if nid1 is unknown          */
+    int       subframe;   /* 0 or 5 (the SSS says which); -1 if unknown    */
+    long long offset;     /* index of the first PSS sample in the input    */
+    float     metric;     /* normalised PSS correlation peak, 0..1         */
+    float     sss_score;  /* mean SSS correlation, 0..1                    */
+    float     cfo_hz;     /* carrier frequency offset of the cell          */
+} atkdsp_lte_cell;
+
+typedef struct atkdsp_lte atkdsp_lte;
+ATKDSP_API atkdsp_lte *atkdsp_lte_create(void);
+ATKDSP_API void        atkdsp_lte_destroy(atkdsp_lte *h);
+/* The reference PSS symbol for one N_ID^(2), 128 samples — for tests and
+ * for a caller that wants to draw it. */
+ATKDSP_API int         atkdsp_lte_pss_symbol(int nid2, atkdsp_cf32 *out);
+/* The 62 SSS values (+1/-1) for one cell and subframe. */
+ATKDSP_API int         atkdsp_lte_sss_symbol(int nid1, int nid2, int subframe,
+                                             float *out62);
+/* Scan `in` (at ATKDSP_LTE_RATE) for cells. Needs at least two PSS periods
+ * to confirm the 5 ms repeat. Returns how many cells were written. */
+ATKDSP_API ptrdiff_t   atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in,
+                                         size_t n, float min_metric,
+                                         atkdsp_lte_cell *out, size_t cap);
+
+/* ---- 11b. LTE PBCH -> MIB ----------------------------------------------
+ * The Master Information Block: downlink bandwidth, PHICH config, antenna
+ * count and system frame number. Broadcast and public — the network's own
+ * parameters, nothing about any subscriber. Decoded from slot-1 symbols
+ * 0..3 of subframe 0 (CRS channel estimate, transmit-diversity combine,
+ * tail-biting Viterbi, CRC-16 with the antenna mask). */
+#define ATKDSP_LTE_FRAME       19200  /* samples in a 10 ms radio frame     */
+#define ATKDSP_LTE_PBCH_OFFSET 128    /* PSS data-start -> PBCH block start  */
+#define ATKDSP_LTE_PBCH_BLOCK  549    /* samples: 4 OFDM symbols with CP     */
+
+typedef struct {
+    int dl_bw_rb;    /* downlink bandwidth in resource blocks: 6..100      */
+    int phich_dur;   /* 0 normal, 1 extended                               */
+    int phich_res;   /* 0..3: oneSixth / half / one / two                  */
+    int sfn;         /* full 10-bit system frame number                    */
+    int n_ports;     /* 1, 2 or 4 antenna ports (from the CRC mask)        */
+} atkdsp_lte_mib;
+
+/* Gold sequence (36.211 7.2); length <= 1920. Exposed for tests. */
+ATKDSP_API int atkdsp_lte_gold(unsigned c_init, int length, signed char *out);
+
+/* Decode the MIB from one PBCH block. `block` points at the first sample
+ * (including its cyclic prefix) of the 4-symbol block, ATKDSP_LTE_PBCH_OFFSET
+ * samples after the subframe-0 PSS offset atkdsp_lte_detect returns; it needs
+ * ATKDSP_LTE_PBCH_BLOCK samples. `cfo_hz` is the cell offset from detect (0
+ * to skip). Returns 1 decoded, 0 none, <0 error. */
+ATKDSP_API int atkdsp_lte_mib_decode(atkdsp_lte *h, const atkdsp_cf32 *block,
+                                     int n_id, double cfo_hz,
+                                     atkdsp_lte_mib *out);
+/* Soft-combine up to `nframes` consecutive PBCH blocks (stride
+ * ATKDSP_LTE_FRAME apart) for weak cells: every single frame first, then
+ * every aligned 4-frame window. `base` points at the first block. */
+ATKDSP_API int atkdsp_lte_mib_decode_combined(atkdsp_lte *h,
+                                     const atkdsp_cf32 *base, int nframes,
+                                     ptrdiff_t stride, int n_id,
+                                     double cfo_hz, atkdsp_lte_mib *out);
+
+/* ---- 11c. Passive PRACH handset-presence detector ----------------------
+ * Finds the Zadoff-Chu access preamble a powered handset sends when it
+ * reaches a cell. PRESENCE and location only, never identity: it reports
+ * that an access happened, which root sequence, and how many concurrent
+ * accesses, nothing about the subscriber. Root-agnostic: one FFT of the
+ * differential product D[k]=Y[k+1]conj(Y[k]) shows a tone per concurrent
+ * root (no 838-way correlator bank); a per-root power-delay profile counts
+ * the accesses. Feed the sequence window (>= ATKDSP_PRACH_NZC samples at the
+ * PRACH rate) after tuning to the uplink. */
+#define ATKDSP_PRACH_NZC 839          /* Zadoff-Chu length, formats 0-3 */
+
+typedef struct {
+    int   root;    /* Zadoff-Chu root index of a preamble present         */
+    int   count;   /* concurrent accesses on this root (PDP peaks)        */
+    float metric;  /* differential-tone peak / median (detection strength)*/
+    int   delay;   /* strongest PDP peak index (timing / cyclic shift)    */
+} atkdsp_prach_hit;
+
+typedef struct atkdsp_prach atkdsp_prach;
+ATKDSP_API atkdsp_prach *atkdsp_prach_create(void);
+ATKDSP_API void          atkdsp_prach_destroy(atkdsp_prach *h);
+/* The frequency-domain ZC root sequence (839 values); for tests and PDPs. */
+ATKDSP_API int           atkdsp_prach_zc(int u, atkdsp_cf32 *out);
+/* Detect preambles in `seq` (>= ATKDSP_PRACH_NZC samples). `min_metric` is
+ * the tone peak/median to clear (<=0 uses the default 40). Returns how many
+ * distinct roots were written, or <0 on error. */
+ATKDSP_API ptrdiff_t     atkdsp_prach_detect(atkdsp_prach *h,
+                                     const atkdsp_cf32 *seq, size_t n,
+                                     float min_metric, atkdsp_prach_hit *out,
+                                     size_t cap);
+/* Slide an NZC window across a longer uplink capture (step `win_step`, use
+ * 64) and merge detections by root — one entry per root with its best metric
+ * and largest concurrent-access count. This is the call a survey uses: it
+ * does not need PRACH-occasion timing. */
+ATKDSP_API ptrdiff_t     atkdsp_prach_scan(atkdsp_prach *h,
+                                     const atkdsp_cf32 *stream, size_t n,
+                                     int win_step, float min_metric,
+                                     atkdsp_prach_hit *out, size_t cap);
 
 #ifdef __cplusplus
 }

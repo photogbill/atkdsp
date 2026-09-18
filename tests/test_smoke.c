@@ -28,8 +28,32 @@ int main(void) {
     ptrdiff_t n = atkdsp_unpack(raw, sizeof raw, ATKDSP_FMT_CI16Q11, s, 4, 0.0f, NULL);
     CHECK(n == 4, "unpack count");
     CHECK(fabsf(s[0].re - 1.0f) < 1e-6f && fabsf(s[1].im + 1.0f) < 1e-6f, "unpack q11 scale");
+    const float s0re = s[0].re;
     n = atkdsp_unpack(raw, 7, ATKDSP_FMT_CI16Q11, s, 4, 0.0f, NULL);
     CHECK(n == 1, "torn tail ignored");
+
+    /* -- unpack_dc: the offset folded into the scale, the mean returned --- */
+    {
+        atkdsp_cf32 t[4];
+        double mr = 0.0, mi = 0.0;
+        n = atkdsp_unpack_dc(raw, sizeof raw, ATKDSP_FMT_CI16Q11, t, 4,
+                             0.25f, -0.5f, &mr, &mi);
+        CHECK(n == 4, "unpack_dc count");
+        /* same conversion as above, minus the offset */
+        CHECK(fabsf(t[0].re - (s0re - 0.25f)) < 1e-6f, "unpack_dc removes the offset");
+        /* the mean is of the samples BEFORE the offset came out */
+        double want_r = 0.0, want_i = 0.0;
+        for (int q = 0; q < 4; ++q) {
+            want_r += (double)raw[2 * q] / 2048.0;
+            want_i += (double)raw[2 * q + 1] / 2048.0;
+        }
+        CHECK(fabs(mr - want_r / 4.0) < 1e-6 && fabs(mi - want_i / 4.0) < 1e-6,
+              "unpack_dc mean is taken before the subtraction");
+        n = atkdsp_unpack_dc(raw, sizeof raw, ATKDSP_FMT_CI16Q11, t, 4,
+                             0.0f, 0.0f, NULL, NULL);
+        CHECK(n == 4 && fabsf(t[0].re - s0re) < 1e-7f,
+              "unpack_dc with no offset is unpack");
+    }
 
     /* -- NCO: mixing a tone at f down to DC leaves a constant ------------ */
     const size_t N = 4096;

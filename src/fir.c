@@ -7,7 +7,17 @@
 #include "internal.h"
 
 struct atkdsp_fir {
-    float       *taps;    /* ntaps, copied */
+    /* The taps REVERSED and each one DUPLICATED: hd[2k] = hd[2k+1] = h[T-1-k].
+     *
+     * The obvious dot product — sum_j h[j] * w[T-1-j] over an interleaved
+     * complex window — walks the window BACKWARDS while the taps go forwards,
+     * and reads .re/.im at stride two. A compiler can do very little with
+     * that. Reversing the taps once, at create, makes the window walk
+     * forwards; duplicating them makes the whole thing a flat unit-stride
+     * multiply-accumulate over 2T floats, where the even lanes sum to the
+     * real part and the odd lanes to the imaginary one. That shape is what a
+     * vector unit is for, and it costs 2T floats of memory once. */
+    float       *hd;      /* 2*ntaps */
     atkdsp_cf32 *hist;    /* last ntaps-1 inputs seen, oldest first */
     atkdsp_cf32 *tmp;     /* ntaps scratch for windows straddling hist/in */
     size_t       ntaps;
@@ -19,11 +29,12 @@ atkdsp_fir *atkdsp_fir_create(const float *taps, size_t ntaps, unsigned decim) {
     if (!taps || ntaps == 0 || decim == 0) return NULL;
     atkdsp_fir *f = (atkdsp_fir *)calloc(1, sizeof *f);
     if (!f) return NULL;
-    f->taps = (float *)atk_aligned_malloc(ntaps * sizeof(float));
+    f->hd   = (float *)atk_aligned_malloc(2 * ntaps * sizeof(float));
     f->hist = (atkdsp_cf32 *)atk_aligned_malloc((ntaps > 1 ? ntaps - 1 : 1) * sizeof(atkdsp_cf32));
     f->tmp  = (atkdsp_cf32 *)atk_aligned_malloc(ntaps * sizeof(atkdsp_cf32));
-    if (!f->taps || !f->hist || !f->tmp) { atkdsp_fir_destroy(f); return NULL; }
-    memcpy(f->taps, taps, ntaps * sizeof(float));
+    if (!f->hd || !f->hist || !f->tmp) { atkdsp_fir_destroy(f); return NULL; }
+    for (size_t k = 0; k < ntaps; ++k)
+        f->hd[2 * k] = f->hd[2 * k + 1] = taps[ntaps - 1 - k];
     f->ntaps = ntaps;
     f->decim = decim;
     atkdsp_fir_reset(f);
@@ -32,7 +43,7 @@ atkdsp_fir *atkdsp_fir_create(const float *taps, size_t ntaps, unsigned decim) {
 
 void atkdsp_fir_destroy(atkdsp_fir *f) {
     if (!f) return;
-    atk_aligned_free(f->taps);
+    atk_aligned_free(f->hd);
     atk_aligned_free(f->hist);
     atk_aligned_free(f->tmp);
     free(f);
@@ -55,16 +66,26 @@ size_t atkdsp_fir_out_max(const atkdsp_fir *f, size_t n_in) {
     return out_count(f->pos, f->decim, n_in);
 }
 
-/* dot product of taps against a window ending at w[T-1]: sum_j h[j]*w[T-1-j] */
-ATK_INLINE atkdsp_cf32 dot(const float *ATK_RESTRICT h, const atkdsp_cf32 *ATK_RESTRICT w,
-                           size_t T) {
-    float ar = 0.0f, ai = 0.0f;
-    for (size_t j = 0; j < T; ++j) {
-        const float hj = h[j];
-        ar += hj * w[T - 1 - j].re;
-        ai += hj * w[T - 1 - j].im;
-    }
-    atkdsp_cf32 y; y.re = ar; y.im = ai;
+/* sum_j h[j]*w[T-1-j], with `hd` the reversed-and-duplicated taps: one flat
+ * pass over 2T floats, eight independent accumulators so the adds do not form
+ * a dependency chain either, even lanes -> re and odd lanes -> im. */
+ATK_INLINE atkdsp_cf32 dot(const float *ATK_RESTRICT hd,
+                           const atkdsp_cf32 *ATK_RESTRICT w, size_t T) {
+    const float *ATK_RESTRICT wf = (const float *)w;
+    const size_t N = 2 * T;
+    const size_t m = N & ~(size_t)7;
+    float acc[8];
+    int l;
+    for (l = 0; l < 8; ++l) acc[l] = 0.0f;
+    size_t k = 0;
+    for (; k < m; k += 8)
+        for (l = 0; l < 8; ++l)
+            acc[l] += hd[k + l] * wf[k + l];
+    /* m is a multiple of 8 and N is even, so k keeps its parity here */
+    for (; k < N; ++k) acc[k & 7] += hd[k] * wf[k];
+    atkdsp_cf32 y;
+    y.re = (acc[0] + acc[2]) + (acc[4] + acc[6]);
+    y.im = (acc[1] + acc[3]) + (acc[5] + acc[7]);
     return y;
 }
 
@@ -80,13 +101,13 @@ ptrdiff_t atkdsp_fir_process(atkdsp_fir *f, const atkdsp_cf32 *in, size_t n,
     size_t i = (D - f->pos) % D;
     for (; i < n; i += D) {
         if (i >= H) {
-            out[k++] = dot(f->taps, in + i - H, T);
+            out[k++] = dot(f->hd, in + i - H, T);
         } else {
             /* window = hist[H-(H-i) .. H) ++ in[0..i] : H-i old samples then i+1 new */
             const size_t old = H - i;
             memcpy(f->tmp, f->hist + (H - old), old * sizeof(atkdsp_cf32));
             memcpy(f->tmp + old, in, (i + 1) * sizeof(atkdsp_cf32));
-            out[k++] = dot(f->taps, f->tmp, T);
+            out[k++] = dot(f->hd, f->tmp, T);
         }
     }
 

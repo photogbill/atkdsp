@@ -51,8 +51,30 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.2.0"
+    assert atkdsp.version() == "0.3.0"
     assert "abi" in atkdsp.build_info()
+
+
+def test_the_build_info_reports_the_abi_it_was_built_with():
+    """It used to carry the number as a typed-in literal — `" abi" " 1"` —
+    which would have kept saying 1 after the bump to 2, on the one line
+    anybody reads to check exactly that."""
+    assert f"abi {atkdsp.ABI_VERSION}" in atkdsp.build_info()
+
+
+def test_every_bound_symbol_exists_in_this_library():
+    """The reason adding a function now bumps the ABI (atkdsp.h rule 5).
+
+    The binding binds eagerly, so a binding that knows a newer function and a
+    library that does not used to fail with an AttributeError about a missing
+    symbol instead of the version sentence. `load()` succeeding at all is that
+    check; this names it so the next person does not re-earn it.
+    """
+    lib = atkdsp.load()
+    for name in ("atkdsp_unpack", "atkdsp_unpack_dc", "atkdsp_nco_mix",
+                 "atkdsp_fir_process", "atkdsp_ddc_process",
+                 "atkdsp_spectrum_reduce", "atkdsp_design_lowpass"):
+        assert getattr(lib, name, None) is not None, f"{name} is not in the library"
 
 
 def test_bytes_per_sample_agree():
@@ -415,3 +437,61 @@ def test_ddc_refuses_what_it_cannot_do():
     d = atkdsp.Ddc(2_400_000, 0.0, 15_000, 48_000, 60, max_block=1000)
     with pytest.raises(atkdsp.AtkDspError):
         d.process(noise(2000))                                   # block > max_block
+
+
+# ---------------------------------------------------------------------------
+# 1b. unpack_dc — the offset folded into the scale, the mean handed back
+# ---------------------------------------------------------------------------
+
+def _raw(fmt, n=4096, seed=77):
+    r = np.random.default_rng(seed)
+    if fmt == "cu8":
+        return r.integers(0, 256, 2 * n, dtype=np.uint8).tobytes()
+    if fmt == "ci8":
+        return r.integers(-128, 128, 2 * n, dtype=np.int8).tobytes()
+    if fmt == "cf32":
+        return r.standard_normal(2 * n).astype("<f4").tobytes()
+    return r.integers(-2000, 2000, 2 * n, dtype=np.int64).astype("<i2").tobytes()
+
+
+@pytest.mark.parametrize("fmt", ["cu8", "ci8", "ci16", "ci16q11", "cf32"])
+@pytest.mark.parametrize("offset", [0j, 0.123 - 0.045j])
+def test_unpack_dc_matches_its_twin(fmt, offset):
+    raw = _raw(fmt)
+    a, ma = atkdsp.unpack_dc(raw, fmt, offset)
+    b, mb = ref.unpack_dc(raw, fmt, offset)
+    assert a.dtype == np.complex64 and a.size == b.size
+    assert np.max(np.abs(a - b)) < 1e-6, f"{fmt}: samples differ"
+    assert abs(ma - mb) < 1e-6, f"{fmt}: mean differs"
+
+
+@pytest.mark.parametrize("fmt", ["cu8", "ci16q11", "cf32"])
+def test_unpack_dc_is_unpack_when_the_offset_is_zero(fmt):
+    """The new path must not quietly become a second, different converter."""
+    raw = _raw(fmt, seed=5)
+    a, _ = atkdsp.unpack_dc(raw, fmt, 0j)
+    assert np.array_equal(a, atkdsp.unpack(raw, fmt))
+
+
+def test_unpack_dc_returns_the_mean_from_before_the_subtraction():
+    """That is what makes a running estimate possible without a third pass:
+    the caller needs to know where the offset IS, not where it is after the
+    last guess was removed."""
+    n = 4096
+    off = 0.25 - 0.1j
+    x = (np.full(n, 0.4 + 0.2j) + 0.01 * noise(n)).astype(np.complex64)
+    raw = x.tobytes()
+    y, mean = atkdsp.unpack_dc(raw, "cf32", off)
+    assert abs(mean - complex(np.mean(x, dtype=np.complex128))) < 1e-5
+    assert abs(complex(np.mean(y, dtype=np.complex128)) - (mean - off)) < 1e-5
+
+
+def test_the_offset_costs_nothing_the_conversion_was_not_already_doing():
+    """The claim in atkdsp.h §1b. Not a timing assertion — those are flaky —
+    but the arithmetic one underneath it: folding the offset into the
+    constant gives the same answer as subtracting afterwards."""
+    raw = _raw("ci16q11", seed=9)
+    off = -0.031 + 0.017j
+    folded, _ = atkdsp.unpack_dc(raw, "ci16q11", off)
+    after = atkdsp.unpack(raw, "ci16q11") - np.complex64(off)
+    assert np.max(np.abs(folded - after)) < 1e-6

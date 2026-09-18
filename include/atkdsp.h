@@ -20,9 +20,15 @@
  *   4. Numbers in, numbers out. No I/O, no threads the caller cannot see
  *      (OpenMP inside a single call is the one exception, and
  *      atkdsp_set_threads controls it), no printing.
- *   5. ABI changes bump ATKDSP_ABI_VERSION. Adding a function is allowed
- *      without a bump; changing or removing one is not. The Python binding
- *      refuses to load a library whose ABI it does not know.
+ *   5. ABI changes bump ATKDSP_ABI_VERSION. Changing or removing a function
+ *      obviously does — and so does ADDING one, which this rule used to
+ *      exempt. The exemption was wrong in practice: the Python binding binds
+ *      every symbol eagerly at load, so a binding that knows a new function
+ *      and a library that does not fails with an AttributeError about a
+ *      missing symbol rather than the sentence the version check exists to
+ *      print. A number that goes up is cheap; a mismatch that reports itself
+ *      as something else is not. (Bumped 1 -> 2 on 2026-09-18 for
+ *      atkdsp_unpack_dc.)
  *
  * Sample convention: complex float32 as {re, im} pairs (same memory layout as
  * numpy complex64). All sizes are in SAMPLES unless the name says bytes.
@@ -50,8 +56,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 1
-#define ATKDSP_VERSION_STRING "0.2.0"
+#define ATKDSP_ABI_VERSION 2
+#define ATKDSP_VERSION_STRING "0.3.0"
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -103,6 +109,25 @@ ATKDSP_API int         atkdsp_get_threads(void);
 ATKDSP_API ptrdiff_t atkdsp_unpack(const void *raw, size_t nbytes, int fmt,
                                    atkdsp_cf32 *out, size_t out_cap,
                                    float dc_alpha, atkdsp_cf32 *dc_state);
+
+/* ---- 1b. unpack, minus a constant, with the mean handed back -----------
+ * Subtracts (off_re, off_im) from every sample and, if mean_re/mean_im are
+ * given, returns the mean of the samples BEFORE that subtraction.
+ *
+ * Both are free: each format already subtracts a constant and multiplies by
+ * a scale, so (x-c)*k - off is (x-(c+off/k))*k, and the mean accumulates in
+ * the loop that is already reading. It exists because a caller that
+ * estimates the offset once per block (ATK's RfChain) would otherwise make
+ * two more full passes over the samples — at 40 MSPS, 48 MB per 50 ms block
+ * on a path that measures as bandwidth-bound, for a notch and an average.
+ *
+ * This is the DC block to reach for when the caller has blocks.
+ * atkdsp_unpack's per-sample pole is the one to reach for when it does not:
+ * it is exact at every sample and costs five times the conversion. */
+ATKDSP_API ptrdiff_t atkdsp_unpack_dc(const void *raw, size_t nbytes, int fmt,
+                                      atkdsp_cf32 *out, size_t out_cap,
+                                      float off_re, float off_im,
+                                      double *mean_re, double *mean_im);
 
 /* ---- 2. NCO: phase-continuous complex mixer ----------------------------
  * out[n] = in[n] * exp(j * (phase + n*step)); phase advances by n*step and

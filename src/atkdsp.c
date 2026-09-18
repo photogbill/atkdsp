@@ -31,9 +31,15 @@
 #  define ATK_OMP "no-openmp"
 #endif
 
+/* The ABI number is STRINGIFIED from the macro, not typed in. It was typed
+ * in — " abi" " 1" — and would have gone on saying 1 after the bump to 2,
+ * which is the one line anybody reads to check exactly that. */
+#define ATK_STR2(x) #x
+#define ATK_STR(x)  ATK_STR2(x)
+
 static const char BUILD_INFO[] =
-    ATKDSP_VERSION_STRING " abi" " 1" " " ATK_CC " " ATK_SIMD " " ATK_OMP
-    " built " __DATE__ " " __TIME__;
+    ATKDSP_VERSION_STRING " abi " ATK_STR(ATKDSP_ABI_VERSION)
+    " " ATK_CC " " ATK_SIMD " " ATK_OMP " built " __DATE__ " " __TIME__;
 
 int atkdsp_abi_version(void) { return ATKDSP_ABI_VERSION; }
 const char *atkdsp_version_string(void) { return ATKDSP_VERSION_STRING; }

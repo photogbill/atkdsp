@@ -50,6 +50,14 @@ def unpack(raw, fmt: str, dc_alpha: float = 0.0, dc_state: np.ndarray | None = N
     return out
 
 
+def unpack_dc(raw, fmt: str, offset: complex = 0j, out=None, want_mean: bool = True):
+    """Twin of atkdsp.unpack_dc: (samples - offset, mean_before_subtraction)."""
+    x = unpack(raw, fmt)
+    m = complex(np.mean(x, dtype=np.complex128)) if x.size else 0j
+    y = (x - np.complex64(offset)).astype(np.complex64) if offset else x
+    return y, m
+
+
 # ---- 2. NCO -------------------------------------------------------------------
 class Nco:
     def __init__(self, freq_hz: float, sample_rate: float):

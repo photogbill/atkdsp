@@ -1,0 +1,46 @@
+# ============================================================================
+#  Line endings, decided here rather than per machine.
+#
+#  This repository had no such file, and `build.bat` is stored with LF. With
+#  `core.autocrlf` unset — which it is on the machine this was found on — a
+#  fresh clone therefore writes LF into the working tree, and cmd.exe parses
+#  a .bat by byte offset as it executes it. It tolerates LF for plain
+#  sequential commands, which is why the build appeared to work; it does not
+#  tolerate it for `goto :label`, for multi-line ( ... ) blocks, or for
+#  subroutines placed after the main body. build.bat's compiler probe is
+#  built from three gotos, so this is a live hazard, not a style preference.
+#
+#  ATK learned this in August 2026 and paid three days for it (see ATK's own
+#  .gitattributes, which this mirrors). The rule belongs in version control
+#  rather than in someone's memory: `eol=crlf` makes git write CRLF into the
+#  working tree on every checkout, on every machine, whatever the local
+#  configuration says.
+#
+#  After committing this file once: `git add --renormalize .`
+# ============================================================================
+
+# Normalise to LF inside the repository; the working tree follows the rules
+# below.
+* text=auto
+
+# ---- MUST be CRLF in the working tree --------------------------------------
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# ---- MUST be LF ------------------------------------------------------------
+*.c     text eol=lf
+*.h     text eol=lf
+*.py    text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yml   text eol=lf
+CMakeLists.txt text eol=lf
+
+# ---- never touched ---------------------------------------------------------
+*.dll   binary
+*.so    binary
+*.lib   binary
+*.exe   binary
+*.pdf   binary

@@ -13,17 +13,23 @@ called through `ctypes` holds the interpreter lock for none of its running
 time, allocates nothing, and costs the same on the ten-thousandth block as on
 the first. That is the property this library is for; speed is the bonus.
 
-Measured on a two-core SSE2 container, the same 50 ms block through the same
-stages ATK runs today (unpack, DC block, display line, decoder channel,
-analog channel), CPU-seconds per second of signal:
+Measured on a two-core AVX2 VM, the same 50 ms block through the same stages
+ATK runs today (unpack, DC block, display line, decoder channel, analog
+channel), CPU-seconds per second of signal — where 1.00 means the worker is
+exactly saturated and the first hiccup starts a backlog it never clears:
 
-| rate | numpy (today's ATK) | atkdsp, one display line | atkdsp, 100 % POI (every FFT) | + two real DDCs (60 dB, exact 48 kHz) |
-|---|---|---|---|---|
-| 2.4 MSPS | 0.43 | 0.04 | 0.05 | 0.07 |
-| 10 MSPS | 1.80 | 0.10 | 0.18 | 0.31 |
-| 40 MSPS | 6.68 | 0.39 | **0.64** | 1.04 |
+| rate | numpy (ATK without this) | atkdsp, everything, 100 % POI |
+|---|---|---|
+| 2.4 MSPS | 0.24 | **0.04** |
+| 10 MSPS | 0.68 | **0.15** |
+| 40 MSPS | 2.62 | **0.68** |
 
-`bench/bench_hotpath.py` reproduces it; run it on the machine that matters.
+The atkdsp column transforms EVERY FFT frame in the block (977 of them at
+40 MSPS) where the numpy one transforms a single frame per chunk and discards
+the rest — so it is doing about a thousand times the spectral work at a
+quarter of the cost. `bench/bench_hotpath.py` and ATK's
+`tests/bench/bench_chain.py` reproduce it; run them on the machine that
+matters, because the display reduction uses every core it is given.
 
 ## Layout
 
@@ -75,11 +81,11 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.2.0 (ABI 1)
+## What is in v0.3.0 (ABI 2)
 
 | group | kernels | replaces in ATK |
 |---|---|---|
-| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block) | `dsp.iq_to_complex`, `dsp.dc_block` |
+| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block), **`atkdsp_unpack_dc`** — convert, remove a constant offset and return the block's mean, all in one pass | `dsp.iq_to_complex`, `dsp.dc_block` |
 | NCO | `atkdsp_nco_*` phase-continuous mixer | `dsp.frequency_shift` (the per-sample `np.exp`) |
 | FIR | `atkdsp_fir_*` decimating, carried history | `dsp._decimating_fir` |
 | resampler | `atkdsp_resampler_*` polyphase L/M, exact counts | (nothing — 48 077 Hz was fed to dsd-neo as 48 000) |
@@ -100,6 +106,29 @@ checks the DLL loads through ATK's own Python, and reports `[OK] atkdsp` or
 `get_atkdsp.bat` on its own to update, `get_atkdsp.bat /rebuild` to build
 again.
 
+Since 2026-09-18 ATK's RF worker goes through `atk/core/rf_chain.py` for
+every stage of the hot path. Measured there (`tests/bench/bench_chain.py` in
+ATK), on a **two-core AVX2 VM**, CPU-seconds per second of signal for the
+whole chain — unpack, DC notch, display line, decoder channel, analog
+channel, discriminator:
+
+| rate | ATK on numpy | ATK on atkdsp | FFT frames per display line |
+|---|---|---|---|
+| 2.4 MSPS | 0.24 | **0.04** | 59 |
+| 10 MSPS | 0.68 | **0.15** | 244 |
+| 40 MSPS | 2.62 | **0.68** | 977 |
+
+**One kernel ATK does not use: `atkdsp_unpack`'s `dc_alpha`.** The per-sample
+DC pole costs 0.138 CPU-seconds per second of signal at 40 MSPS against 0.029
+for the conversion it rides on — five times the work, to remove one spike —
+and being a serial recurrence it will not vectorise or use a second core.
+`atkdsp_unpack_dc` exists because of that measurement: the caller estimates
+the offset once per block, and the subtraction rides free in the constant
+each format already subtracts while the mean accumulates in the loop that is
+already reading. Three passes became one, and ATK's unpack stage went from
+0.093 to 0.041 CPU-seconds per second at 40 MSPS. The pole stays here — it
+is the right tool for a caller with no blocks — and the cross-check tests it.
+
 ATK loads it through `atk/core/dsp_native.py`, which looks in
 `vendor\atkdsp\bin\`, then a sibling `..\atkdsp\bin\` checkout, then PATH —
 one discovery order, so there is never a second copy loaded. If the library
@@ -108,7 +137,7 @@ Setup page; it never silently computes something different. The twins live
 here, in `python/atkdsp/reference.py`, so ATK's fallback and this repo's
 specification are one file.
 
-## Roadmap (ABI 2 and later)
+## Roadmap (ABI 3 and later)
 
 Ordered by what ATK's plan needs next. Items below the line are from the
 wider capability list (Bill's 2026-09-17 design notes) and are real, but
@@ -121,9 +150,45 @@ each is its own project with its own verification.
    double-precision pocketfft path when the size is a power of two.
 3. **Ring-buffer primitives** for the block ring / DVR (`§RF-F2`, `§RF-F9`):
    sequence numbers, multi-consumer cursors, overflow accounting.
-4. A float32 SIMD NCO path: at 40 MSPS the double-precision mixer is now
-   the largest single cost in a DDC (~4 ns/sample on SSE2); a float phasor
-   with a shorter renormalisation interval would halve it.
+4. ~~A float32 SIMD NCO path~~ — **measured, and it is not the answer.**
+   Three formulations were benchmarked at 40 MSPS: the double phasor with
+   8 lanes, a float phasor re-derived exactly from the double phase every
+   256 samples, and a flat unit-stride version shaped like the FIR's dot.
+   They came out at 1.54, 1.57 and 1.76 ns/sample — indistinguishable. At
+   2 M samples a block the mixer is reading 16 MB and writing 16 MB, so it
+   is **bandwidth-bound, not compute-bound**, and no arithmetic is going to
+   move it. What WILL move it is not doing the pass: folding the mixer into
+   the first decimating stage with pre-rotated complex taps removes a 16 MB
+   write and a 16 MB read per channel per block. The taps double the stage's
+   multiplies (+0.04) and the NCO disappears (−0.093), so it is worth about
+   0.05 CPU-seconds per second per channel — not the 2x a faster multiply
+   seemed to promise, and the only version of it that is real.
+
+Item 1 is what ATK's measurement points at hardest: at 40 MSPS its two
+channels cost 0.160 and 0.150 CPU-seconds per second of signal against 0.183
+for the entire 977-frame display reduction. Channels taken from an analysis
+FFT (item 1) would make the fifty-entry watchlist ATK wants cost roughly what
+one channel costs now — but see ATK's plan for the constraint the original
+design note missed: at 40 MSPS with a 2048-point FFT the bins are 19.5 kHz
+apart and a 15 kHz channel does not span one, so the extractor needs its own
+FFT sized from the channel, not the display's.
+
+### Two things the 2026-09-18 pass found, worth keeping written down
+
+**The FIR dot product was 4.3x slower than it needed to be, for readability.**
+`sum_j h[j] * w[T-1-j]` over interleaved complex walks the window BACKWARDS
+at stride two while the taps go forwards. Reversing the taps once at create,
+and duplicating each one so the whole thing is a flat unit-stride
+multiply-accumulate over 2T floats with eight accumulators (even lanes sum to
+the real part, odd lanes to the imaginary), took a 485-tap decimate-by-8 from
+1.76 to 0.41 CPU-seconds per second of signal. Same answers — all 91
+cross-check tests, unchanged tolerances.
+
+**`build.sh` was quietly building a different library than CMake.** Its
+no-cmake fallback had no `-mavx2 -mfma` while `CMakeLists.txt` did, so the
+same source on the same machine produced an SSE2 build or an AVX2 one
+depending on whether cmake happened to be installed, with only the
+`build_info` string to tell them apart. It probes for the flags now.
 
 ---
 

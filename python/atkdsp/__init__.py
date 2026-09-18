@@ -31,14 +31,14 @@ __all__ = [
     "ABI_VERSION", "AtkDspError", "load", "available", "lib_path", "version",
     "build_info", "set_threads", "get_threads",
     "FMT", "DET", "WIN", "bytes_per_sample",
-    "unpack", "Nco", "Fir", "Resampler", "Fft", "window", "power_db",
+    "unpack", "unpack_dc", "Nco", "Fir", "Resampler", "Fft", "window", "power_db",
     "spectrum_reduce", "fm_demod", "am_demod", "db_to_pixels", "decimate_max",
     "median", "detect_channels", "stitch_max", "Channel",
 ]
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -133,6 +133,11 @@ def _bind(lib) -> None:
     lib.atkdsp_unpack.restype = C.c_ssize_t
     lib.atkdsp_unpack.argtypes = [C.c_void_p, C.c_size_t, C.c_int, cf, C.c_size_t,
                                   C.c_float, P(_Cf32)]
+
+    lib.atkdsp_unpack_dc.restype = C.c_ssize_t
+    lib.atkdsp_unpack_dc.argtypes = [C.c_void_p, C.c_size_t, C.c_int, cf, C.c_size_t,
+                                     C.c_float, C.c_float,
+                                     P(C.c_double), P(C.c_double)]
 
     lib.atkdsp_nco_init.argtypes = [P(_Nco), C.c_double, C.c_double]
     lib.atkdsp_nco_set_freq.argtypes = [P(_Nco), C.c_double, C.c_double]
@@ -308,6 +313,32 @@ def unpack(raw, fmt, dc_alpha: float = 0.0, dc_state: np.ndarray | None = None,
     got = _check(lib.atkdsp_unpack(src.ctypes.data, nbytes, _fmt(fmt), _cfp(out), out.size,
                                    float(dc_alpha), st), "unpack")
     return out[:got]
+
+
+def unpack_dc(raw, fmt, offset: complex = 0j, out: np.ndarray | None = None,
+              want_mean: bool = True):
+    """Raw bytes -> complex64 with ``offset`` removed; returns ``(x, mean)``.
+
+    ``mean`` is the mean of the samples BEFORE the offset was taken out, so a
+    caller keeping a running estimate gets it without a second pass. Both the
+    subtraction and the mean are free: see atkdsp.h §1b.
+    """
+    lib = load()
+    src = np.frombuffer(raw, dtype=np.uint8) if not isinstance(raw, np.ndarray) \
+        else np.ascontiguousarray(raw).view(np.uint8).reshape(-1)
+    nbytes = src.size
+    n = nbytes // bytes_per_sample(fmt)
+    if out is None:
+        out = np.empty(n, dtype=np.complex64)
+    elif out.dtype != np.complex64 or not out.flags.c_contiguous:
+        raise AtkDspError("out must be a contiguous complex64 array")
+    mr, mi = C.c_double(0.0), C.c_double(0.0)
+    pr = C.byref(mr) if want_mean else None
+    pi = C.byref(mi) if want_mean else None
+    got = _check(lib.atkdsp_unpack_dc(src.ctypes.data, nbytes, _fmt(fmt), _cfp(out),
+                                      out.size, float(offset.real), float(offset.imag),
+                                      pr, pi), "unpack_dc")
+    return out[:got], complex(mr.value, mi.value)
 
 
 # -- 2. NCO -------------------------------------------------------------------

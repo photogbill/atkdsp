@@ -483,10 +483,12 @@ static int riv_inv(int v, int n_rb, int *st, int *L) {
     return 0;
 }
 
-/* ---- public API -------------------------------------------------------- */
-int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
-                           int n_id, int n_ports, int subframe, double cfo_hz,
-                           int equalize_on, atkdsp_lte_sib1 *out) {
+/* ---- shared receive chain --------------------------------------------- */
+/* kind 0 = SIB1 (out is atkdsp_lte_sib1), kind 1 = SI (out is atkdsp_lte_si).
+ * The two differ only in the ASN.1 parser used as the K-search accept gate. */
+static int sib_phy_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
+                          int n_id, int n_ports, int subframe, double cfo_hz,
+                          int equalize_on, int kind, void *out) {
     const int nfft = nfft_for(n_rb), n_sc = n_rb * SC_PER_RB, n_s = subframe * 2;
     atkdsp_cf32 *grid = NULL, *s = NULL;
     signed char *occ = NULL;
@@ -495,7 +497,8 @@ int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
     signed char dci[DCI_D];
     static const int SS_AL[2] = {4, 8}, SS_NC[2] = {4, 2};
     if (!samples || !out || !nfft || n_id < 0 || n_id > 503) return ATKDSP_E_ARG;
-    memset(out, 0, sizeof *out); out->csg_id = -1;
+    if (kind == 0) { memset(out, 0, sizeof(atkdsp_lte_sib1)); ((atkdsp_lte_sib1 *)out)->csg_id = -1; }
+    else           { memset(out, 0, sizeof(atkdsp_lte_si)); }
 
     /* optional CFO removal at the full-BW sample rate */
     if (cfo_hz != 0.0) {
@@ -603,7 +606,10 @@ int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
                     if (K < 40 || K > hi) continue;
                     cbits = (signed char *)malloc((size_t)(K - 24));
                     if (atkdsp_lte_turbo_decode(fllr, (size_t)E, K, 0, 8, cbits) == 1) {
-                        if (atkdsp_lte_sib1_parse(cbits, K - 24, out) == 1) decoded = 1;
+                        int okp = (kind == 0)
+                            ? atkdsp_lte_sib1_parse(cbits, K - 24, (atkdsp_lte_sib1 *)out)
+                            : atkdsp_lte_si_parse(cbits, K - 24, (atkdsp_lte_si *)out);
+                        if (okp == 1) decoded = 1;
                     }
                     free(cbits); cbits = NULL;
                 }
@@ -618,4 +624,19 @@ int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
 done:
     free(grid); free(occ); free(ck); free(cl); free(s);
     return rc;
+}
+
+/* ---- public API -------------------------------------------------------- */
+int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
+                           int n_id, int n_ports, int subframe, double cfo_hz,
+                           int equalize_on, atkdsp_lte_sib1 *out) {
+    return sib_phy_decode(samples, n, n_rb, n_id, n_ports, subframe, cfo_hz,
+                          equalize_on, 0, out);
+}
+
+int atkdsp_lte_si_decode(const atkdsp_cf32 *samples, size_t n, int n_rb,
+                         int n_id, int n_ports, int subframe, double cfo_hz,
+                         int equalize_on, atkdsp_lte_si *out) {
+    return sib_phy_decode(samples, n, n_rb, n_id, n_ports, subframe, cfo_hz,
+                          equalize_on, 1, out);
 }

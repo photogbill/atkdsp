@@ -38,7 +38,7 @@ __all__ = [
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 8
+ABI_VERSION = 9
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -705,6 +705,10 @@ class _PrachHit(C.Structure):
 
 
 _LTE_MAX_PLMN = 6
+_LTE_MAX_SI = 8
+_LTE_MAX_SIBMAP = 8
+_LTE_MAX_NEIGH = 16
+_LTE_MAX_FREQ = 8
 
 
 class _LtePlmn(C.Structure):
@@ -712,10 +716,56 @@ class _LtePlmn(C.Structure):
                 ("mnc_len", C.c_int), ("reserved", C.c_int)]
 
 
+class _LteSched(C.Structure):
+    _fields_ = [("periodicity_rf", C.c_int), ("n_sibs", C.c_int),
+                ("sibs", C.c_int * _LTE_MAX_SIBMAP)]
+
+
 class _LteSib1(C.Structure):
     _fields_ = [("n_plmn", C.c_int), ("plmn", _LtePlmn * _LTE_MAX_PLMN),
                 ("tac", C.c_int), ("cell_id", C.c_uint),
-                ("cell_barred", C.c_int), ("csg_id", C.c_int)]
+                ("cell_barred", C.c_int), ("csg_id", C.c_int),
+                ("freq_band", C.c_int), ("si_window_ms", C.c_int),
+                ("n_sched", C.c_int), ("sched", _LteSched * _LTE_MAX_SI)]
+
+
+class _LteNeigh(C.Structure):
+    _fields_ = [("pci", C.c_int), ("q_off", C.c_int)]
+
+
+class _LteSib2(C.Structure):
+    _fields_ = [("present", C.c_int), ("barring", C.c_int),
+                ("barring_emergency", C.c_int), ("prach_root", C.c_int),
+                ("prach_config_index", C.c_int), ("prach_high_speed", C.c_int),
+                ("prach_zcc", C.c_int), ("prach_freq_offset", C.c_int),
+                ("ref_sig_power", C.c_int), ("ul_earfcn", C.c_int),
+                ("ul_bandwidth_rb", C.c_int), ("time_align_timer", C.c_int)]
+
+
+class _LteSib3(C.Structure):
+    _fields_ = [("present", C.c_int), ("q_rxlevmin", C.c_int),
+                ("s_intra_search", C.c_int), ("resel_priority", C.c_int)]
+
+
+class _LteSib4(C.Structure):
+    _fields_ = [("present", C.c_int), ("n_neigh", C.c_int),
+                ("neigh", _LteNeigh * _LTE_MAX_NEIGH),
+                ("n_black", C.c_int), ("black_start", C.c_int * _LTE_MAX_NEIGH)]
+
+
+class _LteInterFreq(C.Structure):
+    _fields_ = [("dl_earfcn", C.c_int), ("n_neigh", C.c_int),
+                ("neigh_pci", C.c_int * _LTE_MAX_NEIGH)]
+
+
+class _LteSib5(C.Structure):
+    _fields_ = [("present", C.c_int), ("n_freq", C.c_int),
+                ("freq", _LteInterFreq * _LTE_MAX_FREQ)]
+
+
+class _LteSi(C.Structure):
+    _fields_ = [("sib2", _LteSib2), ("sib3", _LteSib3),
+                ("sib4", _LteSib4), ("sib5", _LteSib5)]
 
 
 LTE_RATE = 1_920_000
@@ -769,6 +819,12 @@ def _bind_lte(lib) -> None:
     lib.atkdsp_lte_sib1_decode.argtypes = [cf, C.c_size_t, C.c_int, C.c_int,
                                            C.c_int, C.c_int, C.c_double, C.c_int,
                                            P(_LteSib1)]
+    lib.atkdsp_lte_si_parse.restype = C.c_int
+    lib.atkdsp_lte_si_parse.argtypes = [P(C.c_byte), C.c_int, P(_LteSi)]
+    lib.atkdsp_lte_si_decode.restype = C.c_int
+    lib.atkdsp_lte_si_decode.argtypes = [cf, C.c_size_t, C.c_int, C.c_int,
+                                         C.c_int, C.c_int, C.c_double, C.c_int,
+                                         P(_LteSi)]
 
 
 _BIND_EXTRA.append(_bind_lte)
@@ -884,15 +940,7 @@ def lte_sib1_parse(bits):
                 b.size, C.byref(out)), "lte_sib1_parse")
     if rc != 1:
         return None
-    plmns = []
-    for i in range(out.n_plmn):
-        p = out.plmn[i]
-        mcc = None if p.mcc[0] < 0 else [p.mcc[0], p.mcc[1], p.mcc[2]]
-        plmns.append({"mcc": mcc, "mnc": [p.mnc[j] for j in range(p.mnc_len)],
-                      "reserved": bool(p.reserved)})
-    return {"plmns": plmns, "tac": int(out.tac), "cellid": int(out.cell_id),
-            "cell_barred": int(out.cell_barred),
-            "csg_id": None if out.csg_id < 0 else int(out.csg_id)}
+    return _sib1_dict(out)
 
 
 def _sib1_dict(out):
@@ -902,9 +950,68 @@ def _sib1_dict(out):
         mcc = None if p.mcc[0] < 0 else [p.mcc[0], p.mcc[1], p.mcc[2]]
         plmns.append({"mcc": mcc, "mnc": [p.mnc[j] for j in range(p.mnc_len)],
                       "reserved": bool(p.reserved)})
+    sched = []
+    for i in range(out.n_sched):
+        sc = out.sched[i]
+        sched.append({"periodicity_rf": int(sc.periodicity_rf),
+                      "sibs": [int(sc.sibs[j]) for j in range(sc.n_sibs)]})
     return {"plmns": plmns, "tac": int(out.tac), "cellid": int(out.cell_id),
             "cell_barred": int(out.cell_barred),
-            "csg_id": None if out.csg_id < 0 else int(out.csg_id)}
+            "csg_id": None if out.csg_id < 0 else int(out.csg_id),
+            "freq_band": int(out.freq_band), "si_window_ms": int(out.si_window_ms),
+            "sched": sched}
+
+
+def _si_dict(out):
+    s2, s3, s4, s5 = out.sib2, out.sib3, out.sib4, out.sib5
+    d = {}
+    if s2.present:
+        d["sib2"] = {
+            "barring": bool(s2.barring), "barring_emergency": bool(s2.barring_emergency),
+            "prach_root": int(s2.prach_root), "prach_config_index": int(s2.prach_config_index),
+            "prach_high_speed": bool(s2.prach_high_speed), "prach_zcc": int(s2.prach_zcc),
+            "prach_freq_offset": int(s2.prach_freq_offset), "ref_sig_power": int(s2.ref_sig_power),
+            "ul_earfcn": None if s2.ul_earfcn < 0 else int(s2.ul_earfcn),
+            "ul_bandwidth_rb": int(s2.ul_bandwidth_rb),
+            "time_align_timer": int(s2.time_align_timer)}
+    if s3.present:
+        d["sib3"] = {"q_rxlevmin": int(s3.q_rxlevmin),
+                     "s_intra_search": None if s3.s_intra_search < 0 else int(s3.s_intra_search),
+                     "resel_priority": int(s3.resel_priority)}
+    if s4.present:
+        d["sib4"] = {
+            "neighbors": [{"pci": int(s4.neigh[i].pci), "q_off": int(s4.neigh[i].q_off)}
+                          for i in range(s4.n_neigh)],
+            "blacklist": [int(s4.black_start[i]) for i in range(s4.n_black)]}
+    if s5.present:
+        d["sib5"] = {"carriers": [
+            {"dl_earfcn": int(s5.freq[i].dl_earfcn),
+             "neighbors": [int(s5.freq[i].neigh_pci[j]) for j in range(s5.freq[i].n_neigh)]}
+            for i in range(s5.n_freq)]}
+    return d
+
+
+def lte_si_parse(bits):
+    """Parse a SystemInformation message's transport-block bits (one bit per
+    element, MSB first) into a dict of the SIBs it carries (sib2/3/4/5), or None
+    on a structural mismatch."""
+    b = np.ascontiguousarray(np.asarray(bits, np.int8))
+    out = _LteSi()
+    rc = _check(load().atkdsp_lte_si_parse(b.ctypes.data_as(C.POINTER(C.c_byte)),
+                b.size, C.byref(out)), "lte_si_parse")
+    return _si_dict(out) if rc == 1 else None
+
+
+def lte_si_decode(samples, n_rb, n_id, n_ports, subframe, cfo_hz=0.0,
+                  equalize=True):
+    """Full receive chain for a SystemInformation message (same PHY as
+    lte_sib1_decode). Returns the SIB2-5 fingerprint dict or None."""
+    s = _cf32(samples, "samples")
+    out = _LteSi()
+    rc = _check(load().atkdsp_lte_si_decode(_cfp(s), s.size, int(n_rb), int(n_id),
+                int(n_ports), int(subframe), float(cfo_hz), 1 if equalize else 0,
+                C.byref(out)), "lte_si_decode")
+    return _si_dict(out) if rc == 1 else None
 
 
 def lte_sib1_decode(samples, n_rb: int, n_id: int, n_ports: int, subframe: int,
@@ -960,4 +1067,5 @@ class Prach:
 __all__ += ["design_lowpass", "Ddc", "Lte", "lte_pss_symbol", "lte_sss_symbol",
             "lte_gold", "LTE_RATE", "LTE_SYM", "LTE_PSS_PERIOD", "LTE_FRAME",
             "LTE_PBCH_OFFSET", "LTE_PBCH_BLOCK", "Prach", "prach_zc", "PRACH_NZC",
-            "lte_crc24a", "lte_turbo_decode", "lte_sib1_parse", "lte_sib1_decode"]
+            "lte_crc24a", "lte_turbo_decode", "lte_sib1_parse", "lte_sib1_decode",
+            "lte_si_parse", "lte_si_decode"]

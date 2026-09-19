@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.7.0"
+    assert atkdsp.version() == "0.8.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -1116,3 +1116,148 @@ def test_lte_sib1_decode_is_silent_when_no_sib_is_present():
         if atkdsp.lte_sib1_decode(z, 25, 123, 2, 5) is not None:
             false += 1
     assert false == 0, f"{false} phantom SIB1 decodes on noise"
+
+
+# ---------------------------------------------------------------------------
+# 11g. SIB1 scheduling + SIB2-5 network fingerprint
+# ---------------------------------------------------------------------------
+def test_lte_sib1_scheduling_matches_its_twin():
+    """The full SIB1 (identity + schedulingInfoList + si-WindowLength): C and
+    twin agree on where the SIB2+ messages sit."""
+    plmns = [{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}]
+    sched = [{"periodicity_idx": 1, "sibs": [3]},
+             {"periodicity_idx": 2, "sibs": [4, 5]}]
+    bits = ref.lte_sib1_encode(plmns, 0x1234, 0x0ABCDEF, sched=sched,
+                               si_window_idx=5, freq_band=7)
+    c = atkdsp.lte_sib1_parse(bits)
+    t = ref.lte_sib1_decode(bits)
+    assert c["tac"] == t["tac"] == 0x1234
+    assert c["si_window_ms"] == t["si_window_ms"] == 20
+    assert c["freq_band"] == t["freq_band"] == 7
+    got = [(s["periodicity_rf"], s["sibs"]) for s in c["sched"]]
+    assert got == [(16, [3]), (32, [4, 5])]
+    assert got == [(s["periodicity_rf"], s["sibs"]) for s in t["sched"]]
+
+
+def test_lte_sib1_identity_only_stream_still_parses():
+    """An identity-only SIB1 stream (no scheduling bits) still yields the
+    identity, with scheduling reported empty rather than as a failure."""
+    # 84 bits = exactly the identity for this PLMN (3-digit MNC); nothing after.
+    bits = ref.lte_sib1_encode([{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}],
+                               0x22, 0x33)[:84]
+    c = atkdsp.lte_sib1_parse(bits)
+    assert c is not None and c["tac"] == 0x22 and c["cellid"] == 0x33
+    assert c["sched"] == [] and c["si_window_ms"] == 0
+
+
+_SI_SIB2 = {"ac_barring": {"emergency": True,
+                           "mo_signalling": {"factor": 5, "time": 2, "special": 3},
+                           "mo_data": None},
+            "rrc": {"prach_root": 22, "prach_config_index": 3, "prach_high_speed": True,
+                    "prach_zcc": 11, "prach_freq_offset": 4, "ref_sig_power": -24,
+                    "num_ra_preambles": 10},
+            "ul_earfcn": 18100, "ul_bandwidth": 2, "time_align_timer": 7}
+_SI_SIB3 = {"q_hyst": 3, "s_non_intra_search": 10, "thresh_serving_low": 4,
+            "resel_priority": 6, "q_rxlevmin": -58, "p_max": 23,
+            "s_intra_search": 20, "allowed_meas_bw": 2, "t_resel": 2}
+_SI_SIB4 = {"neighbors": [{"pci": 100}, {"pci": 288}, {"pci": 503}],
+            "blacklist": [{"start": 50, "range": 3}], "csg_range": None}
+_SI_SIB5 = {"carriers": [{"dl_earfcn": 2600, "p_max": 23, "resel_priority": 5,
+                          "neighbors": [{"pci": 10}, {"pci": 20}]},
+                         {"dl_earfcn": 1850, "neighbors": []}]}
+
+
+def test_lte_si_parse_matches_its_twin():
+    """The SIB2-5 fingerprint: C and twin recover the same PRACH config, uplink
+    freq, access barring, and neighbour PCIs from a SystemInformation message."""
+    bits = ref.lte_si_encode([(2, _SI_SIB2), (3, _SI_SIB3),
+                              (4, _SI_SIB4), (5, _SI_SIB5)])
+    c = atkdsp.lte_si_parse(bits)
+    t = {k: v for k, v in ref.lte_si_decode(bits)["sibs"]}
+    assert c is not None
+    # SIB2
+    assert c["sib2"]["prach_root"] == 22 == t[2]["rrc"]["prach_root"]
+    assert c["sib2"]["prach_zcc"] == 11 == t[2]["rrc"]["prach_zcc"]
+    assert c["sib2"]["prach_freq_offset"] == 4 == t[2]["rrc"]["prach_freq_offset"]
+    assert c["sib2"]["prach_high_speed"] is True
+    assert c["sib2"]["ul_earfcn"] == 18100 == t[2]["ul_earfcn"]
+    assert c["sib2"]["ul_bandwidth_rb"] == 25 == t[2]["ul_bandwidth_rb"]
+    assert c["sib2"]["barring_emergency"] is True
+    assert c["sib2"]["ref_sig_power"] == -24 == t[2]["rrc"]["ref_sig_power"]
+    # SIB3
+    assert c["sib3"]["q_rxlevmin"] == -58 == t[3]["q_rxlevmin"]
+    assert c["sib3"]["s_intra_search"] == 20 == t[3]["s_intra_search"]
+    # SIB4
+    assert [n["pci"] for n in c["sib4"]["neighbors"]] == [100, 288, 503]
+    assert [n["pci"] for n in t[4]["neighbors"]] == [100, 288, 503]
+    assert c["sib4"]["blacklist"] == [50]
+    # SIB5
+    assert [(f["dl_earfcn"], f["neighbors"]) for f in c["sib5"]["carriers"]] \
+        == [(2600, [10, 20]), (1850, [])]
+    assert [f["dl_earfcn"] for f in t[5]["carriers"]] == [2600, 1850]
+
+
+def _pick_K(nbits):
+    for k in sorted(ref._QPP_TABLE):
+        if k >= nbits + 24:
+            return k
+    return 6144
+
+
+def _synth_si(si_bits, n_id=123, n_rb=25, n_ports=2, subframe=5, snr_db=13.0, seed=4):
+    cfi = 3; ns = subframe * 2; gp = ref.lte_grid_params(n_rb)
+    K = _pick_K(len(si_bits))
+    tb = np.concatenate([si_bits, np.zeros(K - 24 - len(si_bits), np.int8)])[:K - 24]
+    L = 15
+    res = ref.lte_pdsch_re_list(n_id, n_rb, list(range(L)), cfi, n_ports)
+    E = len(res) * 2
+    psym = ref._pb_qpsk(ref.lte_pdsch_encode(tb, n_id, ref.LTE_SI_RNTI, subframe, E, K))
+    dci, _ = ref.lte_dci_1a_encode(0, L, n_rb, dci_len=24)
+    dsym = ref._pb_qpsk(ref.lte_pdcch_encode(dci, ref.LTE_SI_RNTI, 288, n_id, ns, 0))
+    csym = ref.lte_pcfich_encode(3, n_id, ns)
+    g = np.zeros((gp["n_sc"], 14), complex)
+    for (k, sym), val in ref.lte_crs_positions(n_id, n_rb).items():
+        g[k, sym] = val
+    for (k, l), v in zip(ref.lte_pcfich_res(n_id, n_rb), csym):
+        g[k, l] = v
+    cce = [re for reg in ref.lte_control_regs(n_id, n_rb, cfi, n_ports) for re in reg]
+    for (k, l), v in zip(cce[0:4 * 36], dsym):
+        g[k, l] = v
+    for (k, l), v in zip(res, psym):
+        g[k, l] = v
+    s = ref.lte_ofdm_modulate(g, gp)
+    rng = np.random.default_rng(seed)
+    p = np.mean(np.abs(s) ** 2)
+    s = s + np.sqrt(p / 10 ** (snr_db / 10) / 2) * (
+        rng.standard_normal(len(s)) + 1j * rng.standard_normal(len(s)))
+    return s.astype(np.complex64)
+
+
+def test_lte_si_decode_from_iq_recovers_the_fingerprint():
+    """The whole receive chain for a SystemInformation message: a synthesized
+    subframe -> PRACH config, uplink EARFCN and neighbour PCIs."""
+    sib2 = {"ac_barring": None,
+            "rrc": {"prach_root": 144, "prach_config_index": 3, "prach_zcc": 8,
+                    "prach_freq_offset": 4, "ref_sig_power": -24},
+            "ul_earfcn": 18100, "ul_bandwidth": 2}
+    sib4 = {"neighbors": [{"pci": 101}, {"pci": 202}], "blacklist": [], "csg_range": None}
+    s = _synth_si(ref.lte_si_encode([(2, sib2), (4, sib4)]))
+    c = atkdsp.lte_si_decode(s, 25, 123, 2, 5, equalize=True)
+    assert c is not None
+    assert c["sib2"]["prach_root"] == 144
+    assert c["sib2"]["ul_earfcn"] == 18100 and c["sib2"]["ul_bandwidth_rb"] == 25
+    assert [n["pci"] for n in c["sib4"]["neighbors"]] == [101, 202]
+
+
+def test_lte_si_decode_is_silent_on_noise():
+    rng = np.random.default_rng(5)
+    gp = ref.lte_grid_params(25)
+    n = sum((gp["nfft"] + (gp["cp_long"] if l % 7 == 0 else gp["cp_short"]))
+            for l in range(14))
+    false = 0
+    for _ in range(12):
+        z = ((rng.standard_normal(n) + 1j * rng.standard_normal(n))
+             / np.sqrt(2)).astype(np.complex64)
+        if atkdsp.lte_si_decode(z, 25, 123, 2, 5) is not None:
+            false += 1
+    assert false == 0

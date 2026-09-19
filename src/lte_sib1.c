@@ -37,8 +37,11 @@ static int nbits_for(int rng) {
 
 int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
                           atkdsp_lte_sib1 *out) {
+    static const int SI_PERIODICITY_RF[7] = {8, 16, 32, 64, 128, 256, 512};
+    static const int SI_WINDOW_MS[7] = {1, 2, 5, 10, 15, 20, 40};
     bitrd r;
     int csg_present, i, d, last_mcc_valid = 0, last_mcc[3] = {0,0,0};
+    int has_pmax, has_tdd, save, nsi, si_win;
     if (!bits || !out || nbits < 0) return ATKDSP_E_ARG;
     memset(out, 0, sizeof *out);
     out->csg_id = -1;
@@ -47,8 +50,8 @@ int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
     if (br_u(&r, 1) != 0) return 0;          /* BCCH-DL-SCH type CHOICE -> c1 */
     if (br_u(&r, 1) != 1) return 0;          /* c1 CHOICE -> SIB1             */
     (void)br_u(&r, 1);                        /* SIB1 extension bit           */
-    (void)br_u(&r, 1);                        /* p-Max present                */
-    (void)br_u(&r, 1);                        /* tdd-Config present           */
+    has_pmax = (int)br_u(&r, 1);              /* p-Max present                */
+    has_tdd  = (int)br_u(&r, 1);              /* tdd-Config present           */
     (void)br_u(&r, 1);                        /* nonCriticalExtension present */
     csg_present = (int)br_u(&r, 1);           /* cellAccessRelatedInfo csg    */
 
@@ -77,5 +80,42 @@ int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
     (void)br_u(&r, 1);                          /* csg-Indication BOOLEAN          */
     if (csg_present) out->csg_id = (int)br_u(&r, 27);
 
-    return r.bad ? 0 : 1;
+    if (r.bad) return 0;                        /* identity gates the return */
+
+    /* -- scheduling (best-effort; identity above is what gates the return) -- */
+    save = r.pos;
+    (void)br_u(&r, 1);                          /* q-RxLevMinOffset present   */
+    (void)br_u(&r, nbits_for(49));              /* q-RxLevMin (-70..-22)      */
+    if (has_pmax) (void)br_u(&r, nbits_for(64));/* p-Max                      */
+    out->freq_band = (int)br_u(&r, nbits_for(64)) + 1;   /* freqBandIndicator */
+    nsi = (int)br_u(&r, nbits_for(32)) + 1;     /* schedulingInfoList 1..32   */
+    out->n_sched = 0;
+    for (i = 0; i < nsi; ++i) {
+        int per = (int)br_u(&r, nbits_for(7));  /* si-Periodicity (7)         */
+        int nmap = (int)br_u(&r, nbits_for(32)); /* sib-MappingInfo SIZE(0..31)*/
+        int j;
+        atkdsp_lte_sched *sc = (out->n_sched < ATKDSP_LTE_MAX_SI)
+                               ? &out->sched[out->n_sched] : NULL;
+        if (sc) {
+            sc->periodicity_rf = (per < 7) ? SI_PERIODICITY_RF[per] : 0;
+            sc->n_sibs = 0;
+        }
+        for (j = 0; j < nmap; ++j) {
+            int sib;
+            (void)br_u(&r, 1);                  /* SIB-Type ext bit           */
+            sib = (int)br_u(&r, nbits_for(9)) + 3;
+            if (sc && sc->n_sibs < ATKDSP_LTE_MAX_SIBMAP)
+                sc->sibs[sc->n_sibs++] = sib;
+        }
+        if (sc) ++out->n_sched;
+    }
+    if (has_tdd) { (void)br_u(&r, nbits_for(7)); (void)br_u(&r, nbits_for(9)); }
+    si_win = (int)br_u(&r, nbits_for(7));       /* si-WindowLength (7)        */
+    if (r.bad) {                                /* identity-only stream       */
+        r.pos = save;
+        out->freq_band = 0; out->n_sched = 0; out->si_window_ms = 0;
+    } else {
+        out->si_window_ms = (si_win < 7) ? SI_WINDOW_MS[si_win] : 0;
+    }
+    return 1;
 }

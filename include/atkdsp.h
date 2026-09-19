@@ -31,7 +31,8 @@
  *      atkdsp_unpack_dc.) 2 -> 3 for the LTE cell search. 3 -> 4 PBCH/MIB,
  *      4 -> 5 the PRACH detector, 5 -> 6 the turbo decoder + CRC-24A that the
  *      SIB1 transport block rides on, 6 -> 7 the SIB1 identity (ASN.1 UPER),
- *      7 -> 8 the SIB1 physical-layer receive chain (subframe -> identity).
+ *      7 -> 8 the SIB1 physical-layer receive chain (subframe -> identity),
+ *      8 -> 9 SIB1 scheduling + the SIB2-5 network fingerprint.
  *
  * Sample convention: complex float32 as {re, im} pairs (same memory layout as
  * numpy complex64). All sizes are in SAMPLES unless the name says bytes.
@@ -59,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 8
-#define ATKDSP_VERSION_STRING "0.7.0"
+#define ATKDSP_ABI_VERSION 9
+#define ATKDSP_VERSION_STRING "0.8.0"
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -461,6 +462,16 @@ typedef struct {
     int reserved;    /* cellReservedForOperatorUse (1 = reserved)              */
 } atkdsp_lte_plmn;
 
+/* One entry of the SIB1 schedulingInfoList: an SI message's periodicity and
+ * the SIB types it carries (SIB2 is implicit in the first entry). */
+#define ATKDSP_LTE_MAX_SI      8
+#define ATKDSP_LTE_MAX_SIBMAP  8
+typedef struct {
+    int periodicity_rf;                 /* 8..512 radio frames                */
+    int n_sibs;
+    int sibs[ATKDSP_LTE_MAX_SIBMAP];    /* SIB-Type numbers (3..)             */
+} atkdsp_lte_sched;
+
 typedef struct {
     int             n_plmn;                    /* 1..6                         */
     atkdsp_lte_plmn plmn[ATKDSP_LTE_MAX_PLMN];
@@ -468,11 +479,16 @@ typedef struct {
     unsigned        cell_id;                   /* cellIdentity / ECI, 28-bit   */
     int             cell_barred;               /* cellBarred ENUMERATED index  */
     int             csg_id;                    /* -1 if absent                 */
+    /* scheduling (best-effort; 0 / empty if the bits stop after the identity) */
+    int             freq_band;                 /* freqBandIndicator, 0 if none */
+    int             si_window_ms;              /* si-WindowLength, 0 if none    */
+    int             n_sched;                   /* schedulingInfoList entries    */
+    atkdsp_lte_sched sched[ATKDSP_LTE_MAX_SI];
 } atkdsp_lte_sib1;
 
-/* Parse the tower identity from `nbits` decoded transport-block bits. Returns
- * 1 on a clean parse, 0 on a structural mismatch (not a SIB1, or the bits ran
- * out), <0 on a bad argument. */
+/* Parse the tower identity (and, best-effort, the scheduling) from `nbits`
+ * decoded transport-block bits. Returns 1 on a clean identity parse, 0 on a
+ * structural mismatch (not a SIB1, or the bits ran out), <0 on a bad argument. */
 ATKDSP_API int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
                                      atkdsp_lte_sib1 *out);
 
@@ -492,6 +508,88 @@ ATKDSP_API int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n,
                                       int n_rb, int n_id, int n_ports,
                                       int subframe, double cfo_hz,
                                       int equalize, atkdsp_lte_sib1 *out);
+
+/* ---- 11g. SystemInformation: the SIB2-5 network fingerprint ------------
+ * The SIB2+ messages (carried in BCCH-DL-SCH SystemInformation, scheduled by
+ * SIB1's schedulingInfoList) that make a cell's fingerprint: SIB2 (access
+ * barring, PRACH config, uplink carrier freq/bandwidth, reference-signal
+ * power), SIB3 (reselection), SIB4 (intra-frequency neighbour PCIs), SIB5
+ * (inter-frequency carriers + neighbour PCIs). All BROADCAST and public.
+ *
+ * GEOMETRY/LAYOUT CAVEAT: the ASN.1 field layouts are 36.331 R8 and are proven
+ * self-consistent by the round-trip cross-check, NOT against a real air
+ * capture. The neighbour lists and access barring are simple and
+ * high-confidence; the deep radioResourceConfig fields (PRACH, UL freq) most
+ * need a live-capture check. */
+#define ATKDSP_LTE_MAX_NEIGH 16
+#define ATKDSP_LTE_MAX_FREQ  8
+
+typedef struct { int pci; int q_off; } atkdsp_lte_neigh;
+
+typedef struct {
+    int present;
+    int barring;              /* ac-BarringInfo present (0/1)                 */
+    int barring_emergency;    /* ac-BarringForEmergency                      */
+    int prach_root;           /* rootSequenceIndex, 0..837                   */
+    int prach_config_index;   /* prach-ConfigIndex, 0..63                    */
+    int prach_high_speed;     /* highSpeedFlag                               */
+    int prach_zcc;            /* zeroCorrelationZoneConfig, 0..15            */
+    int prach_freq_offset;    /* prach-FreqOffset, 0..94                     */
+    int ref_sig_power;        /* referenceSignalPower, dBm (-60..50)         */
+    int ul_earfcn;            /* ul-CarrierFreq EARFCN, -1 if absent         */
+    int ul_bandwidth_rb;      /* 6/15/25/50/75/100, 0 if absent             */
+    int time_align_timer;     /* timeAlignmentTimerCommon enum index 0..7    */
+} atkdsp_lte_sib2;
+
+typedef struct {
+    int present;
+    int q_rxlevmin;           /* dBm                                          */
+    int s_intra_search;       /* -1 if absent                                */
+    int resel_priority;       /* cellReselectionPriority 0..7                */
+} atkdsp_lte_sib3;
+
+typedef struct {
+    int present;
+    int n_neigh;
+    atkdsp_lte_neigh neigh[ATKDSP_LTE_MAX_NEIGH];   /* intra-freq neighbours  */
+    int n_black;
+    int black_start[ATKDSP_LTE_MAX_NEIGH];          /* blacklist PCI starts   */
+} atkdsp_lte_sib4;
+
+typedef struct {
+    int dl_earfcn;                                   /* inter-freq carrier     */
+    int n_neigh;
+    int neigh_pci[ATKDSP_LTE_MAX_NEIGH];
+} atkdsp_lte_interfreq;
+
+typedef struct {
+    int present;
+    int n_freq;
+    atkdsp_lte_interfreq freq[ATKDSP_LTE_MAX_FREQ];
+} atkdsp_lte_sib5;
+
+typedef struct {
+    atkdsp_lte_sib2 sib2;
+    atkdsp_lte_sib3 sib3;
+    atkdsp_lte_sib4 sib4;
+    atkdsp_lte_sib5 sib5;
+} atkdsp_lte_si;
+
+/* Parse a SystemInformation message's transport-block bits into the SIBs it
+ * carries. Returns 1 on a clean parse, 0 on a structural mismatch, <0 on a bad
+ * argument. Each atkdsp_lte_sibN.present says whether that SIB was seen. */
+ATKDSP_API int atkdsp_lte_si_parse(const signed char *bits, int nbits,
+                                   atkdsp_lte_si *out);
+
+/* The whole receive chain for a SystemInformation message: same PHY as
+ * atkdsp_lte_sib1_decode (OFDM demod, CRS equalise, PCFICH, blind SI-RNTI
+ * PDCCH, PDSCH + turbo), then atkdsp_lte_si_parse. `subframe` is the SI-window
+ * subframe the caller scheduled from SIB1. Returns 1 with the SIBs in *out, 0
+ * when nothing decodes, <0 on error. */
+ATKDSP_API int atkdsp_lte_si_decode(const atkdsp_cf32 *samples, size_t n,
+                                    int n_rb, int n_id, int n_ports,
+                                    int subframe, double cfo_hz,
+                                    int equalize, atkdsp_lte_si *out);
 
 #ifdef __cplusplus
 }

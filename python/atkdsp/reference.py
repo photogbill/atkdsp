@@ -1334,10 +1334,23 @@ class _Sib1Reader:
             v = (v << 1) | int(self.b[self.pos]); self.pos += 1
         return v
 
+    def bit(self):
+        return self.u(1)
 
-def lte_sib1_encode(plmns, tac, cellid, csg_identity=None):
-    """Build BCCH-DL-SCH-Message bits carrying a SIB1. plmns = list of
-    {mcc:[3] or None, mnc:[2 or 3], reserved?}. Returns an int8 bit array."""
+
+# si-Periodicity index -> radio frames; si-WindowLength index -> ms.
+_SI_PERIODICITY_RF = [8, 16, 32, 64, 128, 256, 512]
+_SI_WINDOW_MS = [1, 2, 5, 10, 15, 20, 40]
+
+
+def lte_sib1_encode(plmns, tac, cellid, csg_identity=None, sched=None,
+                    si_window_idx=5, freq_band=1):
+    """Build BCCH-DL-SCH-Message bits carrying a (full) SIB1. plmns = list of
+    {mcc:[3] or None, mnc:[2 or 3], reserved?}. `sched` is the schedulingInfoList
+    as [{periodicity_idx, sibs:[SIB-Type ints]}]; a default (one SI message
+    carrying SIB3) is used when omitted. Returns an int8 bit array."""
+    if sched is None:
+        sched = [{"periodicity_idx": 1, "sibs": [3]}]
     b = []
     _sib1_write(b, 0, 1)                 # BCCH-DL-SCH type CHOICE -> c1
     _sib1_write(b, 1, 1)                 # c1 CHOICE -> systemInformationBlockType1
@@ -1365,19 +1378,38 @@ def lte_sib1_encode(plmns, tac, cellid, csg_identity=None):
     _sib1_write(b, 0, 1)                 # csg-Indication
     if csg_identity is not None:
         _sib1_write(b, csg_identity, 27)
+    # cellSelectionInfo
+    _sib1_write(b, 0, 1)                 # q-RxLevMinOffset absent
+    _sib1_write(b, -60 - (-70), _sib1_nbits(49))     # q-RxLevMin (-70..-22)
+    # (p-Max absent) ; freqBandIndicator (1..64)
+    _sib1_write(b, freq_band - 1, _sib1_nbits(64))
+    # schedulingInfoList SIZE(1..32)
+    _sib1_write(b, len(sched) - 1, _sib1_nbits(32))
+    for si in sched:
+        _sib1_write(b, si.get("periodicity_idx", 1), _sib1_nbits(7))
+        mapping = si.get("sibs", [])
+        _sib1_write(b, len(mapping), _sib1_nbits(32))    # SIB-MappingInfo SIZE(0..31)
+        for sib_type in mapping:
+            _sib1_write(b, 0, 1)                          # SIB-Type ext bit
+            _sib1_write(b, sib_type - 3, _sib1_nbits(9))  # sibType3->0, root 9
+    # (tdd-Config absent) ; si-WindowLength (7) ; systemInfoValueTag (0..31)
+    _sib1_write(b, si_window_idx, _sib1_nbits(7))
+    _sib1_write(b, 0, 5)
     return np.array(b, np.int8)
 
 
 def lte_sib1_decode(bits):
-    """Decode the tower identity from SIB1 transport-block bits. Returns a dict
-    or None on a structural mismatch."""
+    """Decode SIB1 transport-block bits: the tower identity, and (best-effort)
+    the scheduling that says where the SIB2+ messages sit. Returns a dict or
+    None on a structural mismatch. `sched`/`si_window_ms` are empty/0 if the
+    bits stop after the identity (an identity-only stream)."""
     r = _Sib1Reader(bits)
     if r.u(1) != 0:
         return None                     # not c1
     if r.u(1) != 1:
         return None                     # not SIB1
     _ext = r.u(1)
-    r.u(1); r.u(1); r.u(1)              # p-Max / tdd / nonCrit present
+    has_pmax = r.u(1); has_tdd = r.u(1); r.u(1)   # p-Max / tdd / nonCrit present
     csg_present = r.u(1)
     n_plmn = r.u(_sib1_nbits(6)) + 1
     if n_plmn < 1 or n_plmn > 6:
@@ -1403,8 +1435,41 @@ def lte_sib1_decode(bits):
     csg_id = r.u(27) if csg_present else None
     if r.bad:
         return None
-    return {"plmns": plmns, "tac": tac, "cellid": cellid,
-            "cell_barred": cell_barred, "csg_id": csg_id}
+    out = {"plmns": plmns, "tac": tac, "cellid": cellid,
+           "cell_barred": cell_barred, "csg_id": csg_id,
+           "freq_band": 0, "sched": [], "si_window_ms": 0, "si_window_idx": -1}
+    # -- scheduling (best-effort; identity above is what gates the return) --
+    save = r.pos
+    r.u(1)                              # q-RxLevMinOffset present
+    r.u(_sib1_nbits(49))               # q-RxLevMin
+    if has_pmax:
+        r.u(_sib1_nbits(64))           # p-Max
+    freq_band = r.u(_sib1_nbits(64)) + 1
+    nsi = r.u(_sib1_nbits(32)) + 1
+    sched = []
+    for _ in range(nsi):
+        per_idx = r.u(_sib1_nbits(7))
+        nmap = r.u(_sib1_nbits(32))
+        sibs = []
+        for _ in range(nmap):
+            r.u(1)                     # SIB-Type ext bit
+            sibs.append(r.u(_sib1_nbits(9)) + 3)
+        sched.append({"periodicity_idx": per_idx,
+                      "periodicity_rf": (_SI_PERIODICITY_RF[per_idx]
+                                         if per_idx < 7 else 0),
+                      "sibs": sibs})
+    if has_tdd:
+        r.u(_sib1_nbits(7)); r.u(_sib1_nbits(9))     # tdd-Config
+    si_window_idx = r.u(_sib1_nbits(7))
+    if not r.bad:
+        out["freq_band"] = freq_band
+        out["sched"] = sched
+        out["si_window_idx"] = si_window_idx
+        out["si_window_ms"] = (_SI_WINDOW_MS[si_window_idx]
+                               if si_window_idx < 7 else 0)
+    else:
+        r.pos = save                   # identity-only stream; leave sched empty
+    return out
 
 
 def lte_plmn_str(p):
@@ -1836,3 +1901,372 @@ def lte_sib1_decode_iq(samples, n_rb, n_id, n_ports, subframe,
                 info["K"] = K
                 return info
     return None
+
+
+# ============================================================================
+# 11g. SystemInformation: SIB2-5 network fingerprint (twin of src/lte_si.c)
+# ----------------------------------------------------------------------------
+# BCCH-DL-SCH -> c1 -> systemInformation -> SystemInformation-r8-IEs ->
+# sib-TypeAndInfo (a CHOICE per SIB). Extracts the fields that make a network
+# fingerprint: SIB2 (access barring, PRACH config, UL carrier freq/bandwidth,
+# reference-signal power), SIB3 (reselection), SIB4 (intra-freq neighbour PCIs),
+# SIB5 (inter-freq carriers + neighbour PCIs). Encoder + decoder, so a round
+# trip proves the codec self-consistent. 36.331 R8 ASN.1; the neighbour lists
+# and barring are high-confidence, the deep radioResourceConfig fields (PRACH,
+# UL freq) most need a live-capture check. Downlink broadcast only.
+# ============================================================================
+
+class _SiW:
+    def __init__(self):
+        self.bits = []
+
+    def u(self, value, n):
+        for i in range(n - 1, -1, -1):
+            self.bits.append((int(value) >> i) & 1)
+
+    def b(self, flag):
+        self.bits.append(1 if flag else 0)
+
+    def arr(self):
+        return np.array(self.bits, np.int8)
+
+
+def _si_ei(w, value, lb, ub):
+    w.u(int(value) - lb, _sib1_nbits(ub - lb + 1))
+
+
+def _si_di(r, lb, ub):
+    return r.u(_sib1_nbits(ub - lb + 1)) + lb
+
+
+def _si_ext_enc(w, idx, root):
+    w.b(0); w.u(idx, _sib1_nbits(root))
+
+
+def _si_ext_dec(r, root):
+    if r.bit():
+        return -1
+    return r.u(_sib1_nbits(root))
+
+
+# ---- SIB4 (intra-freq neighbours) ----------------------------------------
+def _lte_enc_sib4(w, s):
+    neigh = s.get("neighbors", []); black = s.get("blacklist", [])
+    csg = s.get("csg_range")
+    w.b(0); w.b(bool(neigh)); w.b(bool(black)); w.b(csg is not None)
+    if neigh:
+        _si_ei(w, len(neigh), 1, 16)
+        for nc in neigh:
+            w.b(0); _si_ei(w, nc["pci"], 0, 503); w.u(nc.get("q_off", 15), _sib1_nbits(31))
+    if black:
+        _si_ei(w, len(black), 1, 16)
+        for bc in black:
+            _lte_enc_pcid(w, bc)
+    if csg is not None:
+        _lte_enc_pcid(w, csg)
+
+
+def _lte_dec_sib4(r):
+    r.bit(); has_n = r.bit(); has_b = r.bit(); has_csg = r.bit()
+    out = {"neighbors": [], "blacklist": [], "csg_range": None}
+    if has_n:
+        for _ in range(_si_di(r, 1, 16)):
+            r.bit(); pci = _si_di(r, 0, 503); q = r.u(_sib1_nbits(31))
+            out["neighbors"].append({"pci": pci, "q_off": q})
+    if has_b:
+        for _ in range(_si_di(r, 1, 16)):
+            out["blacklist"].append(_lte_dec_pcid(r))
+    if has_csg:
+        out["csg_range"] = _lte_dec_pcid(r)
+    return out
+
+
+def _lte_enc_pcid(w, pr):
+    rng = pr.get("range")
+    w.b(rng is not None); _si_ei(w, pr["start"], 0, 503)
+    if rng is not None:
+        w.u(rng, _sib1_nbits(16))
+
+
+def _lte_dec_pcid(r):
+    has = r.bit(); start = _si_di(r, 0, 503)
+    return {"start": start, "range": r.u(_sib1_nbits(16)) if has else None}
+
+
+# ---- SIB5 (inter-freq carriers) ------------------------------------------
+def _lte_enc_sib5(w, s):
+    carriers = s["carriers"]
+    w.b(0); _si_ei(w, len(carriers), 1, 8)
+    for c in carriers:
+        p_max = c.get("p_max"); crp = c.get("resel_priority")
+        neigh = c.get("neighbors", []); black = c.get("blacklist", [])
+        w.b(0); w.b(p_max is not None); w.b(False); w.b(crp is not None)
+        w.b(False); w.b(bool(neigh)); w.b(bool(black))
+        _si_ei(w, c["dl_earfcn"], 0, 65535); _si_ei(w, c.get("q_rxlevmin", -60), -70, -22)
+        if p_max is not None:
+            _si_ei(w, p_max, -30, 33)
+        _si_ei(w, c.get("t_resel", 0), 0, 7)
+        _si_ei(w, c.get("thresh_high", 0), 0, 31); _si_ei(w, c.get("thresh_low", 0), 0, 31)
+        w.u(c.get("allowed_meas_bw", 5), _sib1_nbits(6)); w.b(c.get("presence_ant1", False))
+        if crp is not None:
+            _si_ei(w, crp, 0, 7)
+        w.u(c.get("neigh_cell_cfg", 0), 2)
+        if neigh:
+            _si_ei(w, len(neigh), 1, 16)
+            for nc in neigh:
+                _si_ei(w, nc["pci"], 0, 503); w.u(nc.get("q_off", 15), _sib1_nbits(31))
+        if black:
+            _si_ei(w, len(black), 1, 16)
+            for bc in black:
+                _lte_enc_pcid(w, bc)
+
+
+def _lte_dec_sib5(r):
+    r.bit(); nfreq = _si_di(r, 1, 8); carriers = []
+    for _ in range(nfreq):
+        r.bit()
+        has_pmax = r.bit(); has_sf = r.bit(); has_crp = r.bit()
+        has_qoff = r.bit(); has_neigh = r.bit(); has_black = r.bit()
+        dl = _si_di(r, 0, 65535); qmin = _si_di(r, -70, -22)
+        pmax = _si_di(r, -30, 33) if has_pmax else None
+        _si_di(r, 0, 7)                          # t-ReselectionEUTRA
+        if has_sf:
+            r.u(2); r.u(2)
+        _si_di(r, 0, 31); _si_di(r, 0, 31)       # threshX-High/Low
+        r.u(_sib1_nbits(6)); r.bit()             # allowedMeasBW, presenceAntennaPort1
+        crp = _si_di(r, 0, 7) if has_crp else None
+        r.u(2)                                   # neighCellConfig
+        if has_qoff:
+            r.u(_sib1_nbits(31))
+        neigh = []
+        if has_neigh:
+            for _ in range(_si_di(r, 1, 16)):
+                pci = _si_di(r, 0, 503); q = r.u(_sib1_nbits(31))
+                neigh.append({"pci": pci, "q_off": q})
+        black = []
+        if has_black:
+            for _ in range(_si_di(r, 1, 16)):
+                black.append(_lte_dec_pcid(r))
+        carriers.append({"dl_earfcn": dl, "q_rxlevmin": qmin, "p_max": pmax,
+                         "resel_priority": crp, "neighbors": neigh, "blacklist": black})
+    return {"carriers": carriers}
+
+
+# ---- SIB3 (cell reselection) ---------------------------------------------
+def _lte_enc_sib3(w, s):
+    w.b(0)
+    w.b(False); w.u(s.get("q_hyst", 0), _sib1_nbits(16))       # cellReselectionInfoCommon
+    s_non = s.get("s_non_intra_search")
+    w.b(s_non is not None)
+    if s_non is not None:
+        _si_ei(w, s_non, 0, 31)
+    _si_ei(w, s.get("thresh_serving_low", 0), 0, 31); _si_ei(w, s.get("resel_priority", 0), 0, 7)
+    p_max = s.get("p_max"); s_intra = s.get("s_intra_search"); amb = s.get("allowed_meas_bw")
+    w.b(p_max is not None); w.b(s_intra is not None); w.b(amb is not None); w.b(False)
+    _si_ei(w, s.get("q_rxlevmin", -60), -70, -22)
+    if p_max is not None:
+        _si_ei(w, p_max, -30, 33)
+    if s_intra is not None:
+        _si_ei(w, s_intra, 0, 31)
+    if amb is not None:
+        w.u(amb, _sib1_nbits(6))
+    w.b(s.get("presence_ant1", False)); w.u(s.get("neigh_cell_cfg", 0), 2)
+    _si_ei(w, s.get("t_resel", 0), 0, 7)
+
+
+def _lte_dec_sib3(r):
+    r.bit(); has_speed = r.bit(); q_hyst = r.u(_sib1_nbits(16))
+    if has_speed:
+        r.u(3); r.u(3); _si_di(r, 1, 16); _si_di(r, 1, 16); r.u(2); r.u(2)
+    has_snon = r.bit()
+    s_non = _si_di(r, 0, 31) if has_snon else None
+    _si_di(r, 0, 31)                             # threshServingLow
+    resel_prio = _si_di(r, 0, 7)
+    has_pmax = r.bit(); has_sintra = r.bit(); has_amb = r.bit(); has_sf = r.bit()
+    q_rxlevmin = _si_di(r, -70, -22)
+    p_max = _si_di(r, -30, 33) if has_pmax else None
+    s_intra = _si_di(r, 0, 31) if has_sintra else None
+    if has_amb:
+        r.u(_sib1_nbits(6))
+    r.bit(); r.u(2); _si_di(r, 0, 7)             # presenceAnt1, neighCellConfig, t-Resel
+    if has_sf:
+        r.u(2); r.u(2)
+    return {"q_hyst": q_hyst, "s_non_intra_search": s_non, "resel_priority": resel_prio,
+            "q_rxlevmin": q_rxlevmin, "p_max": p_max, "s_intra_search": s_intra}
+
+
+# ---- SIB2 (access barring + radioResourceConfigCommon + freqInfo) ---------
+def _lte_enc_acbc(w, cfg):
+    w.u(cfg.get("factor", 0), _sib1_nbits(16)); w.u(cfg.get("time", 0), _sib1_nbits(8))
+    w.u(cfg.get("special", 0), 5)
+
+
+def _lte_dec_acbc(r):
+    return {"factor": r.u(_sib1_nbits(16)), "time": r.u(_sib1_nbits(8)), "special": r.u(5)}
+
+
+def _lte_enc_rrc(w, rrc):
+    w.b(0)                                       # RRC-CommonSIB ext
+    w.b(0)                                       # RACH-ConfigCommon ext
+    w.b(False); w.u(rrc.get("num_ra_preambles", 0), _sib1_nbits(16))
+    w.u(0, _sib1_nbits(4)); w.u(0, _sib1_nbits(16))
+    w.u(0, _sib1_nbits(11)); w.u(0, _sib1_nbits(8)); w.u(0, _sib1_nbits(8))
+    _si_ei(w, 4, 1, 8)
+    w.b(0); w.u(0, _sib1_nbits(4))               # bcch-Config
+    w.b(0); w.u(0, _sib1_nbits(4)); w.u(0, _sib1_nbits(8))   # pcch-Config
+    _si_ei(w, rrc.get("prach_root", 0), 0, 837)
+    _si_ei(w, rrc.get("prach_config_index", 0), 0, 63)
+    w.b(rrc.get("prach_high_speed", False))
+    _si_ei(w, rrc.get("prach_zcc", 0), 0, 15); _si_ei(w, rrc.get("prach_freq_offset", 0), 0, 94)
+    _si_ei(w, rrc.get("ref_sig_power", 0), -60, 50); _si_ei(w, 0, 0, 3)
+    _si_ei(w, 1, 1, 4); w.u(0, 1); _si_ei(w, 0, 0, 98); w.b(False)
+    w.b(False); _si_ei(w, 0, 0, 29); w.b(False); _si_ei(w, 0, 0, 7)
+    w.u(0, _sib1_nbits(3)); _si_ei(w, 0, 0, 98); _si_ei(w, 0, 0, 7); _si_ei(w, 0, 0, 2047)
+    w.b(0)                                       # soundingRS release
+    _si_ei(w, 0, -126, 24); w.u(0, _sib1_nbits(8)); _si_ei(w, -100, -127, -96)
+    w.u(0, _sib1_nbits(3)); w.u(0, _sib1_nbits(3)); w.u(0, _sib1_nbits(4))
+    w.u(0, _sib1_nbits(3)); w.u(0, _sib1_nbits(3)); _si_ei(w, 0, -1, 6)
+    w.u(rrc.get("ul_cp", 0), _sib1_nbits(2))
+
+
+def _lte_dec_rrc(r):
+    out = {}
+    r.bit(); r.bit(); has_grpA = r.bit(); r.u(_sib1_nbits(16))
+    if has_grpA:
+        r.u(_sib1_nbits(15)); r.u(_sib1_nbits(4)); r.u(_sib1_nbits(8))
+    r.u(_sib1_nbits(4)); r.u(_sib1_nbits(16))
+    r.u(_sib1_nbits(11)); r.u(_sib1_nbits(8)); r.u(_sib1_nbits(8)); _si_di(r, 1, 8)
+    r.bit(); r.u(_sib1_nbits(4)); r.bit(); r.u(_sib1_nbits(4)); r.u(_sib1_nbits(8))
+    out["prach_root"] = _si_di(r, 0, 837)
+    out["prach_config_index"] = _si_di(r, 0, 63)
+    out["prach_high_speed"] = bool(r.bit())
+    out["prach_zcc"] = _si_di(r, 0, 15)
+    out["prach_freq_offset"] = _si_di(r, 0, 94)
+    out["ref_sig_power"] = _si_di(r, -60, 50); _si_di(r, 0, 3)
+    _si_di(r, 1, 4); r.u(1); _si_di(r, 0, 98); r.bit()
+    r.bit(); _si_di(r, 0, 29); r.bit(); _si_di(r, 0, 7)
+    r.u(_sib1_nbits(3)); _si_di(r, 0, 98); _si_di(r, 0, 7); _si_di(r, 0, 2047)
+    if r.bit():
+        r.bit(); r.u(_sib1_nbits(8)); r.u(_sib1_nbits(16)); r.bit()
+    _si_di(r, -126, 24); r.u(_sib1_nbits(8)); _si_di(r, -127, -96)
+    r.u(_sib1_nbits(3)); r.u(_sib1_nbits(3)); r.u(_sib1_nbits(4))
+    r.u(_sib1_nbits(3)); r.u(_sib1_nbits(3)); _si_di(r, -1, 6)
+    out["ul_cp"] = r.u(_sib1_nbits(2))
+    return out
+
+
+def _lte_enc_uetimers(w):
+    w.b(0)
+    for cnt in (8, 8, 7, 8, 7, 8):
+        w.u(0, _sib1_nbits(cnt))
+
+
+def _lte_dec_uetimers(r):
+    r.bit()
+    for cnt in (8, 8, 7, 8, 7, 8):
+        r.u(_sib1_nbits(cnt))
+
+
+def _lte_enc_mbsfn(w, lst):
+    _si_ei(w, len(lst), 1, 8)
+    for _ in lst:
+        w.u(0, _sib1_nbits(6)); _si_ei(w, 0, 0, 7); w.b(0); w.u(0, 6)
+
+
+def _lte_dec_mbsfn(r):
+    for _ in range(_si_di(r, 1, 8)):
+        r.u(_sib1_nbits(6)); _si_di(r, 0, 7)
+        if r.bit() == 0:
+            r.u(6)
+        else:
+            r.u(24)
+
+
+_UL_BW_RB = [6, 15, 25, 50, 75, 100]
+
+
+def _lte_enc_sib2(w, s):
+    ac = s.get("ac_barring"); mbsfn = s.get("mbsfn", [])
+    w.b(0); w.b(ac is not None); w.b(bool(mbsfn))
+    if ac is not None:
+        mo_sig = ac.get("mo_signalling"); mo_dat = ac.get("mo_data")
+        w.b(mo_sig is not None); w.b(mo_dat is not None); w.b(ac.get("emergency", False))
+        if mo_sig is not None:
+            _lte_enc_acbc(w, mo_sig)
+        if mo_dat is not None:
+            _lte_enc_acbc(w, mo_dat)
+    _lte_enc_rrc(w, s.get("rrc", {}))
+    _lte_enc_uetimers(w)
+    ul_e = s.get("ul_earfcn"); ul_bw = s.get("ul_bandwidth")
+    w.b(ul_e is not None); w.b(ul_bw is not None)
+    if ul_e is not None:
+        _si_ei(w, ul_e, 0, 65535)
+    if ul_bw is not None:
+        w.u(ul_bw, _sib1_nbits(6))
+    _si_ei(w, s.get("add_spectrum_emission", 1), 1, 32)
+    if mbsfn:
+        _lte_enc_mbsfn(w, mbsfn)
+    w.u(s.get("time_align_timer", 7), _sib1_nbits(8))
+
+
+def _lte_dec_sib2(r):
+    out = {}
+    r.bit(); has_ac = r.bit(); has_mbsfn = r.bit()
+    if has_ac:
+        has_sig = r.bit(); has_dat = r.bit()
+        out["ac_barring"] = True
+        out["ac_barring_emergency"] = bool(r.bit())
+        out["ac_barring_mo_signalling"] = _lte_dec_acbc(r) if has_sig else None
+        out["ac_barring_mo_data"] = _lte_dec_acbc(r) if has_dat else None
+    else:
+        out["ac_barring"] = False
+    out["rrc"] = _lte_dec_rrc(r)
+    _lte_dec_uetimers(r)
+    has_ulf = r.bit(); has_ulbw = r.bit()
+    out["ul_earfcn"] = _si_di(r, 0, 65535) if has_ulf else None
+    bw_idx = r.u(_sib1_nbits(6)) if has_ulbw else None
+    out["ul_bandwidth_rb"] = (_UL_BW_RB[bw_idx] if (bw_idx is not None and bw_idx < 6) else 0)
+    _si_di(r, 1, 32)                             # additionalSpectrumEmission
+    if has_mbsfn:
+        _lte_dec_mbsfn(r)
+    out["time_align_timer"] = r.u(_sib1_nbits(8))
+    return out
+
+
+# ---- SystemInformation container -----------------------------------------
+_SIB_CHOICE_ROOT = 10
+_LTE_SI_ENC = {2: _lte_enc_sib2, 3: _lte_enc_sib3, 4: _lte_enc_sib4, 5: _lte_enc_sib5}
+_LTE_SI_DEC = {2: _lte_dec_sib2, 3: _lte_dec_sib3, 4: _lte_dec_sib4, 5: _lte_dec_sib5}
+
+
+def lte_si_encode(sibs):
+    """sibs: [(sib_type_int, sib_dict), ...] in one SI message. int8 bit array."""
+    w = _SiW()
+    w.b(0); w.b(0); w.b(0); w.b(0)               # c1/systemInformation/r8/nonCrit
+    _si_ei(w, len(sibs), 1, 32)
+    for st, sd in sibs:
+        _si_ext_enc(w, st - 2, _SIB_CHOICE_ROOT)
+        _LTE_SI_ENC[st](w, sd)
+    return w.arr()
+
+
+def lte_si_decode(bits):
+    """Decode a SystemInformation message's transport-block bits to
+    {"sibs": [(type, dict), ...]}, or None on a structural mismatch."""
+    r = _Sib1Reader(bits)
+    if r.bit() != 0 or r.bit() != 0 or r.bit() != 0:
+        return None                              # not c1/systemInformation/r8
+    r.bit()                                       # nonCriticalExtension present
+    n = _si_di(r, 1, 32)
+    sibs = []
+    for _ in range(n):
+        idx = _si_ext_dec(r, _SIB_CHOICE_ROOT)
+        if idx < 0:
+            break
+        st = idx + 2
+        if st not in _LTE_SI_DEC:
+            break                                 # sib6..sib11 not modelled
+        sibs.append((st, _LTE_SI_DEC[st](r)))
+    if r.bad:
+        return None
+    return {"sibs": sibs}

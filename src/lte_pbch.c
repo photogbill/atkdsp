@@ -31,6 +31,16 @@
 #define MIB_BITS  24
 #define FRAME_BITS 40         /* MIB + CRC16                               */
 #define CODED_BITS 120        /* rate-1/3 tail-biting mother codeword      */
+
+/* Transform-domain (DFT) CRS channel-estimate denoising. The 12 evenly spaced
+ * CRS knots are one period of the channel's frequency response; their 12-point
+ * IDFT is its impulse response, whose energy lives in the first few taps (the
+ * real multipath, all inside the CP) while estimation noise is spread over all
+ * twelve. Zeroing the tail taps and transforming back removes most of that
+ * noise before interpolation — measured ~+2-3 dB of PBCH sensitivity on a
+ * frequency-selective channel, with NTAP=4 the best across the SNR sweep
+ * (scratch/wsig.py). 0 disables it (plain LS + interp, the old behaviour). */
+#define PBCH_CHEST_NTAP 4
 #define MAXW      4           /* frames soft-combined in one window        */
 
 static const double SQ = 0.70710678118654752440;   /* 1/sqrt(2) */
@@ -248,6 +258,38 @@ static void demod_block(const atkdsp_lte *h, const atkdsp_cf32 *block,
     }
 }
 
+/* 12-point transform-domain denoise of the CRS channel knots, in place.
+ * Matches numpy: g = ifft(hk) (with 1/N), zero g[ntap:], hk = fft(g). Both
+ * transforms are direct 12-point DFTs (144 flops each — negligible). */
+static void chest_denoise12(double hre[12], double him[12], int ntap) {
+    double gre[12], gim[12];
+    int k, n;
+    if (ntap <= 0 || ntap >= 12) return;
+    /* g[k] = (1/12) sum_n hk[n] exp(+2*pi*i*k*n/12)  (inverse DFT) */
+    for (k = 0; k < 12; ++k) {
+        double sr = 0.0, si = 0.0;
+        for (n = 0; n < 12; ++n) {
+            const double ph = 2.0 * ATK_PI * (double)(k * n) / 12.0;
+            const double c = cos(ph), s = sin(ph);
+            sr += hre[n] * c - him[n] * s;
+            si += hre[n] * s + him[n] * c;
+        }
+        gre[k] = sr / 12.0; gim[k] = si / 12.0;
+    }
+    for (k = ntap; k < 12; ++k) { gre[k] = 0.0; gim[k] = 0.0; }
+    /* hk[m] = sum_k g[k] exp(-2*pi*i*m*k/12)  (forward DFT) */
+    for (n = 0; n < 12; ++n) {
+        double sr = 0.0, si = 0.0;
+        for (k = 0; k < 12; ++k) {
+            const double ph = -2.0 * ATK_PI * (double)(n * k) / 12.0;
+            const double c = cos(ph), s = sin(ph);
+            sr += gre[k] * c - gim[k] * s;
+            si += gre[k] * s + gim[k] * c;
+        }
+        hre[n] = sr; him[n] = si;
+    }
+}
+
 /* estimate H[port][72] from CRS (held across the 4 PBCH symbols) */
 static void estimate_channels(int n_id, atkdsp_cf32 Y[4][NSC],
                               double Hre[4][NSC], double Him[4][NSC]) {
@@ -263,6 +305,7 @@ static void estimate_channels(int n_id, atkdsp_cf32 Y[4][NSC],
             hre[m] = yr * cre[m] + yi * cim[m];
             him[m] = yi * cre[m] - yr * cim[m];
         }
+        chest_denoise12(hre, him, PBCH_CHEST_NTAP);
         interp72(pos, hre, him, Hre[port], Him[port]);
     }
 }

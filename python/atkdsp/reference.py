@@ -547,32 +547,57 @@ def lte_sss_symbol(nid1: int, nid2: int, subframe: int) -> np.ndarray:
     return d
 
 
+#: CFAR margin (sigmas) for the non-coherent PSS fold; matches PSS_NI_K in
+#: src/lte.c.
+LTE_PSS_NI_K = 9.0
+
+
 def lte_detect(x, min_metric: float = 0.06):
-    """The strongest cell in `x` (which must be at LTE_RATE), or []."""
+    """The strongest cell in `x` (which must be at LTE_RATE), or []. Mirrors
+    src/lte.c: a proven single-shot path (min_metric + 5 ms mate) for strong
+    cells, and a non-coherent-integration fallback (fold the metric modulo the
+    PSS period, CFAR on the fold) that catches weak cells the single shot
+    misses. See atkdsp_lte_detect."""
     x = np.asarray(x, dtype=np.complex128)
     n = x.size
     if n < 2 * LTE_PSS_PERIOD:
         return []
     valid = n - LTE_SYM
+    P = LTE_PSS_PERIOD
     e = np.convolve(np.abs(x) ** 2, np.ones(LTE_SYM), mode="valid")[:valid + 1]
     best = None
+    ni = None                            # {margin, nid2, offset, metric}
     for nid2 in range(3):
         p = np.asarray(lte_pss_symbol(nid2), dtype=np.complex128)
         pe = float(np.vdot(p, p).real)
         c = np.correlate(x, p, mode="valid")[:valid + 1]
         m = (np.abs(c) ** 2) / np.maximum(e * pe, 1e-20)
         k = int(np.argmax(m))
-        if m[k] < min_metric:
-            continue
-        # the mate must reach half of THIS peak, not half of the threshold:
-        # a cell's two occurrences are within a fade of each other, noise
-        # clearing an absolute bar twice is not
-        mate = any(0 <= k + d <= valid and m[k + d] > 0.5 * m[k]
-                   for d in (-LTE_PSS_PERIOD, LTE_PSS_PERIOD))
-        if not mate:
-            continue
-        if best is None or m[k] > best["metric"]:
-            best = {"nid2": nid2, "offset": k, "metric": float(m[k])}
+        # proven single-shot path: min_metric + the 5 ms mate. The mate must
+        # reach half of THIS peak, not half the threshold — a cell's two
+        # occurrences are within a fade of each other, noise clearing an
+        # absolute bar twice is not.
+        if m[k] >= min_metric:
+            mate = any(0 <= k + d <= valid and m[k + d] > 0.5 * m[k]
+                       for d in (-P, P))
+            if mate and (best is None or m[k] > best["metric"]):
+                best = {"nid2": nid2, "offset": k, "metric": float(m[k])}
+        # non-coherent fold: average each residue over its occurrences, CFAR
+        # test the peak against the fold's own mean (peak bin excluded).
+        nb = (valid + 1) // P
+        if nb >= 1:
+            mf = m[:nb * P].reshape(nb, P).mean(axis=0)
+            rpk = int(np.argmax(mf))
+            other = np.delete(mf, rpk)
+            mean = float(other.mean()); sd = float(other.std())
+            margin = (mf[rpk] - mean) / sd if sd > 1e-30 else 0.0
+            if margin >= LTE_PSS_NI_K and (ni is None or margin > ni["margin"]):
+                occ = np.arange(rpk, valid + 1, P)
+                bk = int(occ[np.argmax(m[occ])])
+                ni = {"margin": margin, "nid2": nid2, "offset": bk,
+                      "metric": float(m[bk])}
+    if best is None:                     # single shot found nothing: NI fallback
+        best = ni
     if best is None:
         return []
     k, nid2 = best["offset"], best["nid2"]
@@ -601,6 +626,10 @@ _PB_NFFT, _PB_NSC, _PB_DC = 128, 72, 36
 _PB_CP0, _PB_CP1 = 10, 9
 _PB_NRB_MAX = 110
 _PB_SQ = 1.0 / np.sqrt(2.0)
+#: Transform-domain CRS channel-estimate denoising: keep this many of the 12
+#: IDFT "delay" taps (the channel lives in the first few; noise fills all 12).
+#: Must match PBCH_CHEST_NTAP in src/lte_pbch.c. 0 disables it.
+_PB_CHEST_NTAP = 4
 _PB_PERM = np.array([1,17,9,25,5,21,13,29,3,19,11,27,7,23,15,31,
                      0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30])
 _PB_GEN = (0o133, 0o171, 0o165)
@@ -860,12 +889,23 @@ def lte_build_pbch_samples(mib24, n_id, n_ports, sfn, H_ports,
     return sig.astype(np.complex64)
 
 
+def _pb_chest_denoise(hk, ntap=_PB_CHEST_NTAP):
+    """12-point transform-domain denoise of the CRS knots (see src/lte_pbch.c
+    chest_denoise12). g = ifft(hk); keep first ntap taps; hk = fft(g)."""
+    if ntap <= 0 or ntap >= len(hk):
+        return hk
+    g = np.fft.ifft(hk)
+    g[ntap:] = 0.0
+    return np.fft.fft(g)
+
+
 def _pb_channels(Y, n_id):
     H = {}
     for p in range(4):
         l = _pb_crs_sym(p)
         r = lte_crs_central(n_id, l); pos = lte_crs_pos(n_id, p, l)
         hk = np.array([Y[l][k] / r[m] for m, k in enumerate(pos)])
+        hk = _pb_chest_denoise(hk)
         pos = np.array(pos)
         H[p] = (np.interp(np.arange(_PB_NSC), pos, hk.real)
                 + 1j*np.interp(np.arange(_PB_NSC), pos, hk.imag))
@@ -938,7 +978,10 @@ def lte_mib_decode(block, n_id, cfo_hz=0.0):
 
 # ---- 11c. Passive PRACH detector (the spec src/lte_prach.c is held to) ----
 PRACH_NZC = 839
-PRACH_MIN_METRIC = 40.0
+PRACH_MIN_METRIC = 40.0          # legacy strong-only gate (explicit callers)
+PRACH_CAND_GATE = 8.0            # loose D-tone gate to surface candidates
+PRACH_COH_THR = 30.0             # coherent PDP peak/median confirm threshold
+PRACH_MAX_CAND = 8               # candidates examined per window (cost bound)
 _PRACH_COUNT_FRAC = 0.30
 
 
@@ -971,10 +1014,12 @@ def prach_build_capture(accesses, N=PRACH_NZC, snr_db=10.0, channel=None,
     return y.astype(np.complex64)
 
 
-def prach_detect(seq, min_metric=PRACH_MIN_METRIC, N=PRACH_NZC,
+def prach_detect(seq, min_metric=PRACH_CAND_GATE, N=PRACH_NZC,
                  count_thresh=_PRACH_COUNT_FRAC):
     """Detect PRACH preambles. Returns [{root, count, metric, delay}], the
-    strongest tone first."""
+    strongest tone first. Mirrors src/lte_prach.c: the D-tone FFT surfaces
+    candidate roots at a loose gate, each confirmed on its coherent power-delay
+    profile (peak/median >= PRACH_COH_THR); at most PRACH_MAX_CAND examined."""
     seq = np.asarray(seq, complex)
     Y = np.fft.fft(seq)
     D = Y[1:] * np.conj(Y[:-1])
@@ -982,17 +1027,22 @@ def prach_detect(seq, min_metric=PRACH_MIN_METRIC, N=PRACH_NZC,
     med = float(np.median(S)) + 1e-30
     out = []
     claimed = np.zeros(N, dtype=bool)
-    while True:
+    ncand = 0
+    while ncand < PRACH_MAX_CAND:
         b = int(np.argmax(np.where(claimed, -1.0, S)))
         if claimed[b] or S[b] / med < min_metric:
             break
         for d in range(-2, 3):
             claimed[(b + d) % N] = True
+        ncand += 1
         u = (N - b) % N
         if u == 0:
             continue
         pdp = np.abs(np.fft.ifft(Y * np.conj(prach_zc(u, N)))) ** 2
-        top = pdp.max()
+        top = float(pdp.max())
+        # coherent confirm: matched-filter peak over the PDP's own median
+        if top / (float(np.median(pdp)) + 1e-30) < PRACH_COH_THR:
+            continue
         thr = count_thresh * top
         count, delay, dtop = 0, 0, -1.0
         for k in range(N):
@@ -1006,7 +1056,7 @@ def prach_detect(seq, min_metric=PRACH_MIN_METRIC, N=PRACH_NZC,
     return out
 
 
-def prach_scan(stream, win_step=64, min_metric=PRACH_MIN_METRIC, N=PRACH_NZC):
+def prach_scan(stream, win_step=64, min_metric=PRACH_CAND_GATE, N=PRACH_NZC):
     """Slide an N-sample window across a longer capture; merge hits by root."""
     stream = np.asarray(stream, complex)
     merged = {}
@@ -1198,6 +1248,8 @@ def lte_rate_dematch_turbo(e_llr, D, E, rv=0, Ncb=None):
 
 
 _T_NEG = -1e18
+#: Extrinsic scaling for max-log-MAP (see TURBO_EXT_SCALE in src/lte_turbo.c).
+_TURBO_EXT_SCALE = 0.75
 
 
 def _t_bcjr(sys_llr, par_llr, apri):
@@ -1259,8 +1311,8 @@ def lte_turbo_decode_from_d(d0, d1, d2, K, iters=8):
     apri = np.zeros(K)
     for _ in range(iters):
         e1 = _t_bcjr(sys1, par1, apri)
-        e2 = _t_bcjr(sys2, par2, e1[pi])
-        apri = e2[inv]
+        e2 = _t_bcjr(sys2, par2, _TURBO_EXT_SCALE * e1[pi])
+        apri = _TURBO_EXT_SCALE * e2[inv]
     e1 = _t_bcjr(sys1, par1, apri)
     llr = sys + apri + e1
     return (llr < 0).astype(np.int8)
@@ -1590,6 +1642,23 @@ def lte_crs_re_set(n_id, n_rb, n_ports):
     return occ
 
 
+#: Keep cnt/_SIB_CHEST_NTAP_DEN transform-domain taps (match SIB_CHEST_NTAP_DEN
+#: in src/lte_sib1_phy.c).
+_SIB_CHEST_NTAP_DEN = 3
+
+
+def _sib_chest_denoise(hval, den=_SIB_CHEST_NTAP_DEN):
+    """Transform-domain denoise of the uniformly spaced CRS channel knots (see
+    chest_denoise in src/lte_sib1_phy.c). g = ifft(hk); keep cnt/den taps."""
+    cnt = len(hval)
+    ntap = cnt // den
+    if ntap <= 0 or ntap >= cnt:
+        return hval
+    g = np.fft.ifft(hval)
+    g[ntap:] = 0.0
+    return np.fft.fft(g)
+
+
 def _sib1_equalize(grid, n_id, n_rb, gp):
     """Port-0 single-tap zero-forcing: estimate H at CRS REs per CRS symbol,
     linear-interpolate across the band, apply the nearest CRS symbol's H."""
@@ -1602,6 +1671,7 @@ def _sib1_equalize(grid, n_id, n_rb, gp):
             y = grid[k, sym]
             pos.append(k); hval.append(y * np.conj(ref_val))    # |crs|=1
         pos = np.array(pos); hval = np.array(hval)
+        hval = _sib_chest_denoise(hval)                         # transform-domain denoise
         H = (np.interp(np.arange(n_sc), pos, hval.real)
              + 1j * np.interp(np.arange(n_sc), pos, hval.imag))
         Hsym[sym] = H

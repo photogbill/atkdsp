@@ -78,6 +78,13 @@ static const int TPERM[32] = {
 
 #define NEG (-1e18)
 
+/* Extrinsic scaling for max-log-MAP. The max-log approximation overestimates
+ * the extrinsic magnitude; multiplying it by ~0.7-0.75 before it feeds the
+ * other constituent decoder recovers most of the gap to full log-MAP —
+ * ~0.3-0.5 dB on the SIB turbo blocks, free. Must match _TURBO_EXT_SCALE in
+ * atkdsp.reference. 1.0 = plain max-log-MAP (the old behaviour). */
+#define TURBO_EXT_SCALE 0.75
+
 /* RSC trellis: state = (r1<<2)|(r2<<1)|r3, r1 newest.
  * a = u^r2^r3 (feedback g0=1+D^2+D^3); z = a^r1^r3 (parity g1=1+D+D^3);
  * ns = (a<<2)|(r1<<1)|r2. TAIL_U[s] drives a=0. */
@@ -308,9 +315,11 @@ static int turbo_decode_d(const double *d0, const double *d1, const double *d2,
 
     for (it = 0; it < iters; ++it) {
         bcjr(sys1, par1, apri, K, alpha, beta, e1);
-        for (k = 0; k < K; ++k) tmp[k] = e1[pi[k]];      /* e1 interleaved */
+        for (k = 0; k < K; ++k)                          /* e1 interleaved */
+            tmp[k] = TURBO_EXT_SCALE * e1[pi[k]];
         bcjr(sys2, par2, tmp, K, alpha, beta, e2);
-        for (k = 0; k < K; ++k) apri[k] = e2[inv[k]];    /* e2 deinterleaved */
+        for (k = 0; k < K; ++k)                          /* e2 deinterleaved */
+            apri[k] = TURBO_EXT_SCALE * e2[inv[k]];
     }
     bcjr(sys1, par1, apri, K, alpha, beta, e1);
     for (k = 0; k < K; ++k) {

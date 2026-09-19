@@ -65,6 +65,8 @@ struct atkdsp_lte {
     size_t       scan_n;
     atkdsp_cf32 *X, *P, *Z;   /* scan_n each                                 */
     double      *energy;      /* scan_n running |x|^2 over 128               */
+    double      *fold;        /* PSS_PERIOD  non-coherent PSS fold accum     */
+    int         *fcount;      /* PSS_PERIOD  occurrences per residue         */
     int32_t     *vit_bp;      /* ATK_LTE_VIT_LAPS*40*64 Viterbi backpointers */
 };
 

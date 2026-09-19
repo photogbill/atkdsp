@@ -143,6 +143,41 @@ static void interp_clamp(const int *xp, const double *fpr, const double *fpi,
     }
 }
 
+/* Transform-domain denoise of `cnt` uniformly spaced CRS channel knots, in
+ * place. Same idea as the PBCH chest_denoise12 (src/lte_pbch.c): the knots are
+ * one period of the frequency response sampled every 6 subcarriers; their IDFT
+ * is the impulse response, whose energy is in the first few taps. Keeping ntap
+ * of them (here cnt/3, the same delay window the PBCH's 4-of-12 was tuned to)
+ * strips most of the estimation noise before interpolation. ntap<=0 or >=cnt
+ * disables it. Direct cnt-point DFTs (cnt<=220), called once per subframe. */
+#define SIB_CHEST_NTAP_DEN 3      /* keep cnt/SIB_CHEST_NTAP_DEN taps */
+static void chest_denoise(double *hre, double *him, int cnt, int ntap) {
+    double gre[2 * NRB_MAX], gim[2 * NRB_MAX];
+    int k, n;
+    if (ntap <= 0 || ntap >= cnt || cnt > 2 * NRB_MAX) return;
+    for (k = 0; k < cnt; ++k) {                 /* g = ifft(hk)  (1/cnt norm) */
+        double sr = 0.0, si = 0.0;
+        for (n = 0; n < cnt; ++n) {
+            const double ph = 2.0 * ATK_PI * (double)(k * n) / (double)cnt;
+            const double c = cos(ph), s = sin(ph);
+            sr += hre[n] * c - him[n] * s;
+            si += hre[n] * s + him[n] * c;
+        }
+        gre[k] = sr / (double)cnt; gim[k] = si / (double)cnt;
+    }
+    for (k = ntap; k < cnt; ++k) { gre[k] = 0.0; gim[k] = 0.0; }
+    for (n = 0; n < cnt; ++n) {                  /* hk = fft(g) */
+        double sr = 0.0, si = 0.0;
+        for (k = 0; k < cnt; ++k) {
+            const double ph = -2.0 * ATK_PI * (double)(n * k) / (double)cnt;
+            const double c = cos(ph), s = sin(ph);
+            sr += gre[k] * c - gim[k] * s;
+            si += gre[k] * s + gim[k] * c;
+        }
+        hre[n] = sr; him[n] = si;
+    }
+}
+
 /* Port-0 single-tap ZF equalisation of the whole grid, in place. CRS symbols
  * are {0,4,7,11}; each data symbol uses the nearest CRS symbol's H (ties to
  * the earlier). */
@@ -172,6 +207,7 @@ static int equalize(atkdsp_cf32 *grid, int n_id, int n_rb) {
             hkr[m] = y.re * cre[m] + y.im * cim[m];
             hki[m] = y.im * cre[m] - y.re * cim[m];
         }
+        chest_denoise(hkr, hki, cnt, cnt / SIB_CHEST_NTAP_DEN);
         interp_clamp(pos, hkr, hki, cnt, n_sc,
                      Hre + (size_t)ci * n_sc, Him + (size_t)ci * n_sc);
     }

@@ -24,6 +24,18 @@
  * PSS, so its data starts exactly one symbol (9 CP + 128) earlier. */
 #define SSS_BACK 137
 
+/* Non-coherent PSS integration (weak-signal detection). A cell repeats its PSS
+ * every 5 ms (PSS_PERIOD samples); over a long buffer there are dozens to
+ * hundreds of occurrences. Folding the normalised correlation metric modulo the
+ * period and averaging the occurrences lifts a cell that no single occurrence
+ * shows above the noise — measured reliable to ~-18 dB per-PSS-sample SNR (the
+ * single-shot path dies near -13 dB) with zero false alarms in noise. The fold
+ * is a CFAR test: its peak must exceed the fold's own mean by PSS_NI_K standard
+ * deviations. K=9 gave 0 false alarms over 150 noise buffers and 100% detection
+ * to -18 dB (scratch/pssni2.py). It runs only as a FALLBACK when the proven
+ * single-shot path finds nothing, so strong-cell behaviour is unchanged. */
+#define PSS_NI_K 9.0
+
 static const int PSS_ROOTS[3] = { 25, 29, 34 };
 
 /* struct atkdsp_lte now lives in internal.h (shared with lte_pbch.c). */
@@ -131,7 +143,12 @@ atkdsp_lte *atkdsp_lte_create(void) {
     h->sss = (float *)atk_aligned_malloc((size_t)3 * NSSS * NCARR * sizeof(float));
     h->vit_bp = (int32_t *)atk_aligned_malloc(
         (size_t)ATK_LTE_VIT_LAPS * 40 * 64 * sizeof(int32_t));
-    if (!h->sym || !h->pss || !h->pss_freq || !h->sss || !h->vit_bp) {
+    h->fold   = (double *)atk_aligned_malloc(
+        (size_t)ATKDSP_LTE_PSS_PERIOD * sizeof(double));
+    h->fcount = (int *)atk_aligned_malloc(
+        (size_t)ATKDSP_LTE_PSS_PERIOD * sizeof(int));
+    if (!h->sym || !h->pss || !h->pss_freq || !h->sss || !h->vit_bp
+            || !h->fold || !h->fcount) {
         atkdsp_lte_destroy(h); return NULL;
     }
     for (u = 0; u < 3; ++u) {
@@ -168,6 +185,8 @@ void atkdsp_lte_destroy(atkdsp_lte *h) {
     atk_aligned_free(h->P);
     atk_aligned_free(h->Z);
     atk_aligned_free(h->energy);
+    atk_aligned_free(h->fold);
+    atk_aligned_free(h->fcount);
     atk_aligned_free(h->vit_bp);
     free(h);
 }
@@ -218,9 +237,14 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
     }
     if (atkdsp_fft_exec(h->scan, in, h->X, 0) != ATKDSP_OK) return ATKDSP_E_FFT;
 
+    {   /* non-coherent fold fallback candidate, chosen across nid2 by margin */
+    int ni_u = -1; size_t ni_k = 0; double ni_margin = 0.0, ni_metric = 0.0;
+    const int P = ATKDSP_LTE_PSS_PERIOD;
     for (u = 0; u < 3; ++u) {
         const atkdsp_cf32 *ref = h->pss + (size_t)u * NSYM;
+        const double pe = (double)h->pss_energy[u];
         double top = 0.0; size_t top_k = 0;
+        int r;
         memset(h->P, 0, n * sizeof(atkdsp_cf32));
         memcpy(h->P, ref, NSYM * sizeof(atkdsp_cf32));
         if (atkdsp_fft_exec(h->scan, h->P, h->Z, 0) != ATKDSP_OK) return ATKDSP_E_FFT;
@@ -232,21 +256,26 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
             h->P[i].im = xi * pr - xr * pi;
         }
         if (atkdsp_fft_exec(h->scan, h->P, h->Z, 1) != ATKDSP_OK) return ATKDSP_E_FFT;
+        /* single-shot peak AND non-coherent fold, in one pass. r tracks
+         * k mod PSS_PERIOD without a per-sample division. */
+        memset(h->fold, 0, (size_t)P * sizeof(double));
+        memset(h->fcount, 0, (size_t)P * sizeof(int));
+        r = 0;
         for (k = 0; k <= valid; ++k) {
             const double cr = h->Z[k].re, ci = h->Z[k].im;
-            const double e = h->energy[k] * (double)h->pss_energy[u];
+            const double e = h->energy[k] * pe;
             const double m = (e > 1e-20) ? (cr * cr + ci * ci) / e : 0.0;
             if (m > top) { top = m; top_k = k; }
+            h->fold[r] += m; h->fcount[r]++;
+            if (++r == P) r = 0;
         }
-        if (top < (double)min_metric) continue;
-        /* CONFIRM THE 5 ms REPEAT. A single strong correlation is an impulse
-         * or a coincidence; a cell does this twice every radio frame, for
-         * ever. The mate is required to reach half of THIS peak rather than
-         * half of the threshold: a real cell's two occurrences are within a
-         * fade of each other, while noise that happens to clear an absolute
-         * bar twice does not. Written the weak way it let one detection
-         * through in eight seeds of pure noise. */
-        {
+        /* ---- proven single-shot path (strong cells): min_metric + 5 ms mate.
+         * A single strong correlation is an impulse or a coincidence; a cell
+         * does this twice every radio frame. The mate must reach half of THIS
+         * peak, not half the threshold — a real cell's two occurrences are
+         * within a fade of each other, noise clearing an absolute bar twice is
+         * not. */
+        if (top >= (double)min_metric) {
             int mate = 0;
             long long d;
             for (d = -ATKDSP_LTE_PSS_PERIOD; d <= ATKDSP_LTE_PSS_PERIOD;
@@ -255,16 +284,51 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
                 if (kk < 0 || (size_t)kk > valid) continue;
                 {
                     const double cr = h->Z[kk].re, ci = h->Z[kk].im;
-                    const double e = h->energy[kk] * (double)h->pss_energy[u];
+                    const double e = h->energy[kk] * pe;
                     if (e > 1e-20 && (cr * cr + ci * ci) / e > 0.5 * top)
                         mate = 1;
                 }
             }
-            if (!mate) continue;
+            if (mate && top > best_m) { best_m = top; best_k = top_k; best_u = u; }
         }
-        if (top > best_m) { best_m = top; best_k = top_k; best_u = u; }
+        /* ---- non-coherent fold (weak cells the single shot misses). Average
+         * each residue over its occurrences, then a CFAR test: the fold peak
+         * must stand PSS_NI_K sigma above the fold's own mean (peak bin
+         * excluded). Folding IS the repeat confirmation, so no separate mate. */
+        {
+            int rpk = 0; double pk = -1.0, sum = 0.0, sq = 0.0; int cnt = 0;
+            for (r = 0; r < P; ++r)
+                if (h->fcount[r]) h->fold[r] /= (double)h->fcount[r];
+            for (r = 0; r < P; ++r)
+                if (h->fold[r] > pk) { pk = h->fold[r]; rpk = r; }
+            for (r = 0; r < P; ++r) {
+                if (r == rpk) continue;
+                sum += h->fold[r]; sq += h->fold[r] * h->fold[r]; ++cnt;
+            }
+            if (cnt > 1) {
+                const double mean = sum / cnt;
+                const double var = sq / cnt - mean * mean;
+                const double sd = (var > 0.0) ? sqrt(var) : 0.0;
+                const double margin = (sd > 1e-30) ? (pk - mean) / sd : 0.0;
+                if (margin >= PSS_NI_K && margin > ni_margin) {
+                    size_t bk = (size_t)rpk; double bm = -1.0;
+                    long long kk;
+                    for (kk = rpk; (size_t)kk <= valid; kk += P) {
+                        const double cr = h->Z[kk].re, ci = h->Z[kk].im;
+                        const double e = h->energy[kk] * pe;
+                        const double m = (e > 1e-20) ? (cr * cr + ci * ci) / e : 0.0;
+                        if (m > bm) { bm = m; bk = (size_t)kk; }
+                    }
+                    ni_margin = margin; ni_u = u; ni_k = bk; ni_metric = bm;
+                }
+            }
+        }
     }
-    if (best_u < 0) return 0;
+    if (best_u < 0) {                 /* single shot found nothing: NI fallback */
+        if (ni_u < 0) return 0;
+        best_u = ni_u; best_k = ni_k; best_m = ni_metric;
+    }
+    }
 
     memset(out, 0, sizeof *out);
     out->nid2 = best_u;

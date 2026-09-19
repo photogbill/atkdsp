@@ -28,7 +28,10 @@
  *      missing symbol rather than the sentence the version check exists to
  *      print. A number that goes up is cheap; a mismatch that reports itself
  *      as something else is not. (Bumped 1 -> 2 on 2026-09-18 for
- *      atkdsp_unpack_dc.) 2 -> 3 for the LTE cell search.
+ *      atkdsp_unpack_dc.) 2 -> 3 for the LTE cell search. 3 -> 4 PBCH/MIB,
+ *      4 -> 5 the PRACH detector, 5 -> 6 the turbo decoder + CRC-24A that the
+ *      SIB1 transport block rides on, 6 -> 7 the SIB1 identity (ASN.1 UPER),
+ *      7 -> 8 the SIB1 physical-layer receive chain (subframe -> identity).
  *
  * Sample convention: complex float32 as {re, im} pairs (same memory layout as
  * numpy complex64). All sizes are in SAMPLES unless the name says bytes.
@@ -56,8 +59,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 5
-#define ATKDSP_VERSION_STRING "0.4.0"
+#define ATKDSP_ABI_VERSION 8
+#define ATKDSP_VERSION_STRING "0.7.0"
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -417,6 +420,78 @@ ATKDSP_API ptrdiff_t     atkdsp_prach_scan(atkdsp_prach *h,
                                      const atkdsp_cf32 *stream, size_t n,
                                      int win_step, float min_metric,
                                      atkdsp_prach_hit *out, size_t cap);
+
+/* ---- 11d. LTE turbo decoder + CRC-24A ----------------------------------
+ * The rate-1/3 turbo code (36.212 5.1.3.2) that protects the PDSCH transport
+ * block a SIB rides on: two 8-state RSC constituents joined by a QPP
+ * interleaver, rate-matched (5.1.4.1) into the E soft bits transmitted, and
+ * decoded by iterative max-log-MAP. This is DOWNLINK BROADCAST data — a SIB1
+ * transport block is the cell's own public identity, nothing about any
+ * subscriber. Not a per-sample hot path (a SIB every 80 ms, a few hundred
+ * bits), so this call allocates its own scratch and frees it before returning.
+ *
+ * K is the turbo code-block size (an entry of 36.212 Table 5.1.3-3, 40..6144);
+ * the transport block is K-24 bits plus its CRC-24A. rv is the redundancy
+ * version (0 for a first SIB transmission). iters<=0 uses 8. */
+
+/* CRC-24A (36.212 5.1.1) of `nbits` bits into out24 (MSB first). For tests and
+ * for a caller that attaches its own CRC. */
+ATKDSP_API int atkdsp_lte_crc24a(const signed char *bits, int nbits,
+                                 signed char *out24);
+
+/* Decode E descrambled LLRs (>0 favours bit 0) for code-block size K. On a
+ * CRC-24A pass, writes the K-24 payload bits to `out` and returns 1; returns 0
+ * when the CRC fails, or <0 (ATKDSP_E_ARG for an unknown K, E_NOMEM). */
+ATKDSP_API int atkdsp_lte_turbo_decode(const float *llr, size_t E, int K,
+                                       int rv, int iters, signed char *out);
+
+/* ---- 11e. SIB1 -> tower identity (ASN.1 UPER) --------------------------
+ * The identity-bearing part of SystemInformationBlockType1: the operator
+ * (PLMN = MCC/MNC), the trackingAreaCode and the 28-bit E-UTRAN cell identity
+ * (ECI). Decoded from the transport-block bits a turbo decode produced (the
+ * BCCH-DL-SCH-Message content, one bit per byte, MSB first). Broadcast, public
+ * — the cell's own name for itself; the decode STOPS after
+ * cellAccessRelatedInfo, so nothing about a subscriber is touched. */
+#define ATKDSP_LTE_MAX_PLMN 6
+
+typedef struct {
+    int mcc[3];      /* three MCC digits; mcc[0] = -1 if this PLMN had none    */
+    int mnc[3];      /* MNC digits; only the first mnc_len are valid           */
+    int mnc_len;     /* 2 or 3                                                 */
+    int reserved;    /* cellReservedForOperatorUse (1 = reserved)              */
+} atkdsp_lte_plmn;
+
+typedef struct {
+    int             n_plmn;                    /* 1..6                         */
+    atkdsp_lte_plmn plmn[ATKDSP_LTE_MAX_PLMN];
+    int             tac;                       /* trackingAreaCode, 16-bit     */
+    unsigned        cell_id;                   /* cellIdentity / ECI, 28-bit   */
+    int             cell_barred;               /* cellBarred ENUMERATED index  */
+    int             csg_id;                    /* -1 if absent                 */
+} atkdsp_lte_sib1;
+
+/* Parse the tower identity from `nbits` decoded transport-block bits. Returns
+ * 1 on a clean parse, 0 on a structural mismatch (not a SIB1, or the bits ran
+ * out), <0 on a bad argument. */
+ATKDSP_API int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
+                                     atkdsp_lte_sib1 *out);
+
+/* ---- 11f. SIB1 physical layer: subframe -> tower identity --------------
+ * The whole downlink receive chain for a SIB1: OFDM demod at the cell
+ * numerology (n_rb in {6,15,25,50,75,100}), a port-0 CRS channel estimate and
+ * single-tap equalisation (equalize != 0), PCFICH, a blind SI-RNTI PDCCH
+ * search (DCI 1A -> RB allocation), then PDSCH descramble + turbo + ASN.1.
+ * `samples` covers one subframe (14 OFDM symbols at nfft*15 kHz); `subframe`
+ * is which one (5 for SIB1). cfo_hz corrects a carrier offset (0 to skip).
+ * Returns 1 with the identity in *out, 0 when no SIB1 is present, <0 on error.
+ *
+ * The control-region RE geometry is self-consistent (proved by the round-trip
+ * cross-check) but not yet confirmed on a real air capture -- see the note in
+ * src/lte_sib1_phy.c. */
+ATKDSP_API int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n,
+                                      int n_rb, int n_id, int n_ports,
+                                      int subframe, double cfo_hz,
+                                      int equalize, atkdsp_lte_sib1 *out);
 
 #ifdef __cplusplus
 }

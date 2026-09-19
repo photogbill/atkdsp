@@ -38,7 +38,7 @@ __all__ = [
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 5
+ABI_VERSION = 8
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -704,6 +704,20 @@ class _PrachHit(C.Structure):
                 ("metric", C.c_float), ("delay", C.c_int)]
 
 
+_LTE_MAX_PLMN = 6
+
+
+class _LtePlmn(C.Structure):
+    _fields_ = [("mcc", C.c_int * 3), ("mnc", C.c_int * 3),
+                ("mnc_len", C.c_int), ("reserved", C.c_int)]
+
+
+class _LteSib1(C.Structure):
+    _fields_ = [("n_plmn", C.c_int), ("plmn", _LtePlmn * _LTE_MAX_PLMN),
+                ("tac", C.c_int), ("cell_id", C.c_uint),
+                ("cell_barred", C.c_int), ("csg_id", C.c_int)]
+
+
 LTE_RATE = 1_920_000
 LTE_SYM = 128
 LTE_PSS_PERIOD = 9600
@@ -744,6 +758,17 @@ def _bind_lte(lib) -> None:
     lib.atkdsp_prach_scan.restype = C.c_ssize_t
     lib.atkdsp_prach_scan.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_int,
                                       C.c_float, P(_PrachHit), C.c_size_t]
+    lib.atkdsp_lte_crc24a.restype = C.c_int
+    lib.atkdsp_lte_crc24a.argtypes = [P(C.c_byte), C.c_int, P(C.c_byte)]
+    lib.atkdsp_lte_turbo_decode.restype = C.c_int
+    lib.atkdsp_lte_turbo_decode.argtypes = [P(C.c_float), C.c_size_t, C.c_int,
+                                            C.c_int, C.c_int, P(C.c_byte)]
+    lib.atkdsp_lte_sib1_parse.restype = C.c_int
+    lib.atkdsp_lte_sib1_parse.argtypes = [P(C.c_byte), C.c_int, P(_LteSib1)]
+    lib.atkdsp_lte_sib1_decode.restype = C.c_int
+    lib.atkdsp_lte_sib1_decode.argtypes = [cf, C.c_size_t, C.c_int, C.c_int,
+                                           C.c_int, C.c_int, C.c_double, C.c_int,
+                                           P(_LteSib1)]
 
 
 _BIND_EXTRA.append(_bind_lte)
@@ -829,6 +854,72 @@ def prach_zc(u: int) -> np.ndarray:
     return out
 
 
+def lte_crc24a(bits) -> np.ndarray:
+    """CRC-24A (36.212 5.1.1) of `bits` (0/1), 24 parity bits (MSB first)."""
+    b = np.ascontiguousarray(np.asarray(bits, np.int8))
+    out = np.empty(24, dtype=np.int8)
+    _check(load().atkdsp_lte_crc24a(b.ctypes.data_as(C.POINTER(C.c_byte)),
+           b.size, out.ctypes.data_as(C.POINTER(C.c_byte))), "lte_crc24a")
+    return out
+
+
+def lte_turbo_decode(llr, K: int, rv: int = 0, iters: int = 8):
+    """Decode E descrambled LLRs (>0 favours bit 0) for turbo code-block size
+    K. Returns the K-24 payload bits on a CRC-24A pass, else None."""
+    e = np.ascontiguousarray(llr, dtype=np.float32)
+    out = np.empty(int(K) - 24, dtype=np.int8)
+    rc = _check(load().atkdsp_lte_turbo_decode(
+        e.ctypes.data_as(C.POINTER(C.c_float)), e.size, int(K), int(rv),
+        int(iters), out.ctypes.data_as(C.POINTER(C.c_byte))), "lte_turbo_decode")
+    return out if rc == 1 else None
+
+
+def lte_sib1_parse(bits):
+    """Parse the tower identity (PLMN list, TAC, ECI) from decoded SIB1
+    transport-block bits (one bit per element, MSB first). Returns a dict, or
+    None on a structural mismatch."""
+    b = np.ascontiguousarray(np.asarray(bits, np.int8))
+    out = _LteSib1()
+    rc = _check(load().atkdsp_lte_sib1_parse(b.ctypes.data_as(C.POINTER(C.c_byte)),
+                b.size, C.byref(out)), "lte_sib1_parse")
+    if rc != 1:
+        return None
+    plmns = []
+    for i in range(out.n_plmn):
+        p = out.plmn[i]
+        mcc = None if p.mcc[0] < 0 else [p.mcc[0], p.mcc[1], p.mcc[2]]
+        plmns.append({"mcc": mcc, "mnc": [p.mnc[j] for j in range(p.mnc_len)],
+                      "reserved": bool(p.reserved)})
+    return {"plmns": plmns, "tac": int(out.tac), "cellid": int(out.cell_id),
+            "cell_barred": int(out.cell_barred),
+            "csg_id": None if out.csg_id < 0 else int(out.csg_id)}
+
+
+def _sib1_dict(out):
+    plmns = []
+    for i in range(out.n_plmn):
+        p = out.plmn[i]
+        mcc = None if p.mcc[0] < 0 else [p.mcc[0], p.mcc[1], p.mcc[2]]
+        plmns.append({"mcc": mcc, "mnc": [p.mnc[j] for j in range(p.mnc_len)],
+                      "reserved": bool(p.reserved)})
+    return {"plmns": plmns, "tac": int(out.tac), "cellid": int(out.cell_id),
+            "cell_barred": int(out.cell_barred),
+            "csg_id": None if out.csg_id < 0 else int(out.csg_id)}
+
+
+def lte_sib1_decode(samples, n_rb: int, n_id: int, n_ports: int, subframe: int,
+                    cfo_hz: float = 0.0, equalize: bool = True):
+    """Full SIB1 receive chain over one subframe of I/Q (at nfft*15 kHz):
+    OFDM demod, CRS equalisation, PCFICH, blind SI-RNTI PDCCH, PDSCH turbo and
+    ASN.1. Returns the tower-identity dict (operator PLMN, TAC, ECI) or None."""
+    s = _cf32(samples, "samples")
+    out = _LteSib1()
+    rc = _check(load().atkdsp_lte_sib1_decode(_cfp(s), s.size, int(n_rb),
+                int(n_id), int(n_ports), int(subframe), float(cfo_hz),
+                1 if equalize else 0, C.byref(out)), "lte_sib1_decode")
+    return _sib1_dict(out) if rc == 1 else None
+
+
 class Prach:
     """Passive PRACH handset-presence detector. Feed a sequence window
     (>= PRACH_NZC samples at the PRACH rate); get the preambles present."""
@@ -868,4 +959,5 @@ class Prach:
 
 __all__ += ["design_lowpass", "Ddc", "Lte", "lte_pss_symbol", "lte_sss_symbol",
             "lte_gold", "LTE_RATE", "LTE_SYM", "LTE_PSS_PERIOD", "LTE_FRAME",
-            "LTE_PBCH_OFFSET", "LTE_PBCH_BLOCK", "Prach", "prach_zc", "PRACH_NZC"]
+            "LTE_PBCH_OFFSET", "LTE_PBCH_BLOCK", "Prach", "prach_zc", "PRACH_NZC",
+            "lte_crc24a", "lte_turbo_decode", "lte_sib1_parse", "lte_sib1_decode"]

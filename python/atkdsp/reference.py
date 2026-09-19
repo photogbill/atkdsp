@@ -1023,3 +1023,816 @@ def prach_scan(stream, win_step=64, min_metric=PRACH_MIN_METRIC, N=PRACH_NZC):
                 merged[r]["count"] = max(merged[r]["count"], h["count"])
         start += win_step
     return list(merged.values())
+
+# ============================================================================
+# 11d. LTE turbo decoder + CRC-24A (twin of src/lte_turbo.c)
+# ----------------------------------------------------------------------------
+# The rate-1/3 turbo code (36.212 5.1.3.2) protecting the PDSCH transport block
+# a SIB rides on: two 8-state RSC constituents joined by a QPP interleaver,
+# rate-matched (5.1.4.1), decoded by iterative max-log-MAP. Downlink broadcast
+# data only. The C reads doubles; this reads float64 — the same arithmetic.
+# ============================================================================
+
+# QPP interleaver f1/f2 (36.212 Table 5.1.3-3), the full table, K -> (f1, f2).
+_QPP_TABLE = {
+    40:(3,10), 48:(7,12), 56:(19,42), 64:(7,16), 72:(7,18), 80:(11,20),
+    88:(5,22), 96:(11,24), 104:(7,26), 112:(41,84), 120:(103,90),
+    128:(15,32), 136:(9,34), 144:(17,108), 152:(9,38), 160:(21,120),
+    168:(101,84), 176:(21,44), 184:(57,46), 192:(23,48), 200:(13,50),
+    208:(27,52), 216:(11,36), 224:(27,56), 232:(85,58), 240:(29,60),
+    248:(33,62), 256:(15,32), 264:(17,198), 272:(33,68), 280:(103,210),
+    288:(19,36), 296:(19,74), 304:(37,76), 312:(19,78), 320:(21,120),
+    328:(21,82), 336:(115,84), 344:(193,86), 352:(21,44), 360:(133,90),
+    368:(81,46), 376:(45,94), 384:(23,48), 392:(243,98), 400:(151,40),
+    408:(155,102), 416:(25,52), 424:(51,106), 432:(47,72), 440:(91,110),
+    448:(29,168), 456:(29,114), 464:(247,58), 472:(29,118), 480:(89,180),
+    488:(91,122), 496:(157,62), 504:(55,84), 512:(31,64), 528:(17,66),
+    544:(35,68), 560:(227,420), 576:(65,96), 592:(19,74), 608:(37,76),
+    624:(41,234), 640:(39,80), 656:(185,82), 672:(43,252), 688:(21,86),
+    704:(155,44), 720:(79,120), 736:(139,92), 752:(23,94), 768:(217,48),
+    784:(25,98), 800:(17,80), 816:(127,102), 832:(25,52), 848:(239,106),
+    864:(17,48), 880:(137,110), 896:(215,112), 912:(29,114), 928:(15,58),
+    944:(147,118), 960:(29,60), 976:(59,122), 992:(65,124), 1008:(55,84),
+    1024:(31,64), 1056:(17,66), 1088:(171,204), 1120:(67,140), 1152:(35,72),
+    1184:(19,74), 1216:(39,76), 1248:(19,78), 1280:(199,240), 1312:(21,82),
+    1344:(211,252), 1376:(21,86), 1408:(43,88), 1440:(149,60), 1472:(45,92),
+    1504:(49,846), 1536:(71,48), 1568:(13,28), 1600:(17,80), 1632:(25,102),
+    1664:(183,104), 1696:(55,954), 1728:(127,96), 1760:(27,110),
+    1792:(29,112), 1824:(29,114), 1856:(57,116), 1888:(45,354),
+    1920:(31,120), 1952:(59,610), 1984:(185,124), 2016:(113,420),
+    2048:(31,64), 2112:(17,66), 2176:(171,136), 2240:(209,420),
+    2304:(253,216), 2368:(367,444), 2432:(265,456), 2496:(181,468),
+    2560:(39,80), 2624:(27,164), 2688:(127,504), 2752:(143,172),
+    2816:(43,88), 2880:(29,300), 2944:(45,92), 3008:(157,188), 3072:(47,96),
+    3136:(13,28), 3200:(111,240), 3264:(443,204), 3328:(51,104),
+    3392:(51,212), 3456:(451,192), 3520:(257,220), 3584:(57,336),
+    3648:(313,228), 3712:(271,232), 3776:(179,236), 3840:(331,120),
+    3904:(363,244), 3968:(375,248), 4032:(127,168), 4096:(31,64),
+    4160:(33,130), 4224:(43,264), 4288:(33,134), 4352:(477,408),
+    4416:(35,138), 4480:(233,280), 4544:(357,142), 4608:(337,480),
+    4672:(37,146), 4736:(71,444), 4800:(71,120), 4864:(37,152),
+    4928:(39,462), 4992:(127,234), 5056:(39,158), 5120:(39,80),
+    5184:(31,96), 5248:(113,902), 5312:(41,166), 5376:(251,336),
+    5440:(43,170), 5504:(21,86), 5568:(43,174), 5632:(45,176),
+    5696:(45,178), 5760:(161,120), 5824:(89,182), 5888:(323,184),
+    5952:(47,186), 6016:(23,94), 6080:(47,190), 6144:(263,480)
+}
+
+
+def lte_qpp(K):
+    f1, f2 = _QPP_TABLE[K]
+    i = np.arange(K, dtype=np.int64)
+    return ((f1 * i + f2 * i * i) % K).astype(np.int64)
+
+
+# constituent RSC trellis: state=(r1<<2)|(r2<<1)|r3, r1 newest.
+def _t_rsc_step(state, u):
+    r1 = (state >> 2) & 1; r2 = (state >> 1) & 1; r3 = state & 1
+    a = u ^ r2 ^ r3                 # feedback g0 = 1 + D^2 + D^3
+    z = a ^ r1 ^ r3                 # parity   g1 = 1 + D + D^3
+    return (a << 2) | (r1 << 1) | r2, z
+
+
+_T_NS = np.zeros((8, 2), np.int32)
+_T_PAR = np.zeros((8, 2), np.int32)
+_T_TAIL_U = np.zeros(8, np.int32)
+for _s in range(8):
+    for _u in (0, 1):
+        _T_NS[_s, _u], _T_PAR[_s, _u] = _t_rsc_step(_s, _u)
+    _T_TAIL_U[_s] = ((_s >> 1) & 1) ^ (_s & 1)
+
+
+def _t_rsc_encode(u):
+    K = len(u); s = 0
+    sysb = np.empty(K + 3, np.int8); par = np.empty(K + 3, np.int8)
+    for k in range(K):
+        sysb[k] = u[k]; par[k] = _T_PAR[s, u[k]]; s = _T_NS[s, u[k]]
+    for j in range(3):
+        ut = _T_TAIL_U[s]; sysb[K + j] = ut; par[K + j] = _T_PAR[s, ut]; s = _T_NS[s, ut]
+    return sysb, par
+
+
+def lte_turbo_encode_d(u):
+    """u (K bits) -> the three rate-matcher input streams d0,d1,d2 (K+4 each)."""
+    K = len(u)
+    sys1, par1 = _t_rsc_encode(u)
+    pi = lte_qpp(K)
+    sys2, par2 = _t_rsc_encode(np.asarray(u)[pi])
+    xt = sys1[K:K + 3]; zt = par1[K:K + 3]
+    xpt = sys2[K:K + 3]; zpt = par2[K:K + 3]
+    d0 = np.empty(K + 4, np.int8); d1 = np.empty(K + 4, np.int8); d2 = np.empty(K + 4, np.int8)
+    d0[:K] = u; d1[:K] = par1[:K]; d2[:K] = par2[:K]
+    d0[K], d1[K], d2[K] = xt[0], zt[0], xt[1]
+    d0[K + 1], d1[K + 1], d2[K + 1] = zt[1], xt[2], zt[2]
+    d0[K + 2], d1[K + 2], d2[K + 2] = xpt[0], zpt[0], xpt[1]
+    d0[K + 3], d1[K + 3], d2[K + 3] = zpt[1], xpt[2], zpt[2]
+    return d0, d1, d2
+
+
+_TPERM = np.array([0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+                   1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31])
+
+
+def _lte_turbo_subblock_maps(D):
+    C = 32
+    R = -(-D // C)
+    KPi = R * C
+    ND = KPi - D
+    padded = np.array([-1] * ND + list(range(D)))
+    M = padded.reshape(R, C)
+    idx01 = M[:, _TPERM].reshape(-1, order='F')
+    k = np.arange(KPi)
+    pi2 = (_TPERM[k // R] + C * (k % R) + 1) % KPi
+    idx2 = padded[pi2]
+    return idx01, idx2, R, KPi
+
+
+def _lte_k0(rv, R, Ncb):
+    return R * (2 * (-(-Ncb // (8 * R))) * rv + 2)
+
+
+def lte_rate_match_turbo(d0, d1, d2, E, rv=0, Ncb=None):
+    D = len(d0)
+    idx01, idx2, R, KPi = _lte_turbo_subblock_maps(D)
+    v0 = np.array([-1 if i < 0 else int(d0[i]) for i in idx01], np.int8)
+    v1 = np.array([-1 if i < 0 else int(d1[i]) for i in idx01], np.int8)
+    v2 = np.array([-1 if i < 0 else int(d2[i]) for i in idx2], np.int8)
+    w = np.empty(3 * KPi, np.int8)
+    w[:KPi] = v0; w[KPi::2] = v1; w[KPi + 1::2] = v2
+    Kw = 3 * KPi
+    if Ncb is None:
+        Ncb = Kw
+    j = _lte_k0(rv, R, Ncb)
+    out = np.empty(E, np.int8); k = 0
+    while k < E:
+        val = w[j % Ncb]; j += 1
+        if val >= 0:
+            out[k] = val; k += 1
+    return out
+
+
+def lte_rate_dematch_turbo(e_llr, D, E, rv=0, Ncb=None):
+    idx01, idx2, R, KPi = _lte_turbo_subblock_maps(D)
+    Kw = 3 * KPi
+    if Ncb is None:
+        Ncb = Kw
+    isnull = np.zeros(Ncb, bool)
+    isnull[:KPi] = idx01 < 0
+    isnull[KPi::2] = idx01 < 0
+    isnull[KPi + 1::2] = idx2 < 0
+    w = np.zeros(Ncb)
+    j = _lte_k0(rv, R, Ncb); k = 0
+    while k < E:
+        pos = j % Ncb
+        if not isnull[pos]:
+            w[pos] += e_llr[k]; k += 1
+        j += 1
+    v0 = w[:KPi]; v1 = w[KPi::2][:KPi]; v2 = w[KPi + 1::2][:KPi]
+    d0 = np.zeros(D); d1 = np.zeros(D); d2 = np.zeros(D)
+    for kk in range(KPi):
+        if idx01[kk] >= 0:
+            d0[idx01[kk]] += v0[kk]; d1[idx01[kk]] += v1[kk]
+        if idx2[kk] >= 0:
+            d2[idx2[kk]] += v2[kk]
+    return d0, d1, d2
+
+
+_T_NEG = -1e18
+
+
+def _t_bcjr(sys_llr, par_llr, apri):
+    n = len(sys_llr); K = n - 3
+    alpha = np.full((n + 1, 8), _T_NEG); alpha[0, 0] = 0.0
+    for k in range(n):
+        ap = apri[k] if k < K else 0.0
+        for s in range(8):
+            if alpha[k, s] <= _T_NEG:
+                continue
+            for u in (0, 1):
+                ns = _T_NS[s, u]; z = _T_PAR[s, u]
+                g = 0.5 * (sys_llr[k] * (1 - 2 * u) + par_llr[k] * (1 - 2 * z)
+                           + (ap * (1 - 2 * u) if k < K else 0.0))
+                v = alpha[k, s] + g
+                if v > alpha[k + 1, ns]:
+                    alpha[k + 1, ns] = v
+    beta = np.full((n + 1, 8), _T_NEG); beta[n, 0] = 0.0
+    for k in range(n - 1, -1, -1):
+        ap = apri[k] if k < K else 0.0
+        for s in range(8):
+            best = _T_NEG
+            for u in (0, 1):
+                ns = _T_NS[s, u]; z = _T_PAR[s, u]
+                g = 0.5 * (sys_llr[k] * (1 - 2 * u) + par_llr[k] * (1 - 2 * z)
+                           + (ap * (1 - 2 * u) if k < K else 0.0))
+                v = beta[k + 1, ns] + g
+                if v > best:
+                    best = v
+            beta[k, s] = best
+    ext = np.zeros(K)
+    for k in range(K):
+        ap = apri[k]; m1 = _T_NEG; m0 = _T_NEG
+        for s in range(8):
+            if alpha[k, s] <= _T_NEG:
+                continue
+            for u in (0, 1):
+                ns = _T_NS[s, u]; z = _T_PAR[s, u]
+                g = 0.5 * (sys_llr[k] * (1 - 2 * u) + par_llr[k] * (1 - 2 * z)
+                           + ap * (1 - 2 * u))
+                v = alpha[k, s] + g + beta[k + 1, ns]
+                if u == 1:
+                    m1 = max(m1, v)
+                else:
+                    m0 = max(m0, v)
+        ext[k] = (m0 - m1) - sys_llr[k] - ap
+    return ext
+
+
+def lte_turbo_decode_from_d(d0, d1, d2, K, iters=8):
+    sys = d0[:K]
+    par1 = np.concatenate([d1[:K], [d1[K], d0[K + 1], d2[K + 1]]])
+    par2 = np.concatenate([d2[:K], [d1[K + 2], d0[K + 3], d2[K + 3]]])
+    tail1_sys = np.array([d0[K], d2[K], d1[K + 1]])
+    tail2_sys = np.array([d0[K + 2], d2[K + 2], d1[K + 3]])
+    pi = lte_qpp(K); inv = np.argsort(pi)
+    sys1 = np.concatenate([sys, tail1_sys])
+    sys2 = np.concatenate([sys[pi], tail2_sys])
+    apri = np.zeros(K)
+    for _ in range(iters):
+        e1 = _t_bcjr(sys1, par1, apri)
+        e2 = _t_bcjr(sys2, par2, e1[pi])
+        apri = e2[inv]
+    e1 = _t_bcjr(sys1, par1, apri)
+    llr = sys + apri + e1
+    return (llr < 0).astype(np.int8)
+
+
+# CRC-24A (36.212 5.1.1)
+_G24A = 0x1864CFB
+
+
+def lte_crc24a(bits):
+    reg = 0
+    for b in bits:
+        reg = (reg << 1) | (int(b) & 1)
+        if reg & (1 << 24):
+            reg ^= _G24A
+    for _ in range(24):
+        reg <<= 1
+        if reg & (1 << 24):
+            reg ^= _G24A
+    return np.array([(reg >> (23 - i)) & 1 for i in range(24)], np.int8)
+
+
+def lte_crc24a_check(bits):
+    return np.array_equal(lte_crc24a(bits[:-24]), np.asarray(bits[-24:]) & 1)
+
+
+def lte_turbo_decode(llr, K, rv=0, iters=8):
+    """E descrambled LLRs (>0 favours bit 0), code-block size K -> the K-24
+    payload bits on a CRC-24A pass, else None. Twin of atkdsp_lte_turbo_decode."""
+    E = len(llr)
+    d0, d1, d2 = lte_rate_dematch_turbo(np.asarray(llr, float), K + 4, E, rv)
+    bits = lte_turbo_decode_from_d(d0, d1, d2, K, iters)
+    if lte_crc24a_check(bits):
+        return bits[:-24]
+    return None
+
+
+# ============================================================================
+# 11e. SIB1 -> tower identity (ASN.1 UPER; twin of src/lte_sib1.c)
+# ----------------------------------------------------------------------------
+# The identity-bearing part of SystemInformationBlockType1: PLMN list (operator
+# MCC/MNC), trackingAreaCode (16-bit) and the 28-bit E-UTRAN cell identity
+# (ECI). Works on the decoded transport-block bit array (one bit per element,
+# MSB first). A matching encoder validates the decoder by a round trip.
+# 36.331 ASN.1 (R8 baseline structure). Downlink broadcast only.
+# ============================================================================
+
+def _sib1_nbits(rng):
+    if rng <= 1:
+        return 0
+    return int(rng - 1).bit_length()
+
+
+def _sib1_write(bits, value, n):
+    for i in range(n - 1, -1, -1):
+        bits.append((value >> i) & 1)
+
+
+class _Sib1Reader:
+    def __init__(self, bits):
+        self.b = list(np.asarray(bits, np.int8) & 1)
+        self.pos = 0
+        self.bad = False
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            if self.pos >= len(self.b):
+                self.bad = True
+                return 0
+            v = (v << 1) | int(self.b[self.pos]); self.pos += 1
+        return v
+
+
+def lte_sib1_encode(plmns, tac, cellid, csg_identity=None):
+    """Build BCCH-DL-SCH-Message bits carrying a SIB1. plmns = list of
+    {mcc:[3] or None, mnc:[2 or 3], reserved?}. Returns an int8 bit array."""
+    b = []
+    _sib1_write(b, 0, 1)                 # BCCH-DL-SCH type CHOICE -> c1
+    _sib1_write(b, 1, 1)                 # c1 CHOICE -> systemInformationBlockType1
+    _sib1_write(b, 0, 1)                 # SIB1 extension bit
+    _sib1_write(b, 0, 1)                 # p-Max absent
+    _sib1_write(b, 0, 1)                 # tdd-Config absent
+    _sib1_write(b, 0, 1)                 # nonCriticalExtension absent
+    _sib1_write(b, 1 if csg_identity is not None else 0, 1)   # csg-Identity opt
+    _sib1_write(b, len(plmns) - 1, _sib1_nbits(6))            # SIZE(1..6)
+    for p in plmns:
+        mcc = p.get("mcc")
+        _sib1_write(b, 1 if mcc is not None else 0, 1)
+        if mcc is not None:
+            for d in mcc:
+                _sib1_write(b, int(d), 4)
+        mnc = p["mnc"]
+        _sib1_write(b, len(mnc) - 2, 1)
+        for d in mnc:
+            _sib1_write(b, int(d), 4)
+        _sib1_write(b, 0 if p.get("reserved", False) else 1, 1)
+    _sib1_write(b, tac, 16)
+    _sib1_write(b, cellid, 28)
+    _sib1_write(b, 0, 1)                 # cellBarred
+    _sib1_write(b, 0, 1)                 # intraFreqReselection
+    _sib1_write(b, 0, 1)                 # csg-Indication
+    if csg_identity is not None:
+        _sib1_write(b, csg_identity, 27)
+    return np.array(b, np.int8)
+
+
+def lte_sib1_decode(bits):
+    """Decode the tower identity from SIB1 transport-block bits. Returns a dict
+    or None on a structural mismatch."""
+    r = _Sib1Reader(bits)
+    if r.u(1) != 0:
+        return None                     # not c1
+    if r.u(1) != 1:
+        return None                     # not SIB1
+    _ext = r.u(1)
+    r.u(1); r.u(1); r.u(1)              # p-Max / tdd / nonCrit present
+    csg_present = r.u(1)
+    n_plmn = r.u(_sib1_nbits(6)) + 1
+    if n_plmn < 1 or n_plmn > 6:
+        return None
+    plmns = []
+    last_mcc = None
+    for _ in range(n_plmn):
+        mcc_present = r.u(1)
+        mcc = [r.u(4) for _ in range(3)] if mcc_present else None
+        if mcc is not None:
+            last_mcc = mcc
+        else:
+            mcc = last_mcc
+        mnc_len = r.u(1) + 2
+        mnc = [r.u(4) for _ in range(mnc_len)]
+        reserved = (r.u(1) == 0)
+        plmns.append({"mcc": mcc, "mnc": mnc, "reserved": reserved})
+    tac = r.u(16)
+    cellid = r.u(28)
+    cell_barred = r.u(1)
+    r.u(1)                              # intraFreqReselection
+    r.u(1)                              # csg-Indication
+    csg_id = r.u(27) if csg_present else None
+    if r.bad:
+        return None
+    return {"plmns": plmns, "tac": tac, "cellid": cellid,
+            "cell_barred": cell_barred, "csg_id": csg_id}
+
+
+def lte_plmn_str(p):
+    """'MCC-MNC', e.g. '310-410'. MNC keeps its 2- or 3-digit count."""
+    mcc = "".join(str(d) for d in p["mcc"]) if p["mcc"] else "???"
+    mnc = "".join(str(d) for d in p["mnc"])
+    return f"{mcc}-{mnc}"
+
+
+# ============================================================================
+# 11f. SIB1 physical layer (twin of src/lte_sib1_phy.c)
+# ----------------------------------------------------------------------------
+# Full-bandwidth downlink subframe -> tower identity. OFDM (de)modulation at the
+# cell's numerology, a port-0 CRS channel estimate, PCFICH (CFI), a blind
+# SI-RNTI PDCCH search (DCI 1A -> RB allocation), then PDSCH descramble + turbo
+# + ASN.1. Downlink broadcast only.
+#
+# NOTE ON GEOMETRY: the REG/CCE numbering and the PCFICH/PDCCH RE choice below
+# are a self-consistent statement of 36.211 6.2.4/6.7/6.8 — a transmit/receive
+# round trip proves the coding, scrambling, interleaving and RNTI-masked CRC,
+# NOT the spec's exact RE positions on a real air capture. Confirm against a
+# live signal before trusting a live decode. 36.211 / 36.212 / 36.331.
+# ============================================================================
+
+_SIB1_NFFT = {6: 128, 15: 256, 25: 512, 50: 1024, 75: 1536, 100: 2048}
+_SC_PER_RB = 12
+_SYMS_SF = 14
+_SYMS_SLOT = 7
+LTE_SI_RNTI = 0xFFFF
+
+
+def lte_grid_params(n_rb):
+    nfft = _SIB1_NFFT[n_rb]
+    return {"n_rb": n_rb, "nfft": nfft, "n_sc": n_rb * _SC_PER_RB,
+            "cp_long": nfft * 160 // 2048, "cp_short": nfft * 144 // 2048}
+
+
+def _sib1_sc_to_bin(k, n_sc, nfft):
+    off = k - n_sc // 2
+    if off >= 0:
+        off += 1                       # skip DC
+    return off % nfft
+
+
+def _sib1_cp(sym_in_slot, gp):
+    return gp["cp_long"] if sym_in_slot == 0 else gp["cp_short"]
+
+
+def lte_ofdm_modulate(grid, gp):
+    n_sc, nfft = gp["n_sc"], gp["nfft"]
+    out = []
+    for l in range(_SYMS_SF):
+        X = np.zeros(nfft, complex)
+        for k in range(n_sc):
+            X[_sib1_sc_to_bin(k, n_sc, nfft)] = grid[k, l]
+        xt = np.fft.ifft(X) * nfft / np.sqrt(n_sc)
+        cp = _sib1_cp(l % _SYMS_SLOT, gp)
+        out.append(np.concatenate([xt[-cp:], xt]))
+    return np.concatenate(out)
+
+
+def lte_ofdm_demodulate(samples, gp):
+    n_sc, nfft = gp["n_sc"], gp["nfft"]
+    grid = np.zeros((n_sc, _SYMS_SF), complex)
+    pos = 0
+    for l in range(_SYMS_SF):
+        pos += _sib1_cp(l % _SYMS_SLOT, gp)
+        xt = samples[pos:pos + nfft]; pos += nfft
+        X = np.fft.fft(xt) * np.sqrt(n_sc) / nfft
+        for k in range(n_sc):
+            grid[k, l] = X[_sib1_sc_to_bin(k, n_sc, nfft)]
+    return grid
+
+
+# ---- CRS (port 0), whole band -------------------------------------------
+def lte_crs_seq(n_id, n_s, l):
+    ci = (1 << 10) * (7 * (n_s + 1) + l + 1) * (2 * n_id + 1) + 2 * n_id + 1
+    c = lte_gold(ci, 4 * _PB_NRB_MAX)
+    return _PB_SQ * (1 - 2 * c[0::2]) + 1j * _PB_SQ * (1 - 2 * c[1::2])
+
+
+def lte_crs_re(n_id, n_rb, n_s, l, v):
+    vshift = n_id % 6
+    r = lte_crs_seq(n_id, n_s, l)
+    m0 = _PB_NRB_MAX - n_rb
+    return [(6 * m + (v + vshift) % 6, r[m0 + m]) for m in range(2 * n_rb)]
+
+
+def _crs_syms_in_sf():
+    out = []
+    for n_s in range(2):
+        for l in (0, 4):
+            out.append((n_s * _SYMS_SLOT + l, n_s, l, 0 if l == 0 else 3))
+    return out
+
+
+def lte_crs_positions(n_id, n_rb):
+    occ = {}
+    for sym, n_s, l, v in _crs_syms_in_sf():
+        for k, val in lte_crs_re(n_id, n_rb, n_s, l, v):
+            occ[(k, sym)] = val
+    return occ
+
+
+def lte_crs_re_set(n_id, n_rb, n_ports):
+    vshift = n_id % 6
+    occ = set()
+    for n_s in range(2):
+        base = n_s * _SYMS_SLOT
+        for port in range(n_ports):
+            if port <= 1:
+                syms = ((0, 0 if port == 0 else 3), (4, 3 if port == 0 else 0))
+            else:
+                syms = ((1, 0 if port == 2 else 3),)
+            for l, v in syms:
+                for m in range(2 * n_rb):
+                    occ.add((6 * m + (v + vshift) % 6, base + l))
+    return occ
+
+
+def _sib1_equalize(grid, n_id, n_rb, gp):
+    """Port-0 single-tap zero-forcing: estimate H at CRS REs per CRS symbol,
+    linear-interpolate across the band, apply the nearest CRS symbol's H."""
+    n_sc = gp["n_sc"]
+    crs_syms = _crs_syms_in_sf()
+    Hsym = {}
+    for sym, n_s, l, v in crs_syms:
+        pos = []; hval = []
+        for k, ref_val in lte_crs_re(n_id, n_rb, n_s, l, v):
+            y = grid[k, sym]
+            pos.append(k); hval.append(y * np.conj(ref_val))    # |crs|=1
+        pos = np.array(pos); hval = np.array(hval)
+        H = (np.interp(np.arange(n_sc), pos, hval.real)
+             + 1j * np.interp(np.arange(n_sc), pos, hval.imag))
+        Hsym[sym] = H
+    crs_sym_list = sorted(Hsym)
+    eq = np.zeros_like(grid)
+    for l in range(_SYMS_SF):
+        nearest = min(crs_sym_list, key=lambda cs: (abs(cs - l), cs))
+        H = Hsym[nearest]
+        denom = np.abs(H) ** 2 + 1e-9
+        eq[:, l] = grid[:, l] * np.conj(H) / denom
+    return eq
+
+
+# ---- PDSCH ---------------------------------------------------------------
+def lte_pdsch_re_list(n_id, n_rb, alloc_rbs, cfi, n_ports):
+    crs = lte_crs_re_set(n_id, n_rb, n_ports)
+    res = []
+    for sym in range(cfi, _SYMS_SF):
+        for rb in alloc_rbs:
+            for sub in range(_SC_PER_RB):
+                k = rb * _SC_PER_RB + sub
+                if (k, sym) not in crs:
+                    res.append((k, sym))
+    return res
+
+
+def lte_pdsch_scramble(n_id, n_rnti, subframe, length):
+    n_s = subframe * 2
+    c_init = (n_rnti << 14) | (0 << 13) | ((n_s // 2) << 9) | n_id
+    return lte_gold(c_init, length)
+
+
+def lte_pdsch_encode(tb_bits, n_id, n_rnti, subframe, E, K):
+    frame = np.concatenate([tb_bits, lte_crc24a(tb_bits)]).astype(np.int8)
+    assert len(frame) == K
+    d0, d1, d2 = lte_turbo_encode_d(frame)
+    e = lte_rate_match_turbo(d0, d1, d2, E)
+    c = lte_pdsch_scramble(n_id, n_rnti, subframe, E)
+    return (e ^ c).astype(np.int8)
+
+
+def lte_pdsch_decode(llr_scr, n_id, n_rnti, subframe, K):
+    E = len(llr_scr)
+    c = lte_pdsch_scramble(n_id, n_rnti, subframe, E)
+    llr = (1 - 2 * c) * llr_scr
+    return lte_turbo_decode(llr, K)              # payload (K-24) or None
+
+
+# ---- REGs, PCFICH, PDCCH -------------------------------------------------
+def _sib1_sym_regs(n_id, n_rb, l, n_ports):
+    vshift = n_id % 6
+    has_crs = (l == 0) or (l == 1 and n_ports == 4)
+    regs = []
+    if has_crs:
+        crs_res = {(6 * m + (vshift + o) % 6) for m in range(2 * n_rb) for o in (0, 3)}
+        for g in range(2 * n_rb):
+            group = [g * 6 + i for i in range(6)]
+            data = [k for k in group if k not in crs_res]
+            regs.append([(k, l) for k in data[:4]])
+    else:
+        for g in range(3 * n_rb):
+            regs.append([(g * 4 + i, l) for i in range(4)])
+    return regs
+
+
+def lte_pcfich_reg_idx(n_id, n_rb):
+    n_regs0 = 2 * n_rb
+    k_bar = n_id % (2 * n_rb)
+    return [(k_bar + i * (n_regs0 // 4)) % n_regs0 for i in range(4)]
+
+
+def _sib1_perm_regs(seq, n_id):
+    perm = _PB_PERM
+    D = len(seq); C = 32; R = -(-D // C); nd = R * C - D
+    padded = [None] * nd + list(seq)
+    M = [padded[r * C:(r + 1) * C] for r in range(R)]
+    out = []
+    for c in range(C):
+        for r in range(R):
+            out.append(M[r][perm[c]])
+    out = [x for x in out if x is not None]
+    sh = n_id % len(out)
+    return out[sh:] + out[:sh]
+
+
+def lte_control_regs(n_id, n_rb, cfi, n_ports):
+    all_regs = [_sib1_sym_regs(n_id, n_rb, l, n_ports) for l in range(cfi)]
+    pc = set(lte_pcfich_reg_idx(n_id, n_rb))
+    seq = []
+    maxregs = max(len(r) for r in all_regs)
+    for i in range(maxregs):
+        for l in range(cfi):
+            if i < len(all_regs[l]):
+                if l == 0 and i in pc:
+                    continue
+                seq.append(all_regs[l][i])
+    return _sib1_perm_regs(seq, n_id)
+
+
+def lte_pcfich_res(n_id, n_rb):
+    regs = _sib1_sym_regs(n_id, n_rb, 0, 2)
+    out = []
+    for idx in lte_pcfich_reg_idx(n_id, n_rb):
+        out.extend(regs[idx])
+    return out
+
+
+# PCFICH codewords (36.212 5.3.4)
+_CFI_WORD = {1: np.array([0, 1, 1, 0] * 8, np.int8),
+             2: np.array([1, 0, 1, 1] * 8, np.int8),
+             3: np.array([1, 1, 0, 1] * 8, np.int8)}
+
+
+def lte_pcfich_cinit(n_id, n_s):
+    return ((n_s // 2 + 1) * (2 * n_id + 1) << 9) + n_id
+
+
+def lte_pcfich_encode(cfi, n_id, n_s):
+    b = _CFI_WORD[cfi]
+    c = lte_gold(lte_pcfich_cinit(n_id, n_s), 32)
+    return _pb_qpsk((b ^ c).astype(np.int8))
+
+
+def lte_pcfich_decode(sym16, n_id, n_s):
+    c = lte_gold(lte_pcfich_cinit(n_id, n_s), 32)
+    llr = np.empty(32)
+    a = np.asarray(sym16)
+    llr[0::2] = a.real; llr[1::2] = a.imag
+    llr = (1 - 2 * c) * llr
+    best, best_cfi = -1e30, 1
+    for cfi in (1, 2, 3):
+        score = float(np.dot(1 - 2 * _CFI_WORD[cfi], llr))
+        if score > best:
+            best, best_cfi = score, cfi
+    return best_cfi
+
+
+def lte_pdcch_cinit(n_id, n_s):
+    return (n_s // 2 << 9) + n_id
+
+
+def lte_dci_crc_attach(dci_bits, rnti):
+    p = lte_crc16(dci_bits)
+    mask = np.array([(rnti >> (15 - i)) & 1 for i in range(16)], np.int8)
+    return np.concatenate([dci_bits, p ^ mask]).astype(np.int8)
+
+
+def lte_dci_crc_check(bits, rnti):
+    payload, rx = bits[:-16], bits[-16:]
+    calc = lte_crc16(payload)
+    mask = np.array([(rnti >> (15 - i)) & 1 for i in range(16)], np.int8)
+    return np.array_equal((calc ^ mask) & 1, rx & 1)
+
+
+def lte_pdcch_encode(dci_bits, rnti, E, n_id, n_s, cce_offset=0):
+    frame = lte_dci_crc_attach(dci_bits, rnti)
+    coded = lte_conv_encode(frame)
+    e = lte_rate_match([coded[0::3], coded[1::3], coded[2::3]], E)
+    c = lte_gold(lte_pdcch_cinit(n_id, n_s), cce_offset * 72 + E)[cce_offset * 72:]
+    return (e ^ c).astype(np.int8)
+
+
+def lte_pdcch_decode_candidate(scr_bits, D, rnti, n_id, n_s, cce_offset=0):
+    E = len(scr_bits)
+    c = lte_gold(lte_pdcch_cinit(n_id, n_s), cce_offset * 72 + E)[cce_offset * 72:]
+    llr = (1 - 2 * c) * scr_bits
+    d = lte_rate_dematch(llr, D, seg=(0, E))
+    bits = lte_viterbi_tb(d)
+    if not lte_dci_crc_check(bits, rnti):
+        return None
+    return bits[:-16]
+
+
+# ---- DCI 1A: RIV <-> (rb_start, L) --------------------------------------
+def lte_riv(rb_start, L, n_rb):
+    if (L - 1) <= n_rb // 2:
+        return n_rb * (L - 1) + rb_start
+    return n_rb * (n_rb - L + 1) + (n_rb - 1 - rb_start)
+
+
+def lte_riv_inv(v, n_rb):
+    for L in range(1, n_rb + 1):
+        for st in range(0, n_rb - L + 1):
+            if lte_riv(st, L, n_rb) == v:
+                return st, L
+    return None
+
+
+def _riv_bits(n_rb):
+    return int(n_rb * (n_rb + 1) // 2 - 1).bit_length()
+
+
+def lte_dci_1a_encode(rb_start, L, n_rb, dci_len=None):
+    """A minimal DCI format 1A for SI-RNTI: format flag + localized + RIV, the
+    rest zero-padded to dci_len (default: the 25-RB layout's 24 bits)."""
+    if dci_len is None:
+        dci_len = 24
+    rb = _riv_bits(n_rb)
+    b = [1, 0]
+    v = lte_riv(rb_start, L, n_rb)
+    b += [(v >> (rb - 1 - i)) & 1 for i in range(rb)]
+    while len(b) < dci_len:
+        b.append(0)
+    return np.array(b[:dci_len], np.int8), v
+
+
+def lte_dci_1a_riv(bits, n_rb):
+    rb = _riv_bits(n_rb)
+    v = 0
+    for i in range(rb):
+        v = (v << 1) | int(bits[2 + i])
+    return v
+
+
+# candidate turbo K sizes (QPP table), ascending
+_QPP_KS = sorted(_QPP_TABLE)
+
+
+def _sib1_candidate_Ks(E):
+    """Valid turbo K to try for E coded bits: K-24 = TBS >= 1, K <= 3E (rate
+    >= 1/3-ish), capped. CRC-24 gates the accept, so trying a handful is safe."""
+    hi = min(3 * E, 6144)
+    return [K for K in _QPP_KS if 40 <= K <= hi]
+
+
+# common search space: (aggregation level, #candidates)
+_COMMON_SS = [(4, 4), (8, 2)]
+_DCI_D = 40                                   # DCI 1A (24) + CRC-16 = 40 bits
+
+
+def lte_sib1_decode_iq(samples, n_rb, n_id, n_ports, subframe,
+                       cfo_hz=0.0, equalize=True):
+    """Full receive chain: subframe I/Q at the cell numerology -> tower
+    identity dict, or None. `samples` covers one subframe (14 OFDM symbols)."""
+    gp = lte_grid_params(n_rb)
+    s = np.asarray(samples, complex)
+    if cfo_hz:
+        fs = gp["nfft"] * 15000.0                 # full-BW sample rate
+        n = np.arange(len(s))
+        s = s * np.exp(-2j * np.pi * cfo_hz * n / fs)
+    grid = lte_ofdm_demodulate(s, gp)
+    if equalize:
+        grid = _sib1_equalize(grid, n_id, n_rb, gp)
+    n_s = subframe * 2
+
+    # 1) PCFICH -> CFI
+    pc = [grid[k, l] for (k, l) in lte_pcfich_res(n_id, n_rb)]
+    cfi = lte_pcfich_decode(pc, n_id, n_s)
+
+    # 2) PDCCH blind SI-RNTI search over the common search space
+    regs = lte_control_regs(n_id, n_rb, cfi, n_ports)
+    cce_res = [re for reg in regs for re in reg]      # 36 REs per CCE
+    n_cce = len(cce_res) // 36
+    dci = None
+    for al, ncand in _COMMON_SS:
+        for m in range(ncand):
+            cce = m * al
+            if cce + al > n_cce:
+                continue
+            seg = cce_res[cce * 36:(cce + al) * 36]
+            a = np.array([grid[k, l] for (k, l) in seg])
+            llr = np.empty(len(a) * 2)
+            llr[0::2] = a.real; llr[1::2] = a.imag
+            cand = lte_pdcch_decode_candidate(llr, _DCI_D, LTE_SI_RNTI,
+                                              n_id, n_s, cce_offset=cce)
+            if cand is not None:
+                dci = cand
+                break
+        if dci is not None:
+            break
+    if dci is None:
+        return None
+
+    # 3) DCI 1A -> allocation -> PDSCH
+    v = lte_dci_1a_riv(dci, n_rb)
+    ri = lte_riv_inv(v, n_rb)
+    if ri is None:
+        return None
+    st, L = ri
+    alloc = list(range(st, st + L))
+    res = lte_pdsch_re_list(n_id, n_rb, alloc, cfi, n_ports)
+    a = np.array([grid[k, l] for (k, l) in res])
+    llr = np.empty(len(a) * 2)
+    llr[0::2] = a.real; llr[1::2] = a.imag
+    E = len(llr)
+    c = lte_pdsch_scramble(n_id, LTE_SI_RNTI, subframe, E)
+    dllr = (1 - 2 * c) * llr
+
+    # 4) turbo (CRC-24 gates the transport-block size)
+    for K in _sib1_candidate_Ks(E):
+        payload = lte_turbo_decode(dllr, K)
+        if payload is not None:
+            info = lte_sib1_decode(payload)
+            if info is not None:
+                info["cfi"] = cfi
+                info["alloc"] = (st, L)
+                info["K"] = K
+                return info
+    return None

@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.4.0"
+    assert atkdsp.version() == "0.7.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -874,3 +874,245 @@ def test_prach_scan_is_silent_on_noise():
         if pr.scan(x, win_step=64):
             fa += 1
     assert fa == 0
+
+
+# ---------------------------------------------------------------------------
+# 11d. LTE turbo decoder + CRC-24A
+# ---------------------------------------------------------------------------
+def _turbo_llr(payload, K, E, mag=4.0, rv=0):
+    """Encode a K-24 payload (via the twin) into E clean LLRs (>0 favours 0)."""
+    frame = np.concatenate([payload, ref.lte_crc24a(payload)]).astype(np.int8)
+    d0, d1, d2 = ref.lte_turbo_encode_d(frame)
+    e = ref.lte_rate_match_turbo(d0, d1, d2, E, rv)
+    return (1 - 2 * e.astype(np.float64)) * mag
+
+
+@pytest.mark.parametrize("K", [40, 48, 64, 128, 256])
+def test_lte_crc24a_matches_its_twin(K):
+    rng = np.random.default_rng(K)
+    for _ in range(4):
+        b = rng.integers(0, 2, K).astype(np.int8)
+        assert np.array_equal(atkdsp.lte_crc24a(b), ref.lte_crc24a(b))
+
+
+def test_lte_crc24a_detects_a_flipped_bit():
+    rng = np.random.default_rng(7)
+    payload = rng.integers(0, 2, 80).astype(np.int8)
+    frame = np.concatenate([payload, atkdsp.lte_crc24a(payload)]).astype(np.int8)
+    assert ref.lte_crc24a_check(frame)
+    frame[13] ^= 1
+    assert not ref.lte_crc24a_check(frame)
+
+
+@pytest.mark.parametrize("K", [40, 48, 64, 128, 256])
+@pytest.mark.parametrize("ratefac", [3.1, 2.5, 2.0])
+def test_lte_turbo_decode_matches_its_twin_and_recovers_the_block(K, ratefac):
+    """C and twin agree bit-for-bit on the decoded payload, and both recover
+    the transport block, at a clean operating point across code rates."""
+    E = int(ratefac * K)
+    rng = np.random.default_rng(K + E)
+    payload = rng.integers(0, 2, K - 24).astype(np.int8)
+    llr = _turbo_llr(payload, K, E)
+    c = atkdsp.lte_turbo_decode(llr, K)
+    t = ref.lte_turbo_decode(llr, K)
+    assert c is not None and t is not None
+    assert np.array_equal(c, payload), f"C payload wrong K={K} E={E}"
+    assert np.array_equal(t, payload), f"twin payload wrong K={K} E={E}"
+    assert np.array_equal(c, t), f"C and twin disagree K={K} E={E}"
+
+
+def test_lte_turbo_decode_tracks_the_twin_through_noise():
+    """Down the waterfall, C makes the SAME block decisions as the twin: same
+    successes, same failures — the mark of a matched max-log-MAP."""
+    K, E = 128, 3 * 128 + 12
+    for esn0_db in (5.0, 2.0, 0.0):
+        sigma = 10 ** (-esn0_db / 20.0)
+        rng = np.random.default_rng(int(esn0_db * 10) + 1)
+        for s in range(8):
+            payload = rng.integers(0, 2, K - 24).astype(np.int8)
+            frame = np.concatenate([payload, ref.lte_crc24a(payload)]).astype(np.int8)
+            d0, d1, d2 = ref.lte_turbo_encode_d(frame)
+            e = ref.lte_rate_match_turbo(d0, d1, d2, E)
+            rx = (1 - 2 * e.astype(np.float64)) + rng.standard_normal(E) * sigma
+            llr = 2 * rx / (sigma ** 2)
+            c = atkdsp.lte_turbo_decode(llr, K)
+            t = ref.lte_turbo_decode(llr, K)
+            assert (c is None) == (t is None), f"{esn0_db} dB seed {s}: C/twin disagree on CRC"
+            if c is not None and t is not None:
+                assert np.array_equal(c, t)
+
+
+def test_lte_turbo_decode_rejects_pure_noise():
+    """No CRC-24A false pass on noise LLRs — a broadcast decode must not
+    invent a transport block."""
+    K, E = 64, 3 * 64 + 12
+    rng = np.random.default_rng(11)
+    fa = 0
+    for _ in range(64):
+        llr = rng.standard_normal(E) * 4.0
+        if atkdsp.lte_turbo_decode(llr, K) is not None:
+            fa += 1
+    assert fa == 0, f"{fa} false turbo decodes on noise"
+
+
+def test_lte_turbo_decode_refuses_an_unknown_block_size():
+    with pytest.raises(atkdsp.AtkDspError):
+        atkdsp.lte_turbo_decode(np.zeros(200, np.float32), 41)
+
+
+# ---------------------------------------------------------------------------
+# 11e. SIB1 -> tower identity (ASN.1 UPER)
+# ---------------------------------------------------------------------------
+_SIB1_CASES = [
+    ([{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}], 0x1234, 0x0ABCDEF, None),
+    ([{"mcc": [3, 1, 0], "mnc": [2, 6, 0]}], 0xABCD, 0x1234567, None),
+    ([{"mcc": [2, 3, 4], "mnc": [1, 0]},
+      {"mcc": None, "mnc": [1, 5]}], 7, 0xFFFFFFF, None),
+    ([{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}], 0x0000, 0x0000000, 12345),
+    ([{"mcc": [4, 4, 0], "mnc": [1, 0]},
+      {"mcc": [4, 4, 0], "mnc": [2, 0]},
+      {"mcc": [4, 4, 0], "mnc": [5, 1]}], 999, 0x2222222, None),
+]
+
+
+@pytest.mark.parametrize("plmns,tac,cid,csg", _SIB1_CASES)
+def test_lte_sib1_parse_round_trips_and_matches_its_twin(plmns, tac, cid, csg):
+    """Encode a SIB1 (twin) and confirm C and twin recover the same identity,
+    equal to what went in — operator PLMN, TAC and the 28-bit ECI."""
+    bits = ref.lte_sib1_encode(plmns, tac, cid, csg)
+    c = atkdsp.lte_sib1_parse(bits)
+    t = ref.lte_sib1_decode(bits)
+    assert c is not None and t is not None
+    assert c["tac"] == tac == t["tac"]
+    assert c["cellid"] == cid == t["cellid"]
+    assert c["csg_id"] == csg == t["csg_id"]
+    assert len(c["plmns"]) == len(plmns) == len(t["plmns"])
+    for i, (cp, tp) in enumerate(zip(c["plmns"], t["plmns"])):
+        want_mcc = plmns[i]["mcc"] if plmns[i]["mcc"] is not None else plmns[i - 1]["mcc"]
+        assert cp["mcc"] == want_mcc == tp["mcc"]
+        assert cp["mnc"] == plmns[i]["mnc"] == tp["mnc"]
+
+
+def test_lte_sib1_parse_reads_a_three_digit_mnc():
+    bits = ref.lte_sib1_encode([{"mcc": [3, 1, 0], "mnc": [2, 6, 0]}],
+                               0x55, 0x1000001)
+    got = atkdsp.lte_sib1_parse(bits)
+    assert got["plmns"][0]["mnc"] == [2, 6, 0]
+    assert ref.lte_plmn_str(got["plmns"][0]) == "310-260"
+
+
+def test_lte_sib1_parse_rejects_a_non_sib1_message():
+    """The first two bits must be c1 / systemInformationBlockType1; anything
+    else is not a SIB1 and must be refused, not mis-read into an identity."""
+    bits = ref.lte_sib1_encode([{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}], 1, 2)
+    bad = bits.copy(); bad[1] ^= 1                 # flip the c1 choice bit
+    assert atkdsp.lte_sib1_parse(bad) is None
+
+
+def test_lte_sib1_parse_refuses_truncated_bits():
+    bits = ref.lte_sib1_encode([{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}],
+                               0x1234, 0x0ABCDEF)
+    assert atkdsp.lte_sib1_parse(bits[:20]) is None
+
+
+# ---------------------------------------------------------------------------
+# 11f. SIB1 physical layer: subframe -> tower identity
+# ---------------------------------------------------------------------------
+def _synth_sib1(n_rb, n_id, n_ports, subframe, plmns, tac, eci,
+                rb_start, L, K, snr_db=13.0, chan="flat", cfo_hz=0.0, seed=2):
+    """Build one downlink subframe carrying a SIB1, via the twin transmit
+    path, at the cell's numerology; add noise (and optionally a 2-tap channel
+    or a carrier offset). Returns complex64 samples for one subframe."""
+    cfi = 3
+    n_s = subframe * 2
+    gp = ref.lte_grid_params(n_rb)
+    bits = ref.lte_sib1_encode(plmns, tac, eci)
+    tb = np.concatenate([bits, np.zeros(K - 24 - len(bits), np.int8)])[:K - 24]
+    alloc = list(range(rb_start, rb_start + L))
+    res = ref.lte_pdsch_re_list(n_id, n_rb, alloc, cfi, n_ports)
+    E = len(res) * 2
+    psym = ref._pb_qpsk(ref.lte_pdsch_encode(tb, n_id, ref.LTE_SI_RNTI, subframe, E, K))
+    dci, _ = ref.lte_dci_1a_encode(rb_start, L, n_rb, dci_len=24)
+    dsym = ref._pb_qpsk(ref.lte_pdcch_encode(dci, ref.LTE_SI_RNTI, 288, n_id, n_s, 0))
+    csym = ref.lte_pcfich_encode(3, n_id, n_s)
+    g = np.zeros((gp["n_sc"], 14), complex)
+    for (k, sym), val in ref.lte_crs_positions(n_id, n_rb).items():
+        g[k, sym] = val
+    for (k, l), v in zip(ref.lte_pcfich_res(n_id, n_rb), csym):
+        g[k, l] = v
+    regs = ref.lte_control_regs(n_id, n_rb, cfi, n_ports)
+    cce = [re for reg in regs for re in reg]
+    for (k, l), v in zip(cce[0:4 * 36], dsym):
+        g[k, l] = v
+    for (k, l), v in zip(res, psym):
+        g[k, l] = v
+    s = ref.lte_ofdm_modulate(g, gp)
+    if chan == "sel":
+        s = np.convolve(s, np.array([1.0, 0.35 * np.exp(1j * 0.7)]))[:len(s)]
+    if cfo_hz:
+        fs = gp["nfft"] * 15000.0
+        s = s * np.exp(2j * np.pi * cfo_hz * np.arange(len(s)) / fs)
+    rng = np.random.default_rng(seed)
+    p = np.mean(np.abs(s) ** 2)
+    s = s + np.sqrt(p / 10 ** (snr_db / 10) / 2) * (
+        rng.standard_normal(len(s)) + 1j * rng.standard_normal(len(s)))
+    return s.astype(np.complex64)
+
+
+_ATT = [{"mcc": [3, 1, 0], "mnc": [4, 1, 0]}]
+_TMO = [{"mcc": [3, 1, 0], "mnc": [2, 6, 0]}]                 # 3-digit MNC
+_MULTI = [{"mcc": [2, 3, 4], "mnc": [1, 0]},
+          {"mcc": None, "mnc": [1, 5]},                       # inherits 234
+          {"mcc": [2, 3, 4], "mnc": [2, 0]}]
+
+_SIB1_PHY_CASES = [
+    (6, 0, 1, _ATT, 0x1111, 0x0000001, 0, 6, 256),
+    (15, 55, 2, _TMO, 0x22AB, 0x1234567, 2, 8, 256),
+    (25, 123, 2, _ATT, 0x1234, 0x0ABCDEF, 0, 12, 256),
+    (25, 300, 4, _MULTI, 0x9999, 0x2ABCDEF, 5, 10, 328),
+    (50, 167, 2, _ATT, 0xFFFF, 0xFFFFFFF, 10, 20, 256),
+]
+
+
+@pytest.mark.parametrize("n_rb,n_id,n_ports,plmns,tac,eci,st,L,K", _SIB1_PHY_CASES)
+def test_lte_sib1_decode_matches_its_twin(n_rb, n_id, n_ports, plmns, tac, eci, st, L, K):
+    """The whole receive chain end to end: a synthesized subframe -> operator
+    PLMN, TAC and ECI, with C and twin recovering the same identity, equal to
+    what was transmitted, across bandwidths / PCIs / antenna ports."""
+    s = _synth_sib1(n_rb, n_id, n_ports, 5, plmns, tac, eci, st, L, K, seed=n_id + n_rb)
+    c = atkdsp.lte_sib1_decode(s, n_rb, n_id, n_ports, 5, equalize=True)
+    t = ref.lte_sib1_decode_iq(s, n_rb, n_id, n_ports, 5, equalize=True)
+    assert c is not None and t is not None
+    assert c["tac"] == tac == t["tac"]
+    assert c["cellid"] == eci == t["cellid"]
+    assert len(c["plmns"]) == len(plmns) == len(t["plmns"])
+    assert c["plmns"][0]["mnc"] == plmns[0]["mnc"] == t["plmns"][0]["mnc"]
+    want_mcc0 = plmns[0]["mcc"]
+    assert c["plmns"][0]["mcc"] == want_mcc0
+
+
+@pytest.mark.parametrize("chan,cfo", [("flat", 0.0), ("sel", 0.0), ("flat", 300.0)])
+def test_lte_sib1_decode_survives_channel_and_offset(chan, cfo):
+    """Equalisation from CRS handles a mild frequency-selective channel, and
+    the CFO argument corrects a carrier offset."""
+    s = _synth_sib1(25, 123, 2, 5, _ATT, 0x1234, 0x0ABCDEF, 0, 12, 256,
+                    chan=chan, cfo_hz=cfo, seed=9)
+    c = atkdsp.lte_sib1_decode(s, 25, 123, 2, 5, cfo_hz=cfo, equalize=True)
+    assert c is not None
+    assert c["cellid"] == 0x0ABCDEF and c["tac"] == 0x1234
+    assert ref.lte_plmn_str(c["plmns"][0]) == "310-410"
+
+
+def test_lte_sib1_decode_is_silent_when_no_sib_is_present():
+    """Pure noise (no PDCCH DCI) must not invent a tower identity."""
+    rng = np.random.default_rng(3)
+    gp = ref.lte_grid_params(25)
+    n = sum((gp["nfft"] + (gp["cp_long"] if l % 7 == 0 else gp["cp_short"]))
+            for l in range(14))
+    false = 0
+    for _ in range(12):
+        z = ((rng.standard_normal(n) + 1j * rng.standard_normal(n))
+             / np.sqrt(2)).astype(np.complex64)
+        if atkdsp.lte_sib1_decode(z, 25, 123, 2, 5) is not None:
+            false += 1
+    assert false == 0, f"{false} phantom SIB1 decodes on noise"

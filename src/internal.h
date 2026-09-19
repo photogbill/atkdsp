@@ -44,6 +44,11 @@ ATK_INLINE double atk_wrap(double ph) {
 void *atk_aligned_malloc(size_t bytes);
 void  atk_aligned_free(void *p);
 
+/* Valid turbo code-block sizes (36.212 Table 5.1.3-3), for the SIB1 PHY's
+ * CRC-gated K search. Defined in src/lte_turbo.c; not part of the ABI. */
+int atk_qpp_count(void);
+int atk_qpp_k(int i);
+
 /* ---- LTE handle -------------------------------------------------------
  * Defined here, not in the ABI (atkdsp.h exposes only the opaque typedef),
  * so src/lte.c (PSS/SSS) and src/lte_pbch.c (PBCH->MIB) — and the SIB

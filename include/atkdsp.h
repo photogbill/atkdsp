@@ -60,8 +60,14 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 9
-#define ATKDSP_VERSION_STRING "0.8.0"
+#define ATKDSP_ABI_VERSION 10
+#define ATKDSP_VERSION_STRING "0.9.0"
+/* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
+ * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
+ * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
+ * safe to share across caller threads in this version (a per-slot claim
+ * replaced omp_get_thread_num, which was 0 for every thread outside a parallel
+ * region) — a fix, not an ABI change, but it rode in on this bump. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -132,6 +138,40 @@ ATKDSP_API ptrdiff_t atkdsp_unpack_dc(const void *raw, size_t nbytes, int fmt,
                                       atkdsp_cf32 *out, size_t out_cap,
                                       float off_re, float off_im,
                                       double *mean_re, double *mean_im);
+
+/* ---- 1c. front-end health, in one pass over a converted block ----------
+ * The three things a wideband front end gets wrong that then look like real
+ * signals on the display: a DC/LO-leakage spike at the centre, an I/Q
+ * imbalance that puts a mirror image of every signal on the far side of
+ * centre, and overload that folds intermodulation across the band. This
+ * measures all of them from one block of cf32, cheaply (one pass, no FFT):
+ *
+ *   dc_re/dc_im         mean of I and Q — the centre spike, in the same units
+ *                       as the samples (+-1 full scale)
+ *   rms                 sqrt(mean |z|^2), the block's level
+ *   gain_imbalance_db   10*log10(var I / var Q); 0 is balanced
+ *   phase_error_deg     quadrature skew: asin(cov(I,Q)/sqrt(varI varQ))
+ *   image_rejection_db  derived from the two above — how far below a signal
+ *                       its mirror image sits. Large is good; below ~25 dB an
+ *                       image is a "signal" that is not there. inf when perfect.
+ *   clip_fraction       fraction of samples with |I| or |Q| >= clip_level
+ *                       (<=0 uses 0.99): a proxy for a railed front end, on the
+ *                       converted samples (a cu8 255 lands at ~+1.0)
+ *
+ * Returns ATKDSP_OK, or ATKDSP_E_ARG. The numpy twin is atkdsp.reference
+ * .iq_health. This is an analysis call, not the per-sample hot path — run it
+ * about once a second, not on every buffer. */
+typedef struct {
+    double dc_re, dc_im;
+    double rms;
+    double gain_imbalance_db;
+    double phase_error_deg;
+    double image_rejection_db;
+    double clip_fraction;
+    size_t n;
+} atkdsp_iq_report;
+ATKDSP_API int atkdsp_iq_health(const atkdsp_cf32 *in, size_t n, float clip_level,
+                                atkdsp_iq_report *out);
 
 /* ---- 2. NCO: phase-continuous complex mixer ----------------------------
  * out[n] = in[n] * exp(j * (phase + n*step)); phase advances by n*step and
@@ -205,6 +245,40 @@ ATKDSP_API ptrdiff_t atkdsp_spectrum_reduce(const atkdsp_fft *p, const atkdsp_cf
                                             size_t n_samples, size_t hop,
                                             const float *window, int detector,
                                             float *out_line);
+
+/* Every per-bin statistic a display's frames can give, in ONE pass over the
+ * same frames spectrum_reduce would take — because the FFTs are the whole cost
+ * and computing four things from each transform is nearly free once you have
+ * it. Any of the four outputs may be NULL to skip it; each is n floats,
+ * fftshifted like the reduce line.
+ *
+ *   max_db   peak hold  (10log10 of the largest |X|^2/n^2 per bin)
+ *   avg_db   mean power (10log10 of the mean)   — the calibrated level
+ *   min_db   the floor that is ALWAYS there     — what min-hold shows
+ *   sk       SPECTRAL KURTOSIS, dimensionless: M*(sum P^2)/(sum P)^2 over the
+ *            M frames, P=|X|^2. ~2.0 for stationary Gaussian noise, ~1.0 for a
+ *            steady carrier, and >2 for an ON/OFF (bursty) emitter — so one
+ *            block of the waterfall says, per bin, whether it is noise, a
+ *            constant signal, or something keying, without a second capture.
+ *            Needs M>=2; with one frame it is written as 1.0 (a constant).
+ *
+ * Returns the frame count (0 when n_samples < n) or an error. Frames run in
+ * parallel under OpenMP, on the same claimed-slot scratch as the reduce. */
+ATKDSP_API ptrdiff_t atkdsp_spectrum_stats(const atkdsp_fft *p, const atkdsp_cf32 *in,
+                                           size_t n_samples, size_t hop,
+                                           const float *window,
+                                           float *max_db, float *avg_db,
+                                           float *min_db, float *sk);
+
+/* Coherent gain and equivalent noise bandwidth of a window, so a reading can
+ * be turned into a true level. coherent_gain = (sum w)/n is what a full-scale
+ * tone loses to the window (multiply a tone's linear magnitude by 1/cg to
+ * recover dBFS); enbw_bins = n*(sum w^2)/(sum w)^2 is the window's noise
+ * bandwidth in BINS (multiply by sample_rate/n for Hz), the width to divide a
+ * noise-power reading by for a power spectral density. Either output may be
+ * NULL. Matches atkdsp.reference.window_stats. */
+ATKDSP_API int atkdsp_window_stats(const float *window, size_t n,
+                                   double *coherent_gain, double *enbw_bins);
 
 /* ---- 6. demodulators ---------------------------------------------------
  * FM: out[n] = gain * arg(in[n] * conj(prev)); *prev is carried so the first

@@ -58,6 +58,39 @@ def unpack_dc(raw, fmt: str, offset: complex = 0j, out=None, want_mean: bool = T
     return y, m
 
 
+def iq_health(x, clip_level: float = 0.99) -> dict:
+    """Twin of atkdsp_iq_health: DC, gain/phase imbalance, image rejection and
+    clip fraction of a converted block."""
+    z = np.asarray(x, dtype=np.complex64)
+    n = z.size
+    out = {"dc_re": 0.0, "dc_im": 0.0, "rms": 0.0, "gain_imbalance_db": 0.0,
+           "phase_error_deg": 0.0, "image_rejection_db": 0.0,
+           "clip_fraction": 0.0, "n": n}
+    if n == 0:
+        return out
+    thr = clip_level if clip_level > 0 else 0.99
+    I = z.real.astype(np.float64)
+    Q = z.imag.astype(np.float64)
+    mI, mQ = float(I.mean()), float(Q.mean())
+    out["dc_re"], out["dc_im"] = mI, mQ
+    out["rms"] = float(np.sqrt(np.mean(I * I + Q * Q)))
+    vI = max(0.0, float(I.var()))
+    vQ = max(0.0, float(Q.var()))
+    cIQ = float(((I - mI) * (Q - mQ)).mean())
+    if vI > 1e-30 and vQ > 1e-30:
+        out["gain_imbalance_db"] = 10.0 * np.log10(vI / vQ)
+        s = max(-1.0, min(1.0, cIQ / np.sqrt(vI * vQ)))
+        phi = float(np.arcsin(s))
+        out["phase_error_deg"] = np.degrees(phi)
+        a = np.sqrt(vI / vQ)
+        c = np.cos(phi)
+        num, den = a * a + 1 + 2 * a * c, a * a + 1 - 2 * a * c
+        out["image_rejection_db"] = 10.0 * np.log10(num / den) if den > 1e-30 else 1000.0
+    out["clip_fraction"] = float(np.mean(
+        (np.abs(I) >= thr) | (np.abs(Q) >= thr)))
+    return out
+
+
 # ---- 2. NCO -------------------------------------------------------------------
 class Nco:
     def __init__(self, freq_hz: float, sample_rate: float):
@@ -205,6 +238,49 @@ def spectrum_reduce(x, n: int, hop: int | None = None, win=None, detector: str =
         acc = acc / frames
     mag = np.sqrt(acc)
     return (20.0 * np.log10(mag + 1e-12)).astype(np.float32), frames
+
+
+def spectrum_stats(x, n: int, hop: int | None = None, win=None):
+    """Per-bin max/avg/min (dB) and spectral kurtosis in one pass. The readable
+    statement of atkdsp_spectrum_stats. Returns (max_db, avg_db, min_db, sk,
+    frames); sk is dimensionless, ~2 for Gaussian noise and ~1 for a tone."""
+    x = np.asarray(x, dtype=np.complex64)
+    hop = int(hop or n)
+    if x.size < n:
+        z = np.full(n, -240.0, dtype=np.float32)
+        return z, z.copy(), z.copy(), np.ones(n, np.float32), 0
+    frames = (x.size - n) // hop + 1
+    w = np.asarray(win, dtype=np.float32) if win is not None else None
+    powers = np.empty((frames, n), dtype=np.float64)
+    for f in range(frames):
+        seg = x[f * hop: f * hop + n]
+        if w is not None:
+            seg = seg * w
+        spec = np.fft.fftshift(np.fft.fft(seg))
+        powers[f] = (np.abs(spec) ** 2) / (n * n)
+    su = powers.sum(axis=0)
+    s2 = (powers ** 2).sum(axis=0)
+    mx = powers.max(axis=0)
+    mn = powers.min(axis=0)
+    max_db = (10.0 * np.log10(mx + 1e-12)).astype(np.float32)
+    min_db = (10.0 * np.log10(mn + 1e-12)).astype(np.float32)
+    avg_db = (10.0 * np.log10(su / frames + 1e-12)).astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sk = np.where((frames >= 2) & (su > 0.0),
+                      frames * s2 / (su * su), 1.0).astype(np.float32)
+    return max_db, avg_db, min_db, sk, frames
+
+
+def window_stats(win) -> tuple:
+    """(coherent_gain, enbw_bins) of a window — the twin of atkdsp_window_stats.
+    coherent_gain = mean(w); enbw_bins = n*sum(w^2)/sum(w)^2."""
+    w = np.asarray(win, dtype=np.float64)
+    n = w.size
+    s = float(w.sum())
+    s2 = float((w * w).sum())
+    cg = s / n if n else 0.0
+    enbw = (n * s2 / (s * s)) if s > 0.0 else 0.0
+    return cg, enbw
 
 
 # ---- 6. demodulators ----------------------------------------------------------

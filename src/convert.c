@@ -126,3 +126,63 @@ ptrdiff_t atkdsp_unpack_dc(const void *raw, size_t nbytes, int fmt,
     return unpack_core(raw, nbytes, fmt, out, out_cap, off_re, off_im,
                        mean_re, mean_im);
 }
+
+int atkdsp_iq_health(const atkdsp_cf32 *in, size_t n, float clip_level,
+                     atkdsp_iq_report *out) {
+    if (!in || !out) return ATKDSP_E_ARG;
+    memset(out, 0, sizeof *out);
+    out->n = n;
+    if (n == 0) return ATKDSP_OK;
+    const double thr = (clip_level > 0.0f) ? (double)clip_level : 0.99;
+    /* one pass: the five second-order sums, and the clip count. Eight partial
+     * accumulators so the adds are not one dependency chain. */
+    double sI[8], sQ[8], sII[8], sQQ[8], sIQ[8];
+    size_t clip = 0;
+    int l;
+    for (l = 0; l < 8; ++l) { sI[l]=sQ[l]=sII[l]=sQQ[l]=sIQ[l]=0.0; }
+    size_t i = 0;
+    const size_t m = n & ~(size_t)7;
+    for (; i < m; i += 8)
+        for (l = 0; l < 8; ++l) {
+            const double re = (double)in[i+l].re, im = (double)in[i+l].im;
+            sI[l]+=re; sQ[l]+=im; sII[l]+=re*re; sQQ[l]+=im*im; sIQ[l]+=re*im;
+            if (re >= thr || re <= -thr || im >= thr || im <= -thr) ++clip;
+        }
+    double SI=0,SQ=0,SII=0,SQQ=0,SIQ=0;
+    for (l = 0; l < 8; ++l) { SI+=sI[l]; SQ+=sQ[l]; SII+=sII[l]; SQQ+=sQQ[l]; SIQ+=sIQ[l]; }
+    for (; i < n; ++i) {
+        const double re = (double)in[i].re, im = (double)in[i].im;
+        SI+=re; SQ+=im; SII+=re*re; SQQ+=im*im; SIQ+=re*im;
+        if (re >= thr || re <= -thr || im >= thr || im <= -thr) ++clip;
+    }
+    const double N = (double)n;
+    const double mI = SI/N, mQ = SQ/N;
+    out->dc_re = mI; out->dc_im = mQ;
+    out->rms = sqrt((SII + SQQ) / N);
+    /* variances and covariance with the DC removed */
+    double vI = SII/N - mI*mI;
+    double vQ = SQQ/N - mQ*mQ;
+    double cIQ = SIQ/N - mI*mQ;
+    if (vI < 0) vI = 0; if (vQ < 0) vQ = 0;
+    out->gain_imbalance_db = (vQ > 1e-30 && vI > 1e-30)
+                             ? 10.0 * log10(vI / vQ) : 0.0;
+    double denom = sqrt(vI * vQ);
+    double s = (denom > 1e-30) ? cIQ / denom : 0.0;
+    if (s > 1.0) s = 1.0; if (s < -1.0) s = -1.0;
+    const double phi = asin(s);                       /* radians */
+    out->phase_error_deg = phi * 180.0 / ATK_PI;
+    /* image rejection from amplitude ratio a and phase phi:
+     * IRR = (a^2 + 1 + 2a cos phi) / (a^2 + 1 - 2a cos phi); perfect -> inf. */
+    if (vI > 1e-30 && vQ > 1e-30) {
+        const double a = sqrt(vI / vQ);
+        const double c = cos(phi);
+        const double num = a*a + 1.0 + 2.0*a*c;
+        const double den = a*a + 1.0 - 2.0*a*c;
+        out->image_rejection_db = (den > 1e-30)
+                                  ? 10.0 * log10(num / den) : 1000.0;
+    } else {
+        out->image_rejection_db = 0.0;
+    }
+    out->clip_fraction = (double)clip / N;
+    return ATKDSP_OK;
+}

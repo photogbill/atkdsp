@@ -81,15 +81,25 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.3.0 (ABI 2)
+## What is in v0.9.0 (ABI 10)
+
+Since v0.8.0: the FFT plan is genuinely safe to share across caller threads
+(a per-slot claim replaced `omp_get_thread_num`, which returned 0 for every
+thread outside a parallel region, so two callers wrote one scratch buffer);
+`atkdsp_spectrum_stats` computes per-bin max/avg/min **and spectral kurtosis**
+in one pass over the display's own frames (kurtosis ~2 for noise, ~1 for a
+carrier, >2 for a bursty emitter — a per-bin CW/noise/keying call from one
+block); and `atkdsp_window_stats` returns a window's coherent gain and ENBW so
+a reading can be turned into true dBFS and a bin width in Hz.
 
 | group | kernels | replaces in ATK |
 |---|---|---|
-| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block), **`atkdsp_unpack_dc`** — convert, remove a constant offset and return the block's mean, all in one pass | `dsp.iq_to_complex`, `dsp.dc_block` |
+| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block), **`atkdsp_unpack_dc`** — convert, remove a constant offset and return the block's mean, all in one pass; **`atkdsp_iq_health`** — DC, I/Q gain/phase imbalance, image rejection and clip fraction of a block, one pass | `dsp.iq_to_complex`, `dsp.dc_block` |
 | NCO | `atkdsp_nco_*` phase-continuous mixer | `dsp.frequency_shift` (the per-sample `np.exp`) |
 | FIR | `atkdsp_fir_*` decimating, carried history | `dsp._decimating_fir` |
 | resampler | `atkdsp_resampler_*` polyphase L/M, exact counts | (nothing — 48 077 Hz was fed to dsd-neo as 48 000) |
-| FFT | `atkdsp_fft_*`, `atkdsp_window`, `atkdsp_power_db`, **`atkdsp_spectrum_reduce`** (100 % POI: every frame, max/min/avg) | `dsp.spectrum_db` (one frame per chunk, the rest discarded) |
+| FFT | `atkdsp_fft_*` (thread-safe plans), `atkdsp_window`, **`atkdsp_window_stats`**, `atkdsp_power_db`, `atkdsp_spectrum_reduce` (100 % POI: every frame, max/min/avg), **`atkdsp_spectrum_stats`** (max/avg/min + spectral kurtosis, one pass) | `dsp.spectrum_db` (one frame per chunk, the rest discarded) |
+| LTE | `atkdsp_lte_*` cell search (PSS/SSS/PCI), PBCH→MIB, PRACH presence, turbo+CRC, SIB1/SI decode | (new; see the header's §11 and the roadmap caveats) |
 | demod | `atkdsp_fm_demod`, `atkdsp_am_demod`, state carried | `dsp.fm_demodulate`, `dsp.am_demodulate` |
 | display | `atkdsp_db_to_pixels`, `atkdsp_decimate_max` | pyqtgraph's per-frame LUT pass, `spectrum_view.decimate_max` |
 | detect | `atkdsp_median`, `atkdsp_detect_channels`, `atkdsp_stitch_max` | the per-bin Python loops in `signal_id.detect_channels` and `sweep.stitch` |

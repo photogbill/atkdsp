@@ -44,6 +44,32 @@ ATK_INLINE double atk_wrap(double ph) {
 void *atk_aligned_malloc(size_t bytes);
 void  atk_aligned_free(void *p);
 
+/* ---- a tiny lock-free claim, for the FFT plan's scratch slots -----------
+ * The header promises "a plan may be shared by several threads"; making that
+ * true means two caller threads must never take the same scratch slot. These
+ * are the whole of the machinery: try to claim a free flag (0 -> 1), and
+ * release it (-> 0). Compare-and-swap on the two compilers atkdsp targets,
+ * no OS threads, no OpenMP required — so it also protects callers that share
+ * a plan WITHOUT OpenMP, which omp_get_thread_num never could. A flag is one
+ * 32-bit int; on Windows `long` and `int` are both 32-bit, so the cast is
+ * width-exact. */
+#if defined(_MSC_VER)
+#  include <intrin.h>
+static __inline int atk_try_claim(volatile int *p) {
+    return _InterlockedCompareExchange((volatile long *)p, 1, 0) == 0;
+}
+static __inline void atk_release(volatile int *p) {
+    _InterlockedExchange((volatile long *)p, 0);
+}
+#else
+static inline int atk_try_claim(volatile int *p) {
+    return __sync_bool_compare_and_swap(p, 0, 1);
+}
+static inline void atk_release(volatile int *p) {
+    __sync_lock_release(p);
+}
+#endif
+
 /* Valid turbo code-block sizes (36.212 Table 5.1.3-3), for the SIB1 PHY's
  * CRC-gated K search. Defined in src/lte_turbo.c; not part of the ABI. */
 int atk_qpp_count(void);

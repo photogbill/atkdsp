@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.8.0"
+    assert atkdsp.version() == "0.9.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -1261,3 +1261,206 @@ def test_lte_si_decode_is_silent_on_noise():
         if atkdsp.lte_si_decode(z, 25, 123, 2, 5) is not None:
             false += 1
     assert false == 0
+
+
+# ---------------------------------------------------------------------------
+# one FFT plan, many caller threads — the shared-plan promise in atkdsp.h
+# ---------------------------------------------------------------------------
+
+def test_fft_plan_is_safe_across_caller_threads():
+    """The header says a plan MAY be shared by several threads. It could not:
+    exec/power_db picked their scratch by omp_get_thread_num, which is 0 for
+    every thread OUTSIDE a parallel region, so two external callers wrote the
+    same double buffer and read each other's transform (measured ~0.7% wrong
+    before the per-slot claim). This hammers it and asserts zero corruption.
+    """
+    import threading
+    rng = np.random.default_rng(1)
+    n = 4096
+    plan = atkdsp.Fft(n)
+    xa = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+    xb = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+    ra, rb = plan.exec(xa).copy(), plan.exec(xb).copy()
+    bad = [0, 0]
+
+    def hammer(x, r, i):
+        out = np.empty(n, np.complex64)
+        for _ in range(2000):
+            plan.exec(x, out=out)
+            if not np.allclose(out, r, rtol=1e-4, atol=1e-3):
+                bad[i] += 1
+
+    ts = [threading.Thread(target=hammer, args=(xa, ra, 0)),
+          threading.Thread(target=hammer, args=(xb, rb, 1))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert bad == [0, 0], f"shared-plan FFT corruption is back: {bad}"
+
+
+def test_fft_exec_and_spectrum_reduce_share_a_plan_safely():
+    """The worst case the claim discipline has to cover: a transient exec on
+    one thread while the batched reduction holds most of the slots on another,
+    both on the same plan."""
+    import threading
+    rng = np.random.default_rng(2)
+    n = 2048
+    plan = atkdsp.Fft(n)
+    x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64)
+    rx = plan.exec(x).copy()
+    big = (rng.standard_normal(n * 40) + 1j * rng.standard_normal(n * 40)).astype(np.complex64)
+    ref_line, _ = plan.spectrum_reduce(big, detector="max")
+    ref_line = ref_line.copy()
+    bad = [0]
+
+    def reduce_loop():
+        for _ in range(200):
+            line, _ = plan.spectrum_reduce(big, detector="max")
+            if not np.allclose(line, ref_line, rtol=1e-3, atol=1e-2):
+                bad[0] += 1
+
+    def exec_loop():
+        out = np.empty(n, np.complex64)
+        for _ in range(2000):
+            plan.exec(x, out=out)
+            if not np.allclose(out, rx, rtol=1e-4, atol=1e-3):
+                bad[0] += 1
+
+    ts = [threading.Thread(target=reduce_loop), threading.Thread(target=exec_loop)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    assert bad[0] == 0, "exec collided with spectrum_reduce on a shared plan"
+
+
+# ---------------------------------------------------------------------------
+# one-pass spectrum statistics (ABI 10) and window calibration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("n,hop", [(256, 256), (512, 256), (2048, 2048), (1024, 512)])
+def test_spectrum_stats_matches_the_twin(n, hop):
+    rng = np.random.default_rng(n + hop)
+    frames = 20
+    x = ((rng.standard_normal(n * frames) + 1j * rng.standard_normal(n * frames))
+         * 0.1).astype(np.complex64)
+    # a couple of steady tones and one gated tone, so max/avg/min/sk all differ
+    t = np.arange(x.size)
+    x += (0.2 * np.exp(2j * np.pi * 0.2 * t)).astype(np.complex64)
+    gate = ((t // n) % 2 == 0).astype(np.float32)
+    x += (0.3 * gate * np.exp(2j * np.pi * 0.35 * t)).astype(np.complex64)
+    win = atkdsp.window("hann", n)
+    res = atkdsp.spectrum_stats(x, n, hop=hop, win=win)
+    mx, av, mn, sk, fr = (res["max"], res["avg"], res["min"], res["sk"],
+                          res["frames"])
+    rmx, rav, rmn, rsk, rfr = ref.spectrum_stats(x, n, hop=hop, win=win)
+    assert fr == rfr
+    assert np.allclose(mx, rmx, atol=2e-3)
+    assert np.allclose(av, rav, atol=2e-3)
+    assert np.allclose(mn, rmn, atol=2e-3)
+    # kurtosis: compare where the twin is finite; ratios can be large so relative
+    ok = np.isfinite(rsk)
+    assert np.allclose(sk[ok], rsk[ok], rtol=2e-3, atol=2e-3)
+
+
+def test_spectrum_stats_kurtosis_separates_noise_from_a_tone():
+    n, frames = 1024, 64
+    rng = np.random.default_rng(7)
+    x = ((rng.standard_normal(n * frames) + 1j * rng.standard_normal(n * frames))
+         * 0.05).astype(np.complex64)
+    t = np.arange(x.size)
+    x += (0.05 * np.exp(2j * np.pi * 200 / n * t)).astype(np.complex64)  # steady CW
+    win = atkdsp.window("blackmanharris", n)
+    res = atkdsp.spectrum_stats(x, n, win=win)
+    sk = res["sk"]
+    k = n // 2 + 200
+    noise_sk = np.median(np.concatenate([sk[:k - 20], sk[k + 20:]]))
+    assert 1.6 < noise_sk < 2.4, noise_sk          # ~2 for Gaussian noise
+    assert sk[k] < 1.3, sk[k]                       # ~1 at the steady carrier
+
+
+def test_spectrum_stats_skips_null_outputs():
+    n = 512
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(n * 4) + 1j * rng.standard_normal(n * 4)).astype(np.complex64)
+    res = atkdsp.spectrum_stats(x, n, want=("avg",))
+    assert set(res) == {"avg", "frames"}
+    full = atkdsp.spectrum_stats(x, n)
+    assert np.allclose(res["avg"], full["avg"])
+
+
+def test_spectrum_stats_avg_equals_reduce_avg():
+    """avg_db from stats must equal the avg detector of spectrum_reduce — same
+    quantity by two paths."""
+    n = 2048
+    rng = np.random.default_rng(3)
+    x = ((rng.standard_normal(n * 12) + 1j * rng.standard_normal(n * 12))
+         * 0.1).astype(np.complex64)
+    win = atkdsp.window("hann", n)
+    avg = atkdsp.spectrum_stats(x, n, win=win, want=("avg",))["avg"]
+    line, _ = atkdsp.spectrum_reduce(x, n, win=win, detector="avg")
+    assert np.allclose(avg, line, atol=2e-3)
+
+
+@pytest.mark.parametrize("name,cg,enbw", [
+    ("rectangular", 1.0, 1.0),
+    ("hann", 0.5, 1.5),
+    ("blackmanharris", 0.35875, 2.0),
+])
+def test_window_stats(name, cg, enbw):
+    n = 4096
+    w = atkdsp.window(name, n)
+    gcg, genbw = atkdsp.window_stats(w)
+    rcg, renbw = ref.window_stats(w)
+    assert abs(gcg - rcg) < 1e-9 and abs(genbw - renbw) < 1e-9
+    assert abs(gcg - cg) < 5e-3          # matches the textbook value
+    assert abs(genbw - enbw) < 2e-2
+
+
+# ---------------------------------------------------------------------------
+# front-end health: DC, I/Q imbalance, image rejection, clipping (ABI 10)
+# ---------------------------------------------------------------------------
+
+def test_iq_health_matches_the_twin_on_a_balanced_block():
+    rng = np.random.default_rng(11)
+    x = ((rng.standard_normal(20000) + 1j * rng.standard_normal(20000)) * 0.2).astype(np.complex64)
+    g = atkdsp.iq_health(x)
+    r = ref.iq_health(x)
+    for k in ("dc_re", "dc_im", "rms", "gain_imbalance_db", "phase_error_deg",
+              "image_rejection_db", "clip_fraction"):
+        assert abs(g[k] - r[k]) < 1e-6, (k, g[k], r[k])
+
+
+def test_iq_health_measures_an_injected_imbalance():
+    """Build a block with a known 1 dB gain imbalance, 5 degrees of quadrature
+    error and a DC offset, and check the estimator recovers them."""
+    rng = np.random.default_rng(12)
+    N = 200000
+    I0 = rng.standard_normal(N)
+    Q0 = rng.standard_normal(N)
+    gain = 10 ** (1.0 / 20.0)          # +1 dB on I  -> +2 dB in power ratio
+    phi = np.deg2rad(5.0)
+    I = gain * I0 + 0.05
+    # phase skew: Q picks up some I
+    Q = (Q0 * np.cos(phi) + I0 * np.sin(phi)) - 0.02
+    z = (I + 1j * Q).astype(np.complex64)
+    h = atkdsp.iq_health(z)
+    assert abs(h["dc_re"] - 0.05) < 5e-3
+    assert abs(h["dc_im"] + 0.02) < 5e-3
+    assert abs(h["gain_imbalance_db"] - 1.0) < 0.1      # +1 dB amplitude on I = +1 dB power ratio
+    assert abs(h["phase_error_deg"] - 5.0) < 0.3
+    # a real front end with these errors rejects its image only ~25 dB
+    assert 20.0 < h["image_rejection_db"] < 35.0
+
+
+def test_iq_health_flags_clipping():
+    rng = np.random.default_rng(13)
+    x = ((rng.standard_normal(10000) + 1j * rng.standard_normal(10000)) * 0.1).astype(np.complex64)
+    x[:500] = (1.0 + 1.0j)             # 5% railed
+    h = atkdsp.iq_health(x)
+    assert abs(h["clip_fraction"] - 0.05) < 1e-3
+
+
+def test_iq_health_clean_block_rejects_its_image_well():
+    rng = np.random.default_rng(14)
+    x = ((rng.standard_normal(50000) + 1j * rng.standard_normal(50000)) * 0.2).astype(np.complex64)
+    h = atkdsp.iq_health(x)
+    assert h["image_rejection_db"] > 40.0     # nothing injected -> finite-sample floor
+    assert h["clip_fraction"] == 0.0

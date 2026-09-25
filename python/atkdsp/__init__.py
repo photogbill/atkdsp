@@ -31,14 +31,16 @@ __all__ = [
     "ABI_VERSION", "AtkDspError", "load", "available", "lib_path", "version",
     "build_info", "set_threads", "get_threads",
     "FMT", "DET", "WIN", "bytes_per_sample",
-    "unpack", "unpack_dc", "Nco", "Fir", "Resampler", "Fft", "window", "power_db",
-    "spectrum_reduce", "fm_demod", "am_demod", "db_to_pixels", "decimate_max",
+    "unpack", "unpack_dc", "iq_health",
+    "Nco", "Fir", "Resampler", "Fft", "window", "power_db",
+    "spectrum_reduce", "spectrum_stats", "window_stats",
+    "fm_demod", "am_demod", "db_to_pixels", "decimate_max",
     "median", "detect_channels", "stitch_max", "Channel",
 ]
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 9
+ABI_VERSION = 10
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -58,6 +60,13 @@ class _Cf32(C.Structure):
 
 class _Nco(C.Structure):
     _fields_ = [("phase", C.c_double), ("step", C.c_double)]
+
+
+class _IqHealth(C.Structure):
+    _fields_ = [("dc_re", C.c_double), ("dc_im", C.c_double),
+                ("rms", C.c_double), ("gain_imbalance_db", C.c_double),
+                ("phase_error_deg", C.c_double), ("image_rejection_db", C.c_double),
+                ("clip_fraction", C.c_double), ("n", C.c_size_t)]
 
 
 class _ChannelC(C.Structure):
@@ -139,6 +148,9 @@ def _bind(lib) -> None:
                                      C.c_float, C.c_float,
                                      P(C.c_double), P(C.c_double)]
 
+    lib.atkdsp_iq_health.restype = C.c_int
+    lib.atkdsp_iq_health.argtypes = [cf, C.c_size_t, C.c_float, P(_IqHealth)]
+
     lib.atkdsp_nco_init.argtypes = [P(_Nco), C.c_double, C.c_double]
     lib.atkdsp_nco_set_freq.argtypes = [P(_Nco), C.c_double, C.c_double]
     lib.atkdsp_nco_mix.argtypes = [P(_Nco), cf, cf, C.c_size_t]
@@ -175,6 +187,11 @@ def _bind(lib) -> None:
     lib.atkdsp_spectrum_reduce.restype = C.c_ssize_t
     lib.atkdsp_spectrum_reduce.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_size_t, fp,
                                            C.c_int, fp]
+    lib.atkdsp_spectrum_stats.restype = C.c_ssize_t
+    lib.atkdsp_spectrum_stats.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_size_t, fp,
+                                          fp, fp, fp, fp]
+    lib.atkdsp_window_stats.restype = C.c_int
+    lib.atkdsp_window_stats.argtypes = [fp, C.c_size_t, P(C.c_double), P(C.c_double)]
 
     lib.atkdsp_fm_demod.argtypes = [cf, C.c_size_t, fp, P(_Cf32), C.c_float]
     lib.atkdsp_am_demod.argtypes = [cf, C.c_size_t, fp, fp, C.c_float]
@@ -482,6 +499,28 @@ class Fft:
             _fp(out)), "spectrum_reduce")
         return out, int(frames)
 
+    def spectrum_stats(self, x, hop: int | None = None, win: np.ndarray | None = None,
+                       want=("max", "avg", "min", "sk")):
+        """Per-bin max/avg/min (dB) and spectral kurtosis in one pass over the
+        frames. Returns a dict of the requested arrays plus ``frames``. Skipped
+        outputs cost nothing on the C side (their pointer is NULL)."""
+        x = _cf32(x, "x")
+        w = None if win is None else _f32(win, "win")
+        want = set(want)
+        outs = {k: (np.empty(self.n, dtype=np.float32) if k in want else None)
+                for k in ("max", "avg", "min", "sk")}
+        frames = _check(self._lib.atkdsp_spectrum_stats(
+            self._h, _cfp(x), x.size, int(hop or self.n),
+            None if w is None else _fp(w),
+            _fp(outs["max"]) if outs["max"] is not None else None,
+            _fp(outs["avg"]) if outs["avg"] is not None else None,
+            _fp(outs["min"]) if outs["min"] is not None else None,
+            _fp(outs["sk"]) if outs["sk"] is not None else None),
+            "spectrum_stats")
+        res = {k: v for k, v in outs.items() if v is not None}
+        res["frames"] = int(frames)
+        return res
+
 
 def window(kind, n: int) -> np.ndarray:
     k = WIN[kind] if isinstance(kind, str) else int(kind)
@@ -497,6 +536,35 @@ def power_db(x, win=None) -> np.ndarray:
 
 def spectrum_reduce(x, n: int, hop: int | None = None, win=None, detector="max"):
     return Fft(n).spectrum_reduce(x, hop, win, detector)
+
+
+def spectrum_stats(x, n: int, hop: int | None = None, win=None,
+                   want=("max", "avg", "min", "sk")):
+    return Fft(n).spectrum_stats(x, hop, win, want)
+
+
+def window_stats(win) -> tuple:
+    """(coherent_gain, enbw_bins) of a window array."""
+    w = _f32(win, "win")
+    cg, enbw = C.c_double(0.0), C.c_double(0.0)
+    _check(load().atkdsp_window_stats(_fp(w), w.size, C.byref(cg), C.byref(enbw)),
+           "window_stats")
+    return cg.value, enbw.value
+
+
+def iq_health(x, clip_level: float = 0.0) -> dict:
+    """Front-end health of a converted block: DC offset, I/Q gain and phase
+    imbalance, the derived image rejection, and the clip fraction. Returns a
+    dict with the same keys as the numpy twin."""
+    x = _cf32(x, "x")
+    h = _IqHealth()
+    _check(load().atkdsp_iq_health(_cfp(x), x.size, float(clip_level), C.byref(h)),
+           "iq_health")
+    return {"dc_re": h.dc_re, "dc_im": h.dc_im, "rms": h.rms,
+            "gain_imbalance_db": h.gain_imbalance_db,
+            "phase_error_deg": h.phase_error_deg,
+            "image_rejection_db": h.image_rejection_db,
+            "clip_fraction": h.clip_fraction, "n": int(h.n)}
 
 
 # -- 6. demodulators ----------------------------------------------------------

@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.9.0"
+    assert atkdsp.version() == "0.10.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -191,6 +191,67 @@ def test_resampler_48077_to_48000_over_ten_seconds():
     for _ in range(10):
         total += r.process(noise(48077)).size
     assert abs(total - 480_000) <= 1
+
+
+# ---- 4b. arbitrary (fractional) resampler ------------------------------------
+@pytest.mark.parametrize("in_rate,out_rate", [
+    (100_000, 200_000),      # a clean 2x, but through the Farrow path
+    (2_457_612.3, 48_000),   # a clock measured to a fractional hertz
+    (48_000, 44_100),        # CD <-> DAT, a ratio with a big denominator
+    (1_000_000, 333_333),    # a nearly-but-not-quite 3:1
+])
+def test_arb_resampler_matches_the_twin(in_rate, out_rate):
+    x = noise(int(min(in_rate, 300_000)), 1.0)
+    a = atkdsp.ArbResampler(in_rate, out_rate)
+    b = ref.ArbResampler(in_rate, out_rate)
+    sizes = [1, 17, 2000, 3, 999, 4096]
+    ya = np.concatenate([a.process(blk) for blk in blocks(x, sizes)])
+    yb = np.concatenate([b.process(blk) for blk in blocks(x, sizes)])
+    assert ya.size == yb.size
+    np.testing.assert_allclose(ya, yb, rtol=0, atol=2e-3)
+    # N samples in produce ~N*ratio out
+    assert abs(ya.size - x.size * out_rate / in_rate) <= 2
+
+
+def test_arb_resampler_is_invariant_to_how_the_stream_is_chunked():
+    """The output depends on the samples, not on where the driver cut the
+    blocks — position is tracked from a global index, not accumulated per call,
+    so a coalesced 40 MSPS block and a stream of tiny ones give the SAME line."""
+    x = noise(60_000, 1.0)
+    whole = atkdsp.ArbResampler(1_000_000, 730_000).process(x)
+    for sizes in ([60_000], [1] * 3 + [59_997], [997] * 60 + [180], [12345, 7, 40000, 3648]):
+        a = atkdsp.ArbResampler(1_000_000, 730_000)
+        split = np.concatenate([a.process(blk) for blk in blocks(x, sizes)])
+        assert split.size == whole.size
+        np.testing.assert_array_equal(split, whole)     # bit-for-bit
+
+
+def test_arb_resampler_preserves_a_tone_and_its_rate():
+    fs_in, fs_out, f = 1_000_000, 250_000, 40_000
+    t = np.arange(fs_in) / fs_in
+    x = np.exp(2j * np.pi * f * t).astype(np.complex64)
+    a = atkdsp.ArbResampler(fs_in, fs_out)
+    y = np.concatenate([a.process(blk) for blk in blocks(x, [8192] * 122 + [1]) ])
+    seg = y[2000:]
+    N = 1 << int(np.floor(np.log2(seg.size)))
+    Y = np.fft.fftshift(np.abs(np.fft.fft(seg[:N])))
+    peak = (np.argmax(Y) - N // 2) * fs_out / N
+    assert abs(peak - f) < 50
+    assert abs(y.size - fs_in * fs_out / fs_in) <= 2
+
+
+def test_arb_resampler_set_ratio_is_a_continuous_ppm_nudge():
+    """A live sample-clock correction: nudging the ratio a few ppm mid-stream
+    matches the twin and does not restart the phase."""
+    x = noise(40_000, 1.0)
+    a = atkdsp.ArbResampler(1_000_000, 1_000_000)
+    b = ref.ArbResampler(1_000_000, 1_000_000)
+    ya = [a.process(x[:20_000])]; a.set_ratio(1.000_05); ya.append(a.process(x[20_000:]))
+    yb = [b.process(x[:20_000])]; b.set_ratio(1.000_05); yb.append(b.process(x[20_000:]))
+    ya = np.concatenate(ya); yb = np.concatenate(yb)
+    assert ya.size == yb.size
+    np.testing.assert_allclose(ya, yb, rtol=0, atol=2e-3)
+    assert abs(a.ratio() - 1.000_05) < 1e-9
 
 
 # ---- 5. FFT -------------------------------------------------------------------
@@ -385,6 +446,32 @@ def test_ddc_matches_twin_across_uneven_blocks(fs):
     yb = np.concatenate([b.process(blk) for blk in blocks(x, sizes)])
     assert ya.size == yb.size
     np.testing.assert_allclose(ya, yb, rtol=0, atol=3e-5)
+
+
+@pytest.mark.parametrize("fs", [2_457_612.3, 9_999_997.4])
+def test_ddc_takes_an_arbitrary_clock_instead_of_refusing(fs):
+    """A clock measured to a fractional hertz used to return NULL from the DDC
+    (a non-integer resampling ratio). It now runs through the arbitrary
+    resampler — the channel is native, the rate is the one asked for, and the C
+    matches the twin. An integer clock still takes the exact rational path."""
+    x = noise(int(fs * 0.02), 1.0)
+    a = atkdsp.Ddc(fs, 123_456.0, 15_000, 48_000, 60, max_block=x.size)
+    b = ref.Ddc(fs, 123_456.0, 15_000, 48_000, 60)
+    assert a.out_rate == b.out_rate == 48_000
+    assert "arb" in a.describe(), a.describe()
+    sizes = [1, 7777, 3, x.size // 3]
+    ya = np.concatenate([a.process(blk) for blk in blocks(x, sizes)])
+    yb = np.concatenate([b.process(blk) for blk in blocks(x, sizes)])
+    assert abs(ya.size - yb.size) <= 1
+    m = min(ya.size, yb.size)
+    np.testing.assert_allclose(ya[:m], yb[:m], rtol=0, atol=2e-3)
+
+
+def test_ddc_keeps_the_exact_rational_path_for_an_integer_clock():
+    """The additive rule: nothing that worked before changed. 10 MSPS -> 48 kHz
+    is still the exact 624/625 resampler, not the arbitrary one."""
+    d = atkdsp.Ddc(10_000_000, 0.0, 15_000, 48_000, 60, max_block=1 << 16)
+    assert "arb" not in d.describe() and "x624/625" in d.describe()
 
 
 @pytest.mark.parametrize("fs,worst_db", [(2_400_000, -60), (10_000_000, -60), (40_000_000, -60)])
@@ -1464,3 +1551,61 @@ def test_iq_health_clean_block_rejects_its_image_well():
     h = atkdsp.iq_health(x)
     assert h["image_rejection_db"] > 40.0     # nothing injected -> finite-sample floor
     assert h["clip_fraction"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# multi-cell detection by successive interference cancellation
+# ---------------------------------------------------------------------------
+
+def test_lte_detect_finds_two_co_channel_cells_aligned():
+    """The fake-tower case: two cells on one carrier, time-aligned, the second
+    6 dB down. Before SIC only the stronger was returned; the weaker's PSS is
+    buried and its SSS is corrupted by the strong cell on top of it."""
+    strong = lte_frame(19, 0, 20.0, seed=1)       # PCI 57
+    weak = lte_frame(18, 1, 20.0, seed=2)          # PCI 55
+    n = min(strong.size, weak.size)
+    mix = (strong[:n] + 0.5 * weak[:n]).astype(np.complex64)
+    got = atkdsp.Lte().detect(mix, min_metric=0.15)
+    pcis = sorted(c["pci"] for c in got)
+    assert pcis == [55, 57], pcis
+    assert got[0]["pci"] == 57, "the stronger cell must be the primary (result[0])"
+
+
+def test_lte_detect_finds_two_cells_at_different_timing():
+    strong = lte_frame(19, 0, 20.0, seed=3)        # PCI 57
+    weak = np.roll(lte_frame(30, 2, 20.0, seed=4), 1234)   # PCI 92, offset
+    n = min(strong.size, weak.size)
+    mix = (strong[:n] + 0.6 * weak[:n]).astype(np.complex64)
+    pcis = sorted(c["pci"] for c in atkdsp.Lte().detect(mix, min_metric=0.15))
+    assert pcis == [57, 92], pcis
+
+
+def test_lte_detect_multicell_agrees_with_twin():
+    strong = lte_frame(19, 0, 18.0, seed=5)
+    weak = lte_frame(40, 1, 18.0, seed=6)          # PCI 121
+    n = min(strong.size, weak.size)
+    mix = (strong[:n] + 0.5 * weak[:n]).astype(np.complex64)
+    a = atkdsp.Lte().detect(mix, min_metric=0.1)
+    b = ref.lte_detect(mix, min_metric=0.1)
+    assert [c["pci"] for c in a] == [c["pci"] for c in b], (
+        [c["pci"] for c in a], [c["pci"] for c in b])
+
+
+def test_lte_detect_single_cell_is_still_one_cell():
+    """SIC must not invent a second cell out of a single cell's cancellation
+    residual, at any SNR — the 0-false-alarm property extends to the residual."""
+    for snr in (25.0, 15.0, 5.0, 0.0):
+        got = atkdsp.Lte().detect(lte_frame(57, 1, snr, seed=int(snr) + 40),
+                                  min_metric=0.15)
+        assert len(got) == 1, f"{snr} dB single cell -> {len(got)} cells"
+        assert got[0]["pci"] == 3 * 57 + 1
+
+
+def test_lte_detect_multicell_invents_nothing_in_noise():
+    r = np.random.default_rng(99)
+    lte = atkdsp.Lte()
+    false = 0
+    for _ in range(12):
+        z = (r.standard_normal(38400) + 1j * r.standard_normal(38400))
+        false += len(lte.detect(z.astype(np.complex64), min_metric=0.15))
+    assert false == 0, f"{false} cells invented in noise"

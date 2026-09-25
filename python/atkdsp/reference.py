@@ -178,6 +178,111 @@ class Resampler:
         return np.asarray(outs, dtype=np.complex64)
 
 
+# ---- 4b. arbitrary (fractional) resampler -------------------------------------
+class ArbResampler:
+    """Resample by ANY positive out/in ratio — the twin of atkdsp_arb_resampler.
+
+    A prototype low-pass designed at in_rate*P is split into P polyphase
+    branches (interpolate-by-P, gain P folded in). An output at continuous input
+    position ``pos`` takes i=floor(pos) as the newest input and frac=pos-i as the
+    sub-sample delay; the branch b=floor(frac*P) is applied and LINEARLY
+    interpolated toward the next branch (a first-order Farrow) by mu=frac*P-b,
+    using the forward-difference bank d[k]=p[k+1]-p[k] (p[PQ]=0). ``pos`` steps
+    by in/out per output and is carried across blocks, so a block boundary is
+    invisible. Same newest-first FIR convention as the rational Resampler.
+    """
+
+    def __init__(self, in_rate: float, out_rate: float, atten_db: float = 60.0,
+                 nphase: int = 64):
+        if in_rate <= 0.0 or out_rate <= 0.0:
+            raise ValueError("in_rate and out_rate must be positive")
+        if atten_db <= 0.0:
+            atten_db = 60.0
+        P = int(nphase) if nphase else 64
+        nyq = 0.5 * min(in_rate, out_rate)     # anti-alias down, don't widen up
+        proto = design_lowpass(0.8 * nyq, nyq, atten_db, in_rate * P)
+        nt = proto.size
+        Q = (nt + P - 1) // P
+        PQ = P * Q
+        p = np.zeros(PQ, dtype=np.float64)
+        p[:nt] = proto.astype(np.float64)
+        p *= float(P)                          # interpolate-by-P gain
+        d = np.empty(PQ, dtype=np.float64)
+        d[:PQ - 1] = p[1:] - p[:-1]
+        d[PQ - 1] = -p[PQ - 1]                 # p[PQ] == 0
+        self.P, self.Q = P, Q
+        self.p, self.d = p, d
+        self.in_rate = float(in_rate)
+        self.out_rate = float(out_rate)
+        self.step = in_rate / out_rate         # input samples per output
+        self.reset()
+
+    def reset(self) -> None:
+        self.hist = np.zeros(self.Q, dtype=np.complex64)   # hist[Q-1] = x[-1]
+        # Blocking-invariant position: output K sits at base + K*step (since the
+        # last anchor), in the block that starts at the exact integer input
+        # offset in_off. Because in_off is an integer and K*step is a pure
+        # function of K, the same output lands identically however the stream is
+        # cut into blocks — matching the C, which no longer accumulates `pos`.
+        self.base = 0.0
+        self.K = 0
+        self.in_off = 0
+
+    def set_ratio(self, ratio: float) -> None:
+        """Nudge the ratio (out/in) live, WITHOUT rebuilding the prototype —
+        for a few-ppm sample-clock correction. A large change wants a rebuild,
+        since the prototype's cutoff was fixed at create."""
+        if ratio <= 0.0:
+            return
+        self.base = self.base + self.K * self.step     # re-anchor: keep next output
+        self.K = 0
+        self.out_rate = self.in_rate * ratio
+        self.step = 1.0 / ratio
+
+    def ratio(self) -> float:
+        return 1.0 / self.step if self.step > 0.0 else 0.0
+
+    def out_max(self, n_in: int) -> int:
+        if self.step <= 0.0:
+            return 0
+        local = self.base + self.K * self.step - self.in_off
+        if local >= n_in:
+            return 0
+        return int((n_in - local) / self.step) + 2
+
+    def process(self, x) -> np.ndarray:
+        x = np.asarray(x, dtype=np.complex64)
+        n = x.size
+        P, Q = self.P, self.Q
+        p, d = self.p, self.d
+        step, base, inoff = self.step, self.base, self.in_off
+        # hist (Q) then x, so full[Q + m] addresses x[m] and full[Q-1] is x[-1] —
+        # the same newest-first indexing the C does with in[] and its history.
+        full = np.concatenate([self.hist, x])
+        qidx = P * np.arange(Q)
+        outs = []
+        K = self.K
+        local = base + K * step - inoff
+        while local < n:
+            i = int(np.floor(local))
+            frac = local - i
+            ph = frac * P
+            b = int(ph)
+            if b >= P:
+                b = P - 1
+            mu = ph - b
+            c = p[b + qidx] + mu * d[b + qidx]        # Farrow coefficients, q=0..Q-1
+            bi = Q + i
+            seg = full[bi - Q + 1: bi + 1][::-1]       # x[i], x[i-1], ..., x[i-(Q-1)]
+            outs.append(np.dot(c, seg))
+            K += 1
+            local = base + K * step - inoff
+        self.K = K
+        self.in_off += n
+        self.hist = full[-Q:].copy()
+        return np.asarray(outs, dtype=np.complex64)
+
+
 # ---- 5. FFT -------------------------------------------------------------------
 def window(kind: str, n: int) -> np.ndarray:
     if n == 1:
@@ -527,18 +632,25 @@ class Ddc:
             self.stages.append(Fir(h, 1)); self.factors = [1]; self.ntaps = [h.size]
         self.up = self.down = 1
         self.rs = None
+        self.arb = None
         if abs(self.r - float(out_rate)) > 1e-9 * float(out_rate):
             num, den = float(out_rate) * D, fs
-            g = _gcd(int(num), int(den))
-            self.up, self.down = int(num) // g, int(den) // g
-            hi = self.r * self.up
-            nyq = 0.5 * min(self.r, float(out_rate))
-            h = design_lowpass(nyq * 0.8, nyq, atten_db, hi)
-            self.rs = Resampler(self.up, self.down, h)
+            if num > 4e9 or den > 4e9 or math.floor(num) != num or math.floor(den) != den:
+                # a real-number ratio (an odd sample clock, a huge denominator):
+                # the arbitrary resampler, as the C does.
+                self.arb = ArbResampler(self.r, float(out_rate), atten_db)
+            else:
+                g = _gcd(int(num), int(den))
+                self.up, self.down = int(num) // g, int(den) // g
+                hi = self.r * self.up
+                nyq = 0.5 * min(self.r, float(out_rate))
+                h = design_lowpass(nyq * 0.8, nyq, atten_db, hi)
+                self.rs = Resampler(self.up, self.down, h)
 
     @property
     def out_rate(self) -> float:
-        return self.out_rate_req if self.rs is not None else self.r
+        return (self.out_rate_req if (self.rs is not None or self.arb is not None)
+                else self.r)
 
     def plan(self):
         return list(self.factors), list(self.ntaps), self.up, self.down
@@ -552,6 +664,8 @@ class Ddc:
             s.reset()
         if self.rs is not None:
             self.rs.reset()
+        if self.arb is not None:
+            self.arb.reset()
 
     def process(self, x) -> np.ndarray:
         y = self.nco.mix(x)
@@ -559,6 +673,8 @@ class Ddc:
             y = s.process(y)
         if self.rs is not None:
             y = self.rs.process(y)
+        elif self.arb is not None:
+            y = self.arb.process(y)
         return y
 
 
@@ -628,38 +744,31 @@ def lte_sss_symbol(nid1: int, nid2: int, subframe: int) -> np.ndarray:
 LTE_PSS_NI_K = 9.0
 
 
-def lte_detect(x, min_metric: float = 0.06):
-    """The strongest cell in `x` (which must be at LTE_RATE), or []. Mirrors
-    src/lte.c: a proven single-shot path (min_metric + 5 ms mate) for strong
-    cells, and a non-coherent-integration fallback (fold the metric modulo the
-    PSS period, CFAR on the fold) that catches weak cells the single shot
-    misses. See atkdsp_lte_detect."""
-    x = np.asarray(x, dtype=np.complex128)
-    n = x.size
-    if n < 2 * LTE_PSS_PERIOD:
-        return []
-    valid = n - LTE_SYM
+#: Secondary-cell gates after cancellation — must match src/lte.c. The metric
+#: is decisive: a real cell dominates the residual (~0.8-1.0), a stub is ~0.07.
+LTE_SEC_METRIC_MIN = 0.30
+LTE_SEC_SSS_MIN = 0.5
+
+
+def _lte_detect_one(x, valid, min_metric):
+    """The proven single-cell detector on one buffer: strongest PSS peak with a
+    5 ms mate, else the non-coherent fold + CFAR. Returns (nid2, k, metric) or
+    None. Mirrors detect_one in src/lte.c."""
     P = LTE_PSS_PERIOD
     e = np.convolve(np.abs(x) ** 2, np.ones(LTE_SYM), mode="valid")[:valid + 1]
     best = None
-    ni = None                            # {margin, nid2, offset, metric}
+    ni = None
     for nid2 in range(3):
         p = np.asarray(lte_pss_symbol(nid2), dtype=np.complex128)
         pe = float(np.vdot(p, p).real)
         c = np.correlate(x, p, mode="valid")[:valid + 1]
         m = (np.abs(c) ** 2) / np.maximum(e * pe, 1e-20)
         k = int(np.argmax(m))
-        # proven single-shot path: min_metric + the 5 ms mate. The mate must
-        # reach half of THIS peak, not half the threshold — a cell's two
-        # occurrences are within a fade of each other, noise clearing an
-        # absolute bar twice is not.
         if m[k] >= min_metric:
             mate = any(0 <= k + d <= valid and m[k + d] > 0.5 * m[k]
                        for d in (-P, P))
-            if mate and (best is None or m[k] > best["metric"]):
-                best = {"nid2": nid2, "offset": k, "metric": float(m[k])}
-        # non-coherent fold: average each residue over its occurrences, CFAR
-        # test the peak against the fold's own mean (peak bin excluded).
+            if mate and (best is None or m[k] > best[2]):
+                best = (nid2, k, float(m[k]))
         nb = (valid + 1) // P
         if nb >= 1:
             mf = m[:nb * P].reshape(nb, P).mean(axis=0)
@@ -667,21 +776,65 @@ def lte_detect(x, min_metric: float = 0.06):
             other = np.delete(mf, rpk)
             mean = float(other.mean()); sd = float(other.std())
             margin = (mf[rpk] - mean) / sd if sd > 1e-30 else 0.0
-            if margin >= LTE_PSS_NI_K and (ni is None or margin > ni["margin"]):
+            if margin >= LTE_PSS_NI_K and (ni is None or margin > ni[0]):
                 occ = np.arange(rpk, valid + 1, P)
                 bk = int(occ[np.argmax(m[occ])])
-                ni = {"margin": margin, "nid2": nid2, "offset": bk,
-                      "metric": float(m[bk])}
-    if best is None:                     # single shot found nothing: NI fallback
-        best = ni
-    if best is None:
-        return []
-    k, nid2 = best["offset"], best["nid2"]
+                ni = (margin, nid2, bk, float(m[bk]))
+    if best is not None:
+        return best
+    if ni is not None:
+        return (ni[1], ni[2], ni[3])
+    return None
+
+
+def _lte_project_out(buf, ref, energy, at):
+    if energy <= 1e-20:
+        return
+    seg = buf[at:at + LTE_SYM]
+    g = np.vdot(ref, seg) / energy      # <ref, seg> / |ref|^2
+    buf[at:at + LTE_SYM] = seg - g * ref
+
+
+def _lte_subtract_cell(buf, n, cell):
+    """Remove a decoded cell's PSS (every 5 ms) and SSS (137 before each PSS,
+    subframe alternating). Mirrors subtract_cell in src/lte.c."""
+    P = LTE_PSS_PERIOD
+    nid2 = cell["nid2"]
+    pss = np.asarray(lte_pss_symbol(nid2), dtype=np.complex128)
+    pe = float(np.vdot(pss, pss).real)
+    have_sss = cell["nid1"] >= 0
+    if have_sss:
+        def sss_time(sf):
+            v = np.asarray(lte_sss_symbol(cell["nid1"], nid2, sf), float)
+            g = np.zeros(LTE_SYM, complex)
+            g[LTE_SYM - 31:] = v[:31]; g[1:32] = v[31:]
+            return np.fft.ifft(g) * LTE_SYM / np.sqrt(62)
+        sss = {0: sss_time(0), 5: sss_time(5)}
+        se = {sf: float(np.vdot(s, s).real) for sf, s in sss.items()}
+    base = cell["offset"] % P
+    j0 = (cell["offset"] - base) // P
+    kk = base
+    while kk + LTE_SYM <= n:
+        j = (kk - base) // P
+        sf = cell["subframe"]
+        if (j - j0) & 1:
+            sf = 5 if sf == 0 else 0
+        _lte_project_out(buf, pss, pe, kk)
+        if have_sss:
+            a = kk - LTE_SSS_BACK
+            if 0 <= a and a + LTE_SYM <= n:
+                _lte_project_out(buf, sss[sf], se[sf], a)
+        kk += P
+
+
+def _lte_decode_cell(x, n, nid2, k, metric):
+    """CFO + SSS for one (nid2, offset). Mirrors decode_cell in src/lte.c."""
     p = np.asarray(lte_pss_symbol(nid2), dtype=np.complex128)
+    cell = {"nid2": nid2, "offset": int(k), "metric": float(metric),
+            "nid1": -1, "pci": -1, "subframe": -1, "sss_score": 0.0}
     h1 = np.vdot(p[:64], x[k:k + 64])
     h2 = np.vdot(p[64:], x[k + 64:k + LTE_SYM])
-    best["cfo_hz"] = float(np.angle(h2 * np.conj(h1)) * LTE_RATE / (2 * np.pi * 64))
-    best.update(nid1=-1, pci=-1, subframe=-1, sss_score=0.0)
+    cell["cfo_hz"] = float(np.angle(h2 * np.conj(h1)) * LTE_RATE / (2 * np.pi * 64))
     at = k - LTE_SSS_BACK
     if at < 0:
         at += LTE_PSS_PERIOD
@@ -693,8 +846,47 @@ def lte_detect(x, min_metric: float = 0.06):
         scores = [(float(np.dot(lte_sss_symbol(n1, nid2, sf), r)), n1, sf)
                   for n1 in range(168) for sf in (0, 5)]
         sc, n1, sf = max(scores)
-        best.update(nid1=n1, subframe=sf, pci=3 * n1 + nid2, sss_score=sc / 62.0)
-    return [best]
+        cell.update(nid1=n1, subframe=sf, pci=3 * n1 + nid2, sss_score=sc / 62.0)
+    return cell
+
+
+def lte_detect(x, min_metric: float = 0.06, cap: int = 8):
+    """Every co-channel cell in `x` (at LTE_RATE), strongest first, or []. Mirrors
+    src/lte.c: successive interference cancellation. Detect the strongest cell
+    (pass 0 is the old single-cell result), decode it, SUBTRACT its PSS/SSS from
+    a residual copy, and detect again — only after the strong cell is removed
+    does a weaker co-channel cell rise above the interference floor with an
+    uncorrupted SSS. Stops on nothing found, a repeated PCI, or `cap`. See
+    atkdsp_lte_detect."""
+    x = np.asarray(x, dtype=np.complex128)
+    n = x.size
+    if n < 2 * LTE_PSS_PERIOD:
+        return []
+    valid = n - LTE_SYM
+    work = x.copy()
+    out = []
+    while len(out) < cap:
+        buf = x if not out else work
+        got = _lte_detect_one(buf, valid, min_metric)
+        if got is None:
+            break
+        nid2, k, metric = got
+        cell = _lte_decode_cell(buf, n, nid2, k, metric)
+        if out:
+            # a residual pass is only believed with a strong post-cancellation
+            # metric and a real SSS; below either it is a stub. A repeated PCI
+            # is the same cell resurfacing.
+            if (cell["pci"] < 0 or metric < LTE_SEC_METRIC_MIN
+                    or cell["sss_score"] < LTE_SEC_SSS_MIN
+                    or any(o["pci"] == cell["pci"] for o in out)):
+                break
+        out.append(cell)
+        if len(out) >= cap:
+            break
+        if len(out) == 1:
+            work = x.copy()
+        _lte_subtract_cell(work, n, cell)
+    return out
 
 
 # ---- 11b. LTE PBCH -> MIB (the spec src/lte_pbch.c is held to) -----------

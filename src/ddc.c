@@ -23,7 +23,8 @@ struct atkdsp_ddc {
     unsigned     ntaps[MAX_STAGES];
     double       rate_out[MAX_STAGES];      /* rate after stage i */
     atkdsp_fir  *fir[MAX_STAGES];
-    atkdsp_resampler *rs;                    /* NULL when r == out_rate */
+    atkdsp_resampler *rs;                    /* rational: r -> out_rate, small L/M */
+    atkdsp_arb_resampler *arb;               /* arbitrary: r -> out_rate, any ratio */
     unsigned     up, down;
     unsigned     rs_taps;
     double       r;                          /* rate after the integer stages */
@@ -108,26 +109,31 @@ atkdsp_ddc *atkdsp_ddc_create(double fs, double offset_hz, double bw, double out
         }
     }
 
-    /* exact-rate resampler: r -> out_rate as a reduced integer ratio */
+    /* final rate step: r -> out_rate. A small integer ratio is done exactly by
+     * the rational resampler; a real-number ratio (an odd sample clock like
+     * 2.457600 MHz, or a rate whose reduced denominator is huge) goes to the
+     * arbitrary resampler instead of being refused. */
     d->up = 1; d->down = 1;
     if (fabs(d->r - out_rate) > 1e-9 * out_rate) {
         const double num = out_rate * (double)D, den = fs;    /* out/r = out*D/fs */
         if (num > 4e9 || den > 4e9 || floor(num) != num || floor(den) != den) {
-            atkdsp_ddc_destroy(d); free(taps); return NULL;   /* non-integer rates: not supported */
+            d->arb = atkdsp_arb_resampler_create(d->r, out_rate, atten_db, 0);
+            if (!d->arb) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
+        } else {
+            unsigned g = gcd_u((unsigned)num, (unsigned)den);
+            d->up = (unsigned)num / g; d->down = (unsigned)den / g;
+            const double hi = d->r * (double)d->up;            /* the polyphase rate */
+            const double nyq = 0.5 * (d->r < out_rate ? d->r : out_rate);
+            const double fp = nyq * 0.8, fstop = nyq;
+            ptrdiff_t n = atkdsp_design_lowpass(fp, fstop, atten_db, hi, NULL, 0);
+            if (n <= 0) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
+            free(taps); taps = (float *)malloc((size_t)n * sizeof(float));
+            if (!taps) { atkdsp_ddc_destroy(d); return NULL; }
+            atkdsp_design_lowpass(fp, fstop, atten_db, hi, taps, (size_t)n);
+            d->rs = atkdsp_resampler_create(d->up, d->down, taps, (size_t)n);
+            d->rs_taps = (unsigned)n;
+            if (!d->rs) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
         }
-        unsigned g = gcd_u((unsigned)num, (unsigned)den);
-        d->up = (unsigned)num / g; d->down = (unsigned)den / g;
-        const double hi = d->r * (double)d->up;                /* the polyphase rate */
-        const double nyq = 0.5 * (d->r < out_rate ? d->r : out_rate);
-        const double fp = nyq * 0.8, fstop = nyq;
-        ptrdiff_t n = atkdsp_design_lowpass(fp, fstop, atten_db, hi, NULL, 0);
-        if (n <= 0) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
-        free(taps); taps = (float *)malloc((size_t)n * sizeof(float));
-        if (!taps) { atkdsp_ddc_destroy(d); return NULL; }
-        atkdsp_design_lowpass(fp, fstop, atten_db, hi, taps, (size_t)n);
-        d->rs = atkdsp_resampler_create(d->up, d->down, taps, (size_t)n);
-        d->rs_taps = (unsigned)n;
-        if (!d->rs) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
     }
     free(taps);
 
@@ -149,6 +155,7 @@ void atkdsp_ddc_destroy(atkdsp_ddc *d) {
     if (!d) return;
     for (int i = 0; i < MAX_STAGES; ++i) atkdsp_fir_destroy(d->fir[i]);
     atkdsp_resampler_destroy(d->rs);
+    atkdsp_arb_resampler_destroy(d->arb);
     for (int i = 0; i <= MAX_STAGES; ++i) atk_aligned_free(d->buf[i]);
     free(d);
 }
@@ -158,6 +165,7 @@ void atkdsp_ddc_reset(atkdsp_ddc *d) {
     d->nco.phase = 0.0;
     for (int i = 0; i < d->nstages; ++i) atkdsp_fir_reset(d->fir[i]);
     if (d->rs) atkdsp_resampler_reset(d->rs);
+    if (d->arb) atkdsp_arb_resampler_reset(d->arb);
 }
 
 void atkdsp_ddc_set_offset(atkdsp_ddc *d, double offset_hz) {
@@ -165,7 +173,7 @@ void atkdsp_ddc_set_offset(atkdsp_ddc *d, double offset_hz) {
 }
 
 double atkdsp_ddc_out_rate(const atkdsp_ddc *d) {
-    return d ? (d->rs ? d->out_rate : d->r) : 0.0;
+    return d ? ((d->rs || d->arb) ? d->out_rate : d->r) : 0.0;
 }
 
 size_t atkdsp_ddc_out_max(const atkdsp_ddc *d, size_t n_in) {
@@ -173,6 +181,7 @@ size_t atkdsp_ddc_out_max(const atkdsp_ddc *d, size_t n_in) {
     size_t n = n_in;
     for (int i = 0; i < d->nstages; ++i) n = atkdsp_fir_out_max(d->fir[i], n);
     if (d->rs) n = atkdsp_resampler_out_max(d->rs, n);
+    else if (d->arb) n = atkdsp_arb_resampler_out_max(d->arb, n);
     return n;
 }
 
@@ -190,6 +199,8 @@ ptrdiff_t atkdsp_ddc_process(atkdsp_ddc *d, const atkdsp_cf32 *in, size_t n,
     const atkdsp_cf32 *last = d->buf[d->nstages];
     if (d->rs)
         return atkdsp_resampler_process(d->rs, last, cur, out, out_cap);
+    if (d->arb)
+        return atkdsp_arb_resampler_process(d->arb, last, cur, out, out_cap);
     if (cur > out_cap) return ATKDSP_E_CAP;
     memcpy(out, last, cur * sizeof(atkdsp_cf32));
     return (ptrdiff_t)cur;
@@ -217,5 +228,7 @@ int atkdsp_ddc_describe(const atkdsp_ddc *d, char *buf, size_t cap) {
     if (d->rs && w >= 0 && (size_t)w < cap)
         w += snprintf(buf + w, cap - (size_t)w, " -> x%u/%u (%u taps) -> %.6g Hz",
                       d->up, d->down, d->rs_taps, d->out_rate);
+    else if (d->arb && w >= 0 && (size_t)w < cap)
+        w += snprintf(buf + w, cap - (size_t)w, " -> arb -> %.6g Hz", d->out_rate);
     return w;
 }

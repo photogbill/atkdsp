@@ -32,7 +32,7 @@ __all__ = [
     "build_info", "set_threads", "get_threads",
     "FMT", "DET", "WIN", "bytes_per_sample",
     "unpack", "unpack_dc", "iq_health",
-    "Nco", "Fir", "Resampler", "Fft", "window", "power_db",
+    "Nco", "Fir", "Resampler", "ArbResampler", "Fft", "window", "power_db",
     "spectrum_reduce", "spectrum_stats", "window_stats",
     "fm_demod", "am_demod", "db_to_pixels", "decimate_max",
     "median", "detect_channels", "stitch_max", "Channel",
@@ -40,7 +40,9 @@ __all__ = [
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
-ABI_VERSION = 10
+#: 11 adds the arbitrary/fractional resampler (§4b) and the DDC's use of it for
+#: non-integer output rates.
+ABI_VERSION = 11
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -172,6 +174,18 @@ def _bind(lib) -> None:
     lib.atkdsp_resampler_out_max.argtypes = [C.c_void_p, C.c_size_t]
     lib.atkdsp_resampler_process.restype = C.c_ssize_t
     lib.atkdsp_resampler_process.argtypes = [C.c_void_p, cf, C.c_size_t, cf, C.c_size_t]
+
+    lib.atkdsp_arb_resampler_create.restype = C.c_void_p
+    lib.atkdsp_arb_resampler_create.argtypes = [C.c_double, C.c_double, C.c_double, C.c_uint]
+    lib.atkdsp_arb_resampler_destroy.argtypes = [C.c_void_p]
+    lib.atkdsp_arb_resampler_reset.argtypes = [C.c_void_p]
+    lib.atkdsp_arb_resampler_set_ratio.argtypes = [C.c_void_p, C.c_double]
+    lib.atkdsp_arb_resampler_ratio.restype = C.c_double
+    lib.atkdsp_arb_resampler_ratio.argtypes = [C.c_void_p]
+    lib.atkdsp_arb_resampler_out_max.restype = C.c_size_t
+    lib.atkdsp_arb_resampler_out_max.argtypes = [C.c_void_p, C.c_size_t]
+    lib.atkdsp_arb_resampler_process.restype = C.c_ssize_t
+    lib.atkdsp_arb_resampler_process.argtypes = [C.c_void_p, cf, C.c_size_t, cf, C.c_size_t]
 
     lib.atkdsp_fft_create.restype = C.c_void_p
     lib.atkdsp_fft_create.argtypes = [C.c_size_t]
@@ -447,6 +461,57 @@ class Resampler:
             out = np.empty(cap, dtype=np.complex64)
         got = _check(self._lib.atkdsp_resampler_process(self._h, _cfp(x), x.size, _cfp(out),
                                                         out.size), "resampler_process")
+        return out[:got]
+
+
+# -- 4b. arbitrary (fractional) resampler -------------------------------------
+class ArbResampler:
+    """Resample by ANY positive out/in ratio; see atkdsp.h §4b.
+
+    A polyphase bank with first-order Farrow interpolation between phases, so a
+    ratio that is a real number (an odd sample clock, a huge reduced
+    denominator, a few-ppm clock correction) is native rather than an integer
+    L/M. The fractional position and history are carried, so a block boundary is
+    invisible and N seconds in produce ~N*ratio samples out.
+    """
+
+    def __init__(self, in_rate: float, out_rate: float, atten_db: float = 60.0,
+                 nphase: int = 64):
+        self._lib = load()
+        self._h = self._lib.atkdsp_arb_resampler_create(
+            float(in_rate), float(out_rate), float(atten_db), int(nphase))
+        if not self._h:
+            raise AtkDspError("arb_resampler_create failed")
+        self.in_rate, self.out_rate = float(in_rate), float(out_rate)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_arb_resampler_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_arb_resampler_reset(self._h)
+
+    def set_ratio(self, ratio: float) -> None:
+        """Nudge the ratio (out/in) live without rebuilding the prototype — for
+        a few-ppm sample-clock correction."""
+        self._lib.atkdsp_arb_resampler_set_ratio(self._h, float(ratio))
+        self.out_rate = self.in_rate * float(ratio)
+
+    def ratio(self) -> float:
+        return float(self._lib.atkdsp_arb_resampler_ratio(self._h))
+
+    def out_max(self, n_in: int) -> int:
+        return int(self._lib.atkdsp_arb_resampler_out_max(self._h, int(n_in)))
+
+    def process(self, x, out: np.ndarray | None = None) -> np.ndarray:
+        x = _cf32(x, "x")
+        cap = self.out_max(x.size)
+        if out is None:
+            out = np.empty(cap, dtype=np.complex64)
+        got = _check(self._lib.atkdsp_arb_resampler_process(self._h, _cfp(x), x.size,
+                                                            _cfp(out), out.size),
+                     "arb_resampler_process")
         return out[:got]
 
 

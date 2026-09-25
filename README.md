@@ -81,7 +81,23 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.9.0 (ABI 10)
+## What is in v0.10.0 (ABI 11)
+
+Since v0.9.0: `atkdsp_arb_resampler` — an **arbitrary-ratio (fractional)
+resampler**. The rational one (§4) needs the ratio to be a ratio of integers
+(it does a nominal 2.4576 MHz → 48 kHz fine, as 255/256); this one resamples by
+any real ratio, for a clock measured to a fractional hertz (2457603.1 Hz after
+calibration), a non-integer output rate, or a live few-ppm sample-clock
+correction via `set_ratio`. It is a polyphase bank with first-order Farrow
+interpolation between phases, and its output position is tracked from a global
+index rather than accumulated per call, so the same sample lands **bit-for-bit
+identically however the stream is chunked** — a coalesced 40 MSPS block and a
+run of tiny ones give the same line. The **DDC** now routes to it for exactly
+the non-integer rates it used to refuse (an integer ratio still takes the exact
+rational path), so a channel off an uncalibrated or fractional clock is native
+instead of returning an error and dropping ATK to numpy.
+
+## What was in v0.9.0 (ABI 10)
 
 Since v0.8.0: the FFT plan is genuinely safe to share across caller threads
 (a per-slot claim replaced `omp_get_thread_num`, which returned 0 for every
@@ -92,19 +108,30 @@ carrier, >2 for a bursty emitter — a per-bin CW/noise/keying call from one
 block); and `atkdsp_window_stats` returns a window's coherent gain and ENBW so
 a reading can be turned into true dBFS and a bin width in Hz.
 
+`atkdsp_iq_health` reports a front end's DC offset, I/Q gain/phase imbalance,
+image-rejection ratio and clip fraction in one pass over a block.
+
+`atkdsp_lte_detect` now finds MULTIPLE co-channel cells by successive
+interference cancellation: it detects the strongest cell, subtracts its PSS/SSS,
+and re-detects — so a weaker cell sharing the carrier (the fake-tower case) is
+found with an uncorrupted SSS instead of being masked. Verified against srsRAN's
+downlink (an independent implementation): a strong cell plus one 6 dB down
+returns both PCIs, while a lone cell still returns exactly one (no invented
+cells). result[0] is unchanged from the old single-cell path.
+
 | group | kernels | replaces in ATK |
 |---|---|---|
-| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block), **`atkdsp_unpack_dc`** — convert, remove a constant offset and return the block's mean, all in one pass; **`atkdsp_iq_health`** — DC, I/Q gain/phase imbalance, image rejection and clip fraction of a block, one pass | `dsp.iq_to_complex`, `dsp.dc_block` |
+| unpack | `atkdsp_unpack` (cu8 / ci8 / ci16 / ci16q11 / cf32, running DC block), **`atkdsp_unpack_dc`** — convert, remove a constant offset and return the block's mean, all in one pass | `dsp.iq_to_complex`, `dsp.dc_block` |
 | NCO | `atkdsp_nco_*` phase-continuous mixer | `dsp.frequency_shift` (the per-sample `np.exp`) |
 | FIR | `atkdsp_fir_*` decimating, carried history | `dsp._decimating_fir` |
-| resampler | `atkdsp_resampler_*` polyphase L/M, exact counts | (nothing — 48 077 Hz was fed to dsd-neo as 48 000) |
+| resampler | `atkdsp_resampler_*` polyphase L/M, exact counts; **`atkdsp_arb_resampler_*`** any real ratio (Farrow), chunking-invariant, live `set_ratio` for ppm correction | (nothing — 48 077 Hz was fed to dsd-neo as 48 000) |
 | FFT | `atkdsp_fft_*` (thread-safe plans), `atkdsp_window`, **`atkdsp_window_stats`**, `atkdsp_power_db`, `atkdsp_spectrum_reduce` (100 % POI: every frame, max/min/avg), **`atkdsp_spectrum_stats`** (max/avg/min + spectral kurtosis, one pass) | `dsp.spectrum_db` (one frame per chunk, the rest discarded) |
 | LTE | `atkdsp_lte_*` cell search (PSS/SSS/PCI), PBCH→MIB, PRACH presence, turbo+CRC, SIB1/SI decode | (new; see the header's §11 and the roadmap caveats) |
 | demod | `atkdsp_fm_demod`, `atkdsp_am_demod`, state carried | `dsp.fm_demodulate`, `dsp.am_demodulate` |
 | display | `atkdsp_db_to_pixels`, `atkdsp_decimate_max` | pyqtgraph's per-frame LUT pass, `spectrum_view.decimate_max` |
 | detect | `atkdsp_median`, `atkdsp_detect_channels`, `atkdsp_stitch_max` | the per-bin Python loops in `signal_id.detect_channels` and `sweep.stitch` |
 | design | `atkdsp_design_lowpass` — Kaiser windowed sinc to a stated stopband | `dsp.design_lowpass` (65 taps at the input rate, whatever the rate) |
-| DDC | `atkdsp_ddc_*` — NCO → staged decimation (each stage designed for `atten_db` of alias rejection at ITS rate) → exact-rate polyphase resampler. `describe()` prints the plan, e.g. `10 MSPS: NCO -> /8 (31 taps) -> /2 (9) -> /13 (303) -> 48076.9 Hz -> x624/625 -> 48000 Hz` | `dsp.channelize` — which passed a tone 100 kHz off the channel at −2.9 dB (10 MSPS) / −0.2 dB (40 MSPS); the DDC puts it 80 dB down, and the test asserts 60 |
+| DDC | `atkdsp_ddc_*` — NCO → staged decimation (each stage designed for `atten_db` of alias rejection at ITS rate) → exact-rate polyphase resampler, or the **arbitrary** resampler for a non-integer clock. `describe()` prints the plan, e.g. `10 MSPS: NCO -> /8 (31 taps) -> /2 (9) -> /13 (303) -> 48076.9 Hz -> x624/625 -> 48000 Hz`, or `... -> arb -> 48000 Hz` for a fractional rate | `dsp.channelize` — which passed a tone 100 kHz off the channel at −2.9 dB (10 MSPS) / −0.2 dB (40 MSPS); the DDC puts it 80 dB down, and the test asserts 60 |
 
 ## How ATK uses it
 

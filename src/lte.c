@@ -187,6 +187,7 @@ void atkdsp_lte_destroy(atkdsp_lte *h) {
     atk_aligned_free(h->energy);
     atk_aligned_free(h->fold);
     atk_aligned_free(h->fcount);
+    atk_aligned_free(h->work);
     atk_aligned_free(h->vit_bp);
     free(h);
 }
@@ -196,13 +197,15 @@ static int ensure_scan(atkdsp_lte *h, size_t n) {
     if (h->scan) atkdsp_fft_destroy(h->scan);
     atk_aligned_free(h->X); atk_aligned_free(h->P);
     atk_aligned_free(h->Z); atk_aligned_free(h->energy);
+    atk_aligned_free(h->work);
     h->scan = atkdsp_fft_create(n);
     h->X = (atkdsp_cf32 *)atk_aligned_malloc(n * sizeof(atkdsp_cf32));
     h->P = (atkdsp_cf32 *)atk_aligned_malloc(n * sizeof(atkdsp_cf32));
     h->Z = (atkdsp_cf32 *)atk_aligned_malloc(n * sizeof(atkdsp_cf32));
     h->energy = (double *)atk_aligned_malloc(n * sizeof(double));
+    h->work = (atkdsp_cf32 *)atk_aligned_malloc(n * sizeof(atkdsp_cf32));
     h->scan_n = n;
-    if (!h->scan || !h->X || !h->P || !h->Z || !h->energy) {
+    if (!h->scan || !h->X || !h->P || !h->Z || !h->energy || !h->work) {
         h->scan_n = 0; return ATKDSP_E_NOMEM;
     }
     return ATKDSP_OK;
@@ -210,36 +213,92 @@ static int ensure_scan(atkdsp_lte *h, size_t n) {
 
 /* ---- detection --------------------------------------------------------- */
 
-ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
-                            float min_metric, atkdsp_lte_cell *out, size_t cap) {
-    size_t i, k, valid;
-    int u, best_u = -1;
-    double best_m = 0.0;
-    size_t best_k = 0;
-    if (!h || !in || !out || cap == 0) return ATKDSP_E_ARG;
-    if (n < 2 * (size_t)ATKDSP_LTE_PSS_PERIOD) return 0;
-    if (ensure_scan(h, n) != ATKDSP_OK) return ATKDSP_E_NOMEM;
-    if (min_metric <= 0.0f) min_metric = 0.06f;
-    valid = n - NSYM;                     /* beyond this the circular corr wraps */
-
-    /* running energy of the 128-sample window starting at k */
+/* Fill one cell: the CFO across the matched symbol's two halves, then the SSS
+ * one symbol earlier with the PSS as the channel reference. Extracted verbatim
+ * from the single-cell path so the primary cell (result[0]) is byte-identical
+ * to what this library returned before multi-cell — the multi-cell code only
+ * adds MORE cells behind it. */
+static void decode_cell(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
+                        int u, size_t k, double metric, atkdsp_lte_cell *out) {
+    size_t i;
+    memset(out, 0, sizeof *out);
+    out->nid2 = u;
+    out->nid1 = -1;
+    out->pci = -1;
+    out->subframe = -1;
+    out->offset = (long long)k;
+    out->metric = (float)metric;
+    out->sss_score = 0.0f;
     {
-        double acc = 0.0;
-        for (i = 0; i < (size_t)NSYM && i < n; ++i)
-            acc += (double)in[i].re * in[i].re + (double)in[i].im * in[i].im;
-        h->energy[0] = acc;
-        for (k = 1; k <= valid; ++k) {
-            const atkdsp_cf32 a = in[k - 1], b = in[k + NSYM - 1];
-            acc += (double)b.re * b.re + (double)b.im * b.im;
-            acc -= (double)a.re * a.re + (double)a.im * a.im;
-            h->energy[k] = acc;
+        const atkdsp_cf32 *ref = h->pss + (size_t)u * NSYM;
+        double ar = 0, ai = 0, br = 0, bi = 0;
+        for (i = 0; i < 64; ++i) {
+            const atkdsp_cf32 x = in[k + i], p = ref[i];
+            ar += (double)p.re * x.re + (double)p.im * x.im;
+            ai += (double)p.re * x.im - (double)p.im * x.re;
+        }
+        for (i = 64; i < NSYM; ++i) {
+            const atkdsp_cf32 x = in[k + i], p = ref[i];
+            br += (double)p.re * x.re + (double)p.im * x.im;
+            bi += (double)p.re * x.im - (double)p.im * x.re;
+        }
+        {
+            const double pr = br * ar + bi * ai;      /* b * conj(a) */
+            const double pi_ = bi * ar - br * ai;
+            out->cfo_hz = (float)(atan2(pi_, pr) * ATKDSP_LTE_RATE
+                                  / (2.0 * ATK_PI * 64.0));
         }
     }
-    if (atkdsp_fft_exec(h->scan, in, h->X, 0) != ATKDSP_OK) return ATKDSP_E_FFT;
+    {
+        long long at = (long long)k - SSS_BACK;
+        if (at < 0) at += ATKDSP_LTE_PSS_PERIOD;
+        if (at >= 0 && (size_t)at + NSYM <= n) {
+            atkdsp_cf32 yp[NSYM], ys[NSYM];
+            float r[NCARR];
+            const atkdsp_cf32 *pf = h->pss_freq + (size_t)u * NCARR;
+            int idx, best_i = -1;
+            double best_s = -1e30;
+            if (atkdsp_fft_exec(h->sym, in + k, yp, 0) == ATKDSP_OK &&
+                atkdsp_fft_exec(h->sym, in + (size_t)at, ys, 0) == ATKDSP_OK) {
+                for (i = 0; i < NCARR; ++i) {
+                    const size_t b = (i < 31) ? (NSYM - 31 + i) : (1 + (i - 31));
+                    const atkdsp_cf32 P = pf[i], Y = yp[b], S = ys[b];
+                    const double hr = (double)Y.re * P.re + (double)Y.im * P.im;
+                    const double hi = (double)Y.im * P.re - (double)Y.re * P.im;
+                    const double mag = sqrt(hr * hr + hi * hi) + 1e-12;
+                    r[i] = (float)(((double)S.re * hr + (double)S.im * hi) / mag);
+                }
+                for (idx = 0; idx < NSSS; ++idx) {
+                    const float *seq = h->sss
+                        + ((size_t)u * NSSS + (size_t)idx) * NCARR;
+                    double sc = 0.0;
+                    for (i = 0; i < NCARR; ++i) sc += (double)seq[i] * r[i];
+                    if (sc > best_s) { best_s = sc; best_i = idx; }
+                }
+                if (best_i >= 0) {
+                    out->nid1 = best_i / 2;
+                    out->subframe = (best_i & 1) ? 5 : 0;
+                    out->pci = 3 * out->nid1 + u;
+                    out->sss_score = (float)(best_s / (double)NCARR);
+                }
+            }
+        }
+    }
+}
 
-    {   /* non-coherent fold fallback candidate, chosen across nid2 by margin */
-    int ni_u = -1; size_t ni_k = 0; double ni_margin = 0.0, ni_metric = 0.0;
+/* ONE cell from a buffer: the strongest PSS peak with a 5 ms mate (strong
+ * cells), else the non-coherent PSS fold with its CFAR test (weak cells). This
+ * is the PROVEN single-cell detector, unchanged — it just takes the buffer as
+ * an argument so the multi-cell loop can run it again on a residual. Returns 1
+ * and sets *u/*k/*metric, or 0. `buf` must already be in h->X as its FFT and
+ * h->energy as its running window energy (fill_scan does both). */
+static int detect_one(atkdsp_lte *h, size_t n, size_t valid, float min_metric,
+                      int *out_u, size_t *out_k, double *out_m) {
     const int P = ATKDSP_LTE_PSS_PERIOD;
+    int u, best_u = -1;
+    double best_m = 0.0; size_t best_k = 0;
+    int ni_u = -1; size_t ni_k = 0; double ni_margin = 0.0, ni_metric = 0.0;
+    size_t i, k;
     for (u = 0; u < 3; ++u) {
         const atkdsp_cf32 *ref = h->pss + (size_t)u * NSYM;
         const double pe = (double)h->pss_energy[u];
@@ -247,17 +306,14 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
         int r;
         memset(h->P, 0, n * sizeof(atkdsp_cf32));
         memcpy(h->P, ref, NSYM * sizeof(atkdsp_cf32));
-        if (atkdsp_fft_exec(h->scan, h->P, h->Z, 0) != ATKDSP_OK) return ATKDSP_E_FFT;
-        /* X * conj(P): IFFT of that is sum_j x[k+j] conj(p[j]) */
+        if (atkdsp_fft_exec(h->scan, h->P, h->Z, 0) != ATKDSP_OK) return -1;
         for (i = 0; i < n; ++i) {
             const float xr = h->X[i].re, xi = h->X[i].im;
             const float pr = h->Z[i].re, pi = h->Z[i].im;
             h->P[i].re = xr * pr + xi * pi;
             h->P[i].im = xi * pr - xr * pi;
         }
-        if (atkdsp_fft_exec(h->scan, h->P, h->Z, 1) != ATKDSP_OK) return ATKDSP_E_FFT;
-        /* single-shot peak AND non-coherent fold, in one pass. r tracks
-         * k mod PSS_PERIOD without a per-sample division. */
+        if (atkdsp_fft_exec(h->scan, h->P, h->Z, 1) != ATKDSP_OK) return -1;
         memset(h->fold, 0, (size_t)P * sizeof(double));
         memset(h->fcount, 0, (size_t)P * sizeof(int));
         r = 0;
@@ -269,32 +325,20 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
             h->fold[r] += m; h->fcount[r]++;
             if (++r == P) r = 0;
         }
-        /* ---- proven single-shot path (strong cells): min_metric + 5 ms mate.
-         * A single strong correlation is an impulse or a coincidence; a cell
-         * does this twice every radio frame. The mate must reach half of THIS
-         * peak, not half the threshold — a real cell's two occurrences are
-         * within a fade of each other, noise clearing an absolute bar twice is
-         * not. */
         if (top >= (double)min_metric) {
             int mate = 0;
             long long d;
-            for (d = -ATKDSP_LTE_PSS_PERIOD; d <= ATKDSP_LTE_PSS_PERIOD;
-                 d += 2 * ATKDSP_LTE_PSS_PERIOD) {
+            for (d = -P; d <= P; d += 2 * P) {
                 const long long kk = (long long)top_k + d;
                 if (kk < 0 || (size_t)kk > valid) continue;
                 {
                     const double cr = h->Z[kk].re, ci = h->Z[kk].im;
                     const double e = h->energy[kk] * pe;
-                    if (e > 1e-20 && (cr * cr + ci * ci) / e > 0.5 * top)
-                        mate = 1;
+                    if (e > 1e-20 && (cr * cr + ci * ci) / e > 0.5 * top) mate = 1;
                 }
             }
             if (mate && top > best_m) { best_m = top; best_k = top_k; best_u = u; }
         }
-        /* ---- non-coherent fold (weak cells the single shot misses). Average
-         * each residue over its occurrences, then a CFAR test: the fold peak
-         * must stand PSS_NI_K sigma above the fold's own mean (peak bin
-         * excluded). Folding IS the repeat confirmation, so no separate mate. */
         {
             int rpk = 0; double pk = -1.0, sum = 0.0, sq = 0.0; int cnt = 0;
             for (r = 0; r < P; ++r)
@@ -324,81 +368,148 @@ ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
             }
         }
     }
-    if (best_u < 0) {                 /* single shot found nothing: NI fallback */
+    if (best_u < 0) {
         if (ni_u < 0) return 0;
         best_u = ni_u; best_k = ni_k; best_m = ni_metric;
     }
+    *out_u = best_u; *out_k = best_k; *out_m = best_m;
+    return 1;
+}
+
+/* Fill h->X (FFT of buf) and h->energy (running 128-window power of buf). */
+static int fill_scan(atkdsp_lte *h, const atkdsp_cf32 *buf, size_t n, size_t valid) {
+    size_t i, k;
+    double acc = 0.0;
+    for (i = 0; i < (size_t)NSYM && i < n; ++i)
+        acc += (double)buf[i].re * buf[i].re + (double)buf[i].im * buf[i].im;
+    h->energy[0] = acc;
+    for (k = 1; k <= valid; ++k) {
+        const atkdsp_cf32 a = buf[k - 1], b = buf[k + NSYM - 1];
+        acc += (double)b.re * b.re + (double)b.im * b.im;
+        acc -= (double)a.re * a.re + (double)a.im * a.im;
+        h->energy[k] = acc;
     }
+    return atkdsp_fft_exec(h->scan, buf, h->X, 0);
+}
 
-    memset(out, 0, sizeof *out);
-    out->nid2 = best_u;
-    out->nid1 = -1;
-    out->pci = -1;
-    out->subframe = -1;
-    out->offset = (long long)best_k;
-    out->metric = (float)best_m;
-    out->sss_score = 0.0f;
+/* Least-squares remove one reference symbol from buf[at..at+NSYM): estimate the
+ * complex gain g = <ref, buf>/|ref|^2 and subtract g*ref. Removes the dominant
+ * cell's sync-signal energy so a weaker co-channel cell underneath it can be
+ * detected and its SSS read without corruption. */
+static void project_out(atkdsp_cf32 *buf, const atkdsp_cf32 *ref, double energy,
+                        size_t at) {
+    double gr = 0.0, gi = 0.0;
+    int i;
+    if (energy <= 1e-20) return;
+    for (i = 0; i < NSYM; ++i) {
+        gr += (double)ref[i].re * buf[at + i].re + (double)ref[i].im * buf[at + i].im;
+        gi += (double)ref[i].re * buf[at + i].im - (double)ref[i].im * buf[at + i].re;
+    }
+    gr /= energy; gi /= energy;
+    for (i = 0; i < NSYM; ++i) {
+        buf[at + i].re -= (float)(gr * ref[i].re - gi * ref[i].im);
+        buf[at + i].im -= (float)(gr * ref[i].im + gi * ref[i].re);
+    }
+}
 
-    /* carrier offset: the phase that accumulates across the two halves of
-     * the matched symbol, 64 samples apart */
-    {
-        const atkdsp_cf32 *ref = h->pss + (size_t)best_u * NSYM;
-        double ar = 0, ai = 0, br = 0, bi = 0;
-        for (i = 0; i < 64; ++i) {
-            const atkdsp_cf32 x = in[best_k + i], p = ref[i];
-            ar += (double)p.re * x.re + (double)p.im * x.im;
-            ai += (double)p.re * x.im - (double)p.im * x.re;
-        }
-        for (i = 64; i < NSYM; ++i) {
-            const atkdsp_cf32 x = in[best_k + i], p = ref[i];
-            br += (double)p.re * x.re + (double)p.im * x.im;
-            bi += (double)p.re * x.im - (double)p.im * x.re;
-        }
-        {
-            const double pr = br * ar + bi * ai;      /* b * conj(a) */
-            const double pi_ = bi * ar - br * ai;
-            out->cfo_hz = (float)(atan2(pi_, pr) * ATKDSP_LTE_RATE
-                                  / (2.0 * ATK_PI * 64.0));
+/* Subtract a decoded cell's PSS (every 5 ms) and SSS (137 samples before each
+ * PSS, subframe alternating) from the residual buffer. */
+static void subtract_cell(atkdsp_lte *h, atkdsp_cf32 *buf, size_t n,
+                          const atkdsp_lte_cell *c) {
+    const int P = ATKDSP_LTE_PSS_PERIOD;
+    const atkdsp_cf32 *pss = h->pss + (size_t)c->nid2 * NSYM;
+    const double pe = (double)h->pss_energy[c->nid2];
+    atkdsp_cf32 sss0[NSYM], sss5[NSYM];
+    double se0 = 0.0, se5 = 0.0;
+    int have_sss = (c->nid1 >= 0);
+    int i;
+    long long base, kk;
+    if (have_sss) {
+        float v[NCARR]; atkdsp_cf32 carr[NCARR];
+        atkdsp_lte_sss_symbol(c->nid1, c->nid2, 0, v);
+        for (i = 0; i < NCARR; ++i) { carr[i].re = v[i]; carr[i].im = 0.0f; }
+        to_symbol(h->sym, carr, sss0);
+        atkdsp_lte_sss_symbol(c->nid1, c->nid2, 5, v);
+        for (i = 0; i < NCARR; ++i) { carr[i].re = v[i]; carr[i].im = 0.0f; }
+        to_symbol(h->sym, carr, sss5);
+        for (i = 0; i < NSYM; ++i) {
+            se0 += (double)sss0[i].re * sss0[i].re + (double)sss0[i].im * sss0[i].im;
+            se5 += (double)sss5[i].re * sss5[i].re + (double)sss5[i].im * sss5[i].im;
         }
     }
-
-    /* ---- SSS, one symbol earlier, with the PSS as the channel reference */
+    base = c->offset % P;
     {
-        long long at = (long long)best_k - SSS_BACK;
-        if (at < 0) at += ATKDSP_LTE_PSS_PERIOD;
-        if (at >= 0 && (size_t)at + NSYM <= n) {
-            atkdsp_cf32 yp[NSYM], ys[NSYM];
-            float r[NCARR];
-            const atkdsp_cf32 *pf = h->pss_freq + (size_t)best_u * NCARR;
-            int idx, best_i = -1;
-            double best_s = -1e30;
-            if (atkdsp_fft_exec(h->sym, in + best_k, yp, 0) == ATKDSP_OK &&
-                atkdsp_fft_exec(h->sym, in + at, ys, 0) == ATKDSP_OK) {
-                for (i = 0; i < NCARR; ++i) {
-                    /* bin for carrier i: -31..-1 then +1..+31 */
-                    const size_t b = (i < 31) ? (NSYM - 31 + i) : (1 + (i - 31));
-                    const atkdsp_cf32 P = pf[i], Y = yp[b], S = ys[b];
-                    /* H = Y * conj(P);  eq = S * conj(H) / |H| */
-                    const double hr = (double)Y.re * P.re + (double)Y.im * P.im;
-                    const double hi = (double)Y.im * P.re - (double)Y.re * P.im;
-                    const double mag = sqrt(hr * hr + hi * hi) + 1e-12;
-                    r[i] = (float)(((double)S.re * hr + (double)S.im * hi) / mag);
-                }
-                for (idx = 0; idx < NSSS; ++idx) {
-                    const float *seq = h->sss
-                        + ((size_t)best_u * NSSS + (size_t)idx) * NCARR;
-                    double sc = 0.0;
-                    for (i = 0; i < NCARR; ++i) sc += (double)seq[i] * r[i];
-                    if (sc > best_s) { best_s = sc; best_i = idx; }
-                }
-                if (best_i >= 0) {
-                    out->nid1 = best_i / 2;
-                    out->subframe = (best_i & 1) ? 5 : 0;
-                    out->pci = 3 * out->nid1 + best_u;
-                    out->sss_score = (float)(best_s / (double)NCARR);
-                }
+        long long j0 = (c->offset - base) / P;
+        for (kk = base; kk + NSYM <= (long long)n; kk += P) {
+            long long j = (kk - base) / P;
+            int sf = c->subframe;
+            if (((j - j0) & 1)) sf = (sf == 0) ? 5 : 0;
+            project_out(buf, pss, pe, (size_t)kk);
+            if (have_sss) {
+                long long a = kk - SSS_BACK;
+                if (a >= 0 && a + NSYM <= (long long)n)
+                    project_out(buf, sf ? sss5 : sss0, sf ? se5 : se0, (size_t)a);
             }
         }
     }
-    return 1;
+}
+
+/* Gates a SECONDARY cell (any after the strongest); the primary is never held
+ * to them, so result[0] is exactly the old single-cell answer.
+ *
+ * The decisive one is the METRIC. After the strong cell is cancelled, a real
+ * co-channel cell DOMINATES the residual and its normalised PSS correlation
+ * jumps to ~0.8-1.0 (measured 0.98 for the oracle's -6 dB cell). A cancellation
+ * stub left by imperfect subtraction is just residual, metric ~0.07 — a wide,
+ * clean gap. (An SSS floor alone is not enough: a high-SNR synthetic single
+ * cell throws stubs whose SSS looks real, ~1.2, but whose metric is ~0.07.)
+ * The SSS floor stays as a second, independent check. */
+#define SEC_METRIC_MIN 0.30
+#define SEC_SSS_MIN 0.5f
+
+ptrdiff_t atkdsp_lte_detect(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
+                            float min_metric, atkdsp_lte_cell *out, size_t cap) {
+    size_t valid, nout = 0;
+    if (!h || !in || !out || cap == 0) return ATKDSP_E_ARG;
+    if (n < 2 * (size_t)ATKDSP_LTE_PSS_PERIOD) return 0;
+    if (ensure_scan(h, n) != ATKDSP_OK) return ATKDSP_E_NOMEM;
+    if (min_metric <= 0.0f) min_metric = 0.06f;
+    valid = n - NSYM;                     /* beyond this the circular corr wraps */
+
+    /* SUCCESSIVE INTERFERENCE CANCELLATION. Detect the strongest cell on the
+     * live buffer (pass 0 is byte-identical to the old single-cell result),
+     * decode it, then SUBTRACT its PSS/SSS from a residual copy and detect
+     * again. Only after the strong cell is removed does a weaker co-channel
+     * cell rise above the interference floor with an uncorrupted SSS — which is
+     * why a plain re-scan of the same buffer could not separate them. Stops
+     * when a pass finds nothing, when the residual yields a PCI already seen
+     * (cancellation left a stub), or at `cap`. */
+    memcpy(h->work, in, n * sizeof(atkdsp_cf32));
+    while (nout < cap) {
+        int u; size_t k; double m; int rc;
+        const atkdsp_cf32 *buf = (nout == 0) ? in : h->work;
+        if (fill_scan(h, buf, n, valid) != ATKDSP_OK) return ATKDSP_E_FFT;
+        rc = detect_one(h, n, valid, min_metric, &u, &k, &m);
+        if (rc < 0) return ATKDSP_E_FFT;
+        if (rc == 0) break;
+        atkdsp_lte_cell cell;
+        decode_cell(h, buf, n, u, k, m, &cell);
+        if (nout > 0) {
+            /* a residual pass is only believed with a real SSS; below the
+             * floor it is a cancellation ghost and the search is done. A
+             * repeated PCI means the same cell resurfaced — also done. */
+            int dup = 0; size_t j;
+            for (j = 0; j < nout; ++j)
+                if (out[j].pci == cell.pci && cell.pci >= 0) { dup = 1; break; }
+            if (dup || cell.pci < 0 || m < SEC_METRIC_MIN
+                    || cell.sss_score < SEC_SSS_MIN) break;
+        }
+        out[nout++] = cell;
+        if (nout >= cap) break;
+        /* cancel this cell from the residual so the next pass sees past it.
+         * pass 0 read `in`; every later pass reads and writes h->work. */
+        if (nout == 1) memcpy(h->work, in, n * sizeof(atkdsp_cf32));
+        subtract_cell(h, h->work, n, &cell);
+    }
+    return (ptrdiff_t)nout;
 }

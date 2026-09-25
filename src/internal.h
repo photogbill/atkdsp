@@ -93,6 +93,8 @@ struct atkdsp_lte {
     double      *energy;      /* scan_n running |x|^2 over 128               */
     double      *fold;        /* PSS_PERIOD  non-coherent PSS fold accum     */
     int         *fcount;      /* PSS_PERIOD  occurrences per residue         */
+    atkdsp_cf32 *work;        /* scan_n  residual buffer for interference    */
+                              /* cancellation across detect passes           */
     int32_t     *vit_bp;      /* ATK_LTE_VIT_LAPS*40*64 Viterbi backpointers */
 };
 

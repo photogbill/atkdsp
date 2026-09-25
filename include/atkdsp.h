@@ -60,14 +60,26 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 10
-#define ATKDSP_VERSION_STRING "0.9.0"
+#define ATKDSP_ABI_VERSION 11
+#define ATKDSP_VERSION_STRING "0.10.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
  * safe to share across caller threads in this version (a per-slot claim
  * replaced omp_get_thread_num, which was 0 for every thread outside a parallel
  * region) — a fix, not an ABI change, but it rode in on this bump. */
+/* 10 -> 11: atkdsp_arb_resampler — an ARBITRARY-ratio resampler (§4b). The
+ * rational one (§4) needs the ratio to be a ratio of integers: it handles a
+ * nominal 2.457600 MHz -> 48 kHz fine (255/256). What it CANNOT do is a ratio
+ * that is a real number — a clock measured to a fractional hertz (2457603.1 Hz
+ * after calibration), a non-integer output rate, or a live sample-clock
+ * correction of a few ppm. A polyphase bank with linear interpolation between
+ * phases (a first-order Farrow) resamples by any positive ratio and lets that
+ * ratio be nudged per block. Output position is tracked from a global index, so
+ * the same sample lands identically however the stream is chunked. The DDC
+ * (§10) routes to it for exactly those non-integer rates it used to refuse (an
+ * integer ratio still takes the exact rational path), so a channel off an
+ * uncalibrated or fractional clock is native instead of returning NULL. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -213,6 +225,35 @@ ATKDSP_API void      atkdsp_resampler_reset(atkdsp_resampler *r);
 ATKDSP_API size_t    atkdsp_resampler_out_max(const atkdsp_resampler *r, size_t n_in);
 ATKDSP_API ptrdiff_t atkdsp_resampler_process(atkdsp_resampler *r, const atkdsp_cf32 *in,
                                               size_t n, atkdsp_cf32 *out, size_t out_cap);
+
+/* ---- 4b. arbitrary (fractional) resampler --------------------------------
+ * Resamples by ANY positive ratio out_rate/in_rate, not just a reduced L/M.
+ *
+ * A prototype low-pass is designed once at in_rate*nphase and split into
+ * `nphase` polyphase branches (interpolate-by-nphase, gain nphase folded in);
+ * for an output at a continuous input position the branch nearest its
+ * fractional phase is applied and LINEARLY INTERPOLATED toward the next branch
+ * (a first-order Farrow), so a finite bank still resolves a position between two
+ * phases. `create` designs the prototype (an allocation, at create only — a
+ * *_process call still allocates nothing, rule 2); pass atten_db<=0 for the
+ * 60 dB default and nphase==0 for 64. The cutoff is 0.5*min(in_rate,out_rate),
+ * so it anti-aliases on the way down and does not widen the band on the way up.
+ *
+ * The fractional position and the last taps-per-phase inputs are carried across
+ * calls, so a block boundary is invisible and N seconds in produce ~N*ratio
+ * samples out. set_ratio nudges the ratio live WITHOUT rebuilding the prototype
+ * (for a few-ppm clock correction); a large change is better done by rebuilding,
+ * because the prototype's cutoff was fixed at create. */
+typedef struct atkdsp_arb_resampler atkdsp_arb_resampler;
+ATKDSP_API atkdsp_arb_resampler *atkdsp_arb_resampler_create(double in_rate, double out_rate,
+                                                             double atten_db, unsigned nphase);
+ATKDSP_API void      atkdsp_arb_resampler_destroy(atkdsp_arb_resampler *r);
+ATKDSP_API void      atkdsp_arb_resampler_reset(atkdsp_arb_resampler *r);
+ATKDSP_API void      atkdsp_arb_resampler_set_ratio(atkdsp_arb_resampler *r, double ratio);
+ATKDSP_API double    atkdsp_arb_resampler_ratio(const atkdsp_arb_resampler *r);
+ATKDSP_API size_t    atkdsp_arb_resampler_out_max(const atkdsp_arb_resampler *r, size_t n_in);
+ATKDSP_API ptrdiff_t atkdsp_arb_resampler_process(atkdsp_arb_resampler *r, const atkdsp_cf32 *in,
+                                                  size_t n, atkdsp_cf32 *out, size_t out_cap);
 
 /* ---- 5. FFT ------------------------------------------------------------
  * A plan for one length (any length; power-of-two and 5-smooth are fastest).

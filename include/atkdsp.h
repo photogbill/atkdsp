@@ -61,7 +61,7 @@ extern "C" {
 #endif
 
 #define ATKDSP_ABI_VERSION 11
-#define ATKDSP_VERSION_STRING "0.10.0"
+#define ATKDSP_VERSION_STRING "0.10.1"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely

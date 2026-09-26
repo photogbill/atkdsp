@@ -842,8 +842,11 @@ def _lte_decode_cell(x, n, nid2, k, metric):
         idx = np.r_[LTE_SYM - 31:LTE_SYM, 1:32]
         Yp, Ys = np.fft.fft(x[k:k + LTE_SYM]), np.fft.fft(x[at:at + LTE_SYM])
         H = Yp[idx] * np.conj(lte_pss_values(nid2))
-        r = np.real(Ys[idx] * np.conj(H)) / (np.abs(H) + 1e-12)
-        scores = [(float(np.dot(lte_sss_symbol(n1, nid2, sf), r)), n1, sf)
+        # the SSS equalised by the PSS, kept COMPLEX, and scored by |sum|:
+        # phase-invariant, as src/lte.c decode_cell (2026-09-26) — a carrier
+        # offset turns the SSS against its PSS reference by 2*pi*f*71us
+        r = Ys[idx] * np.conj(H) / (np.abs(H) + 1e-12)
+        scores = [(float(abs(np.dot(lte_sss_symbol(n1, nid2, sf), r))), n1, sf)
                   for n1 in range(168) for sf in (0, 5)]
         sc, n1, sf = max(scores)
         cell.update(nid1=n1, subframe=sf, pci=3 * n1 + nid2, sss_score=sc / 62.0)
@@ -1056,8 +1059,8 @@ def lte_crs_pos(n_id, port, l):
     vs = n_id % 6
     if port == 0:   v = 0 if l == 0 else 3
     elif port == 1: v = 3 if l == 0 else 0
-    elif port == 2: v = 0
-    else:           v = 3
+    elif port == 2: v = 3          # slot 1 (odd): v = 3(n_s mod 2)
+    else:           v = 0          # 3 + 3(n_s mod 2) = 6 -> 0
     return [6 * m + (v + vs) % 6 for m in range(12)]
 def _pb_crs_sym(port):
     return 0 if port <= 1 else 1
@@ -1096,7 +1099,10 @@ def _pb_alamouti(r0, r1, h0, h1):
 
 
 def _pb_kbin(k):
-    return (k - _PB_DC) % _PB_NFFT
+    """Central-72 subcarrier k -> FFT bin, DC skipped (36.211 6.6.4). See
+    src/lte_pbch.c demod_block for the 2026-09-26 correction."""
+    off = k - _PB_DC
+    return off + 1 if off >= 0 else off + _PB_NFFT
 def _pb_ofdm_mod(grid, first):
     X = np.zeros(_PB_NFFT, complex)
     for k in range(_PB_NSC):
@@ -1110,16 +1116,23 @@ def _pb_ofdm_demod(samples, first):
     return np.array([X[_pb_kbin(k)] for k in range(_PB_NSC)])
 
 
-def lte_mib_pack(dl_bw, phich_dur, phich_res, sfn):
+def lte_mib_pack(dl_bw, phich_dur, phich_res, sfn, sib1_br=0,
+                 si_unchanged_br=0):
+    """36.331 MIB, 24 bits. `sib1_br` is schedulingInfoSIB1-BR-r13 (0..31,
+    non-zero on a cell running LTE-M) and `si_unchanged_br` is
+    systemInfoUnchanged-BR-r15; the last four bits are spare."""
     bw = {6: 0, 15: 1, 25: 2, 50: 3, 75: 4, 100: 5}[dl_bw]
     bits = [(bw >> (2-i)) & 1 for i in range(3)]
     bits += [phich_dur & 1] + [(phich_res >> (1-i)) & 1 for i in range(2)]
-    bits += [((sfn >> 2) >> (7-i)) & 1 for i in range(8)] + [0]*10
+    bits += [((sfn >> 2) >> (7-i)) & 1 for i in range(8)]
+    bits += [(int(sib1_br) >> (4-i)) & 1 for i in range(5)]
+    bits += [int(si_unchanged_br) & 1] + [0]*4
     return np.array(bits, np.int8)
 def _pb_unpack(b, i0):
     bw = {0:6,1:15,2:25,3:50,4:75,5:100}
     code = int(b[0])*4 + int(b[1])*2 + int(b[2])
-    if code > 5 or np.any(b[14:24] != 0):
+    # bits 14..19 carry the Rel-13/15 LTE-M fields; only 20..23 are spare
+    if code > 5 or np.any(b[20:24] != 0):
         return None
     sfn_msb = 0
     for x in b[6:14]:

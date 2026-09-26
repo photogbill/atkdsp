@@ -254,7 +254,7 @@ static void decode_cell(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
         if (at < 0) at += ATKDSP_LTE_PSS_PERIOD;
         if (at >= 0 && (size_t)at + NSYM <= n) {
             atkdsp_cf32 yp[NSYM], ys[NSYM];
-            float r[NCARR];
+            float r[NCARR], ri[NCARR];
             const atkdsp_cf32 *pf = h->pss_freq + (size_t)u * NCARR;
             int idx, best_i = -1;
             double best_s = -1e30;
@@ -266,13 +266,26 @@ static void decode_cell(atkdsp_lte *h, const atkdsp_cf32 *in, size_t n,
                     const double hr = (double)Y.re * P.re + (double)Y.im * P.im;
                     const double hi = (double)Y.im * P.re - (double)Y.re * P.im;
                     const double mag = sqrt(hr * hr + hi * hi) + 1e-12;
-                    r[i] = (float)(((double)S.re * hr + (double)S.im * hi) / mag);
+                    /* S * conj(H) / |H|: the SSS, equalised by the PSS */
+                    r[i]  = (float)(((double)S.re * hr + (double)S.im * hi) / mag);
+                    ri[i] = (float)(((double)S.im * hr - (double)S.re * hi) / mag);
                 }
+                /* PHASE-INVARIANT SCORE (2026-09-26). The SSS is one symbol
+                 * (71 us) before the PSS, so a carrier offset f turns it by
+                 * 2*pi*f*71us relative to the PSS used as its reference: 1.3
+                 * rad at 3 kHz, pi at 7 kHz. The score used to be the REAL
+                 * part only — on Bill's B13 capture shifted by 3 kHz it
+                 * named a different, confident and wrong PCI on every look.
+                 * |sum| costs 3 dB at zero offset and nothing to a rotation. */
                 for (idx = 0; idx < NSSS; ++idx) {
                     const float *seq = h->sss
                         + ((size_t)u * NSSS + (size_t)idx) * NCARR;
-                    double sc = 0.0;
-                    for (i = 0; i < NCARR; ++i) sc += (double)seq[i] * r[i];
+                    double sr = 0.0, si = 0.0, sc;
+                    for (i = 0; i < NCARR; ++i) {
+                        sr += (double)seq[i] * r[i];
+                        si += (double)seq[i] * ri[i];
+                    }
+                    sc = sqrt(sr * sr + si * si);
                     if (sc > best_s) { best_s = sc; best_i = idx; }
                 }
                 if (best_i >= 0) {

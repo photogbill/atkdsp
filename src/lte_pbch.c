@@ -22,8 +22,8 @@
 #include "internal.h"
 
 #define NFFT      128
-#define NSC       72          /* 6 central RB, DC included at index 36     */
-#define DC_K      36
+#define NSC       72          /* 6 central RB: 36 below DC, 36 above       */
+#define DC_K      36          /* k = 36 is the first subcarrier ABOVE DC   */
 #define CP0       10
 #define CP1       9
 #define NRB_MAX   110
@@ -206,12 +206,17 @@ static void crs_central(int n_id, int l, double re[12], double im[12]) {
         im[m] = SQ * (1 - 2 * c[2*(base + m) + 1]);
     }
 }
+/* CRS subcarrier positions in the PBCH's slot (n_s = 1). 36.211 6.10.1.2:
+ * ports 2 and 3 use v = 3(n_s mod 2) and 3 + 3(n_s mod 2), so in an ODD
+ * slot port 2 sits at v = 3 and port 3 at v = 0 — the reverse of an even
+ * slot. The even-slot values were used before 2026-09-26, which swapped the
+ * two channel estimates and failed every 4-antenna cell on air. */
 static void crs_pos(int n_id, int port, int l, int pos[12]) {
     int vshift = n_id % 6, v, m;
     if (port == 0) v = (l == 0) ? 0 : 3;
     else if (port == 1) v = (l == 0) ? 3 : 0;
-    else if (port == 2) v = 0;
-    else v = 3;
+    else if (port == 2) v = 3;
+    else v = 0;
     for (m = 0; m < 12; ++m) pos[m] = 6*m + (v + vshift) % 6;
 }
 static int crs_symbol(int port) { return (port <= 1) ? 0 : 1; }
@@ -251,8 +256,14 @@ static void demod_block(const atkdsp_lte *h, const atkdsp_cf32 *block,
         }
         atkdsp_fft_exec(h->sym, buf, spec, 0);              /* forward */
         for (k = 0; k < NSC; ++k) {
-            int off_k = k - DC_K;                           /* -36..+35 */
-            int bin = (off_k % NFFT + NFFT) % NFFT;
+            /* 36.211 6.2.3/6.6.4: the 72 central subcarriers are -36..-1
+             * and +1..+36 — the DC subcarrier is NOT one of them. Mapping
+             * k -> k-36 (DC included, +36 dropped) shifted the upper half
+             * by one bin: consistent with the old synthetic generator, and
+             * wrong for every real cell (found 2026-09-26 on Bill's B13
+             * capture; see tests/test_lte_air.py). */
+            const int off_k = k - DC_K;                     /* -36..+35 */
+            const int bin = (off_k >= 0) ? off_k + 1 : off_k + NFFT;
             Y[l][k] = spec[bin];
         }
     }
@@ -376,11 +387,17 @@ static void combine(int n_ports, atkdsp_cf32 Y[4][NSC],
 }
 
 /* ---- unpack MIB bits (36.331), with the false-alarm gate --------------- */
+/* The ten bits after the SFN were "spare" in Release 8. Release 13 took five
+ * of them for schedulingInfoSIB1-BR-r13 (LTE-M) and Release 15 one more for
+ * systemInfoUnchanged-BR-r15, so on any cell running LTE-M — which is most
+ * US macro cells — they are NOT zero. Only the last four are still spare.
+ * Requiring all ten to be zero rejected every such MIB (found 2026-09-26:
+ * Bill's B13 cell sends schedulingInfoSIB1-BR = 7). */
 static int unpack_mib(const signed char *b, int i0, atkdsp_lte_mib *out) {
     static const int BW[6] = { 6, 15, 25, 50, 75, 100 };
     int bw = b[0]*4 + b[1]*2 + b[2], sfn_msb = 0, k;
     if (bw > 5) return 0;
-    for (k = 14; k < 24; ++k) if (b[k]) return 0;    /* spare must be zero */
+    for (k = 20; k < 24; ++k) if (b[k]) return 0;    /* spare must be zero */
     for (k = 6; k < 14; ++k) sfn_msb = (sfn_msb << 1) | b[k];
     out->dl_bw_rb  = BW[bw];
     out->phich_dur = b[3];

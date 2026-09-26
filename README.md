@@ -81,7 +81,30 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.10.0 (ABI 11)
+## What is in v0.10.1 (ABI 11)
+
+**The LTE MIB decodes on air.** Replaying a bladeRF recording of a real B13
+cell (Verizon, 751 MHz) found three conventions wrong in BOTH `lte_pbch.c`
+and its twin `reference.py` — so every synthetic test agreed with the decoder
+and neither agreed with 36.211:
+
+1. **DC.** The 72 centre subcarriers are −36..−1 and +1..+36; they were read
+   as −36..+35 with DC included, putting the upper half one bin off.
+2. **CRS ports 2/3 in the PBCH's slot.** 36.211 6.10.1.2 gives v = 3(n_s mod
+   2) for port 2 and 3 + 3(n_s mod 2) for port 3; the PBCH is in slot 1, where
+   they are the reverse of the even-slot values that were used. Every
+   4-antenna cell's two estimates were swapped.
+3. **"Spare" MIB bits.** Release 13 gave five of the ten to LTE-M
+   (schedulingInfoSIB1-BR-r13) and Release 15 one more; only the last four are
+   still spare. Requiring all ten to be zero rejected every LTE-M cell.
+
+And the SSS score (`lte.c`) was the real part only: a carrier 3 kHz off turns
+the SSS against its PSS reference by 1.3 rad and a confident, wrong PCI came
+out. It is now |Σ| — phase-invariant, 3 dB at zero offset.
+No ABI change. ATK's `tests/test_lte_air.py` carries 60 ms of that recording
+and fails with each old convention put back.
+
+## What was in v0.10.0 (ABI 11)
 
 Since v0.9.0: `atkdsp_arb_resampler` — an **arbitrary-ratio (fractional)
 resampler**. The rational one (§4) needs the ratio to be a ratio of integers

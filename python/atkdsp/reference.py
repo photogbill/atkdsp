@@ -644,7 +644,11 @@ class Ddc:
                 self.up, self.down = int(num) // g, int(den) // g
                 hi = self.r * self.up
                 nyq = 0.5 * min(self.r, float(out_rate))
-                h = design_lowpass(nyq * 0.8, nyq, atten_db, hi)
+                # widened to a channel wider than 0.8 of Nyquist, as the C
+                fp = nyq * 0.8
+                if 0.5 * bw > fp:
+                    fp = min(0.5 * bw, 0.97 * nyq)
+                h = design_lowpass(fp, nyq, atten_db, hi)
                 self.rs = Resampler(self.up, self.down, h)
 
     @property

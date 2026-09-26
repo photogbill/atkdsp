@@ -124,7 +124,15 @@ atkdsp_ddc *atkdsp_ddc_create(double fs, double offset_hz, double bw, double out
             d->up = (unsigned)num / g; d->down = (unsigned)den / g;
             const double hi = d->r * (double)d->up;            /* the polyphase rate */
             const double nyq = 0.5 * (d->r < out_rate ? d->r : out_rate);
-            const double fp = nyq * 0.8, fstop = nyq;
+            /* 0.8 of Nyquist, unless the CHANNEL is wider than that: a
+             * 10 MHz LTE carrier (+-4.5 MHz occupied) brought to 9.6 MSPS
+             * lost its outer 1.3 MHz each side to a +-3.84 MHz passband.
+             * Widened to the channel, capped at 0.97 so the transition
+             * (and the filter) stays finite. Unchanged for every channel
+             * that already fitted (0.10.3). */
+            double fp = nyq * 0.8;
+            const double fstop = nyq;
+            if (0.5 * d->bw > fp) fp = (0.5 * d->bw < 0.97 * nyq) ? 0.5 * d->bw : 0.97 * nyq;
             ptrdiff_t n = atkdsp_design_lowpass(fp, fstop, atten_db, hi, NULL, 0);
             if (n <= 0) { atkdsp_ddc_destroy(d); free(taps); return NULL; }
             free(taps); taps = (float *)malloc((size_t)n * sizeof(float));

@@ -81,7 +81,18 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.10.2 (ABI 11)
+## What is in v0.10.3 (ABI 11)
+
+**The DDC keeps a wide channel's edges.** The final rational resampler's
+passband was 0.8 of the output Nyquist whatever the channel: a 10 MHz LTE
+carrier (±4.5 MHz occupied) brought to 9.6 MSPS kept only ±3.84 MHz. The
+passband now widens to the channel when the channel is wider than that,
+capped at 0.97 of Nyquist so the filter stays finite; every channel that
+already fitted is unchanged. Twin changed with it. This is what lets ATK
+read SIB1 of a 10 MHz cell from a 10 MSPS capture and of a 20 MHz cell from
+20 MSPS (ATK's `lte_sib1_rx.nfft_for`). No ABI change.
+
+## What was in v0.10.2 (ABI 11)
 
 **SIB1 on air — two fixes here, the receiver in ATK.** The same recording's
 SIB1 decodes in ATK's `atk/core/lte_sib1_rx.py`, a downlink receiver written

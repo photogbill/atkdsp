@@ -81,7 +81,32 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.10.1 (ABI 11)
+## What is in v0.10.2 (ABI 11)
+
+**SIB1 on air — two fixes here, the receiver in ATK.** The same recording's
+SIB1 decodes in ATK's `atk/core/lte_sib1_rx.py`, a downlink receiver written
+again from 36.211/212/213/331 (transmit diversity, PHICH, control REGs in
+(subcarrier, symbol) order, the right DCI 1A length, period-3 CFI codewords,
+PSS/SSS skipped). Two of the faults it found are in this library:
+
+1. **`lte_turbo_decode` ignored the redundancy version** (`rate_dematch` read
+   from k0 = 2R always). SIB1 is sent with RV 0, 2, 3, 1 in turn, so three
+   of every four transmissions could never pass CRC. k0 = R·(2⌈Ncb/8R⌉·rv+2)
+   now (36.212 5.1.4.1.2), as the twin already had.
+2. **`lte_sib1_parse` read a SIB1 extension bit** the ASN.1 does not have
+   (SystemInformationBlockType1 grows through nonCriticalExtension), so every
+   field after the first two bits came out one bit late — garbage PLMN on
+   every real cell. The twin had the same bit, in its encoder too, so the
+   round trip passed. Also: q-RxLevMinOffset is now skipped when present, and
+   SIB-Type values past its extension marker (SIB19+) are read.
+
+On the capture both parsers and ATK's own now read 311-480, TAC 0x7001,
+ECI 0x1B6AA03, band 13. `lte_sib1_decode` (the C physical layer) still has
+the other faults and is not used by ATK; it will be ported from the Python
+receiver once that has met more cells. `lte_si_decode` shares that physical
+layer — SIB2+ does not decode on air yet. No ABI change.
+
+## What was in v0.10.1 (ABI 11)
 
 **The LTE MIB decodes on air.** Replaying a bladeRF recording of a real B13
 cell (Verizon, 751 MHz) found three conventions wrong in BOTH `lte_pbch.c`

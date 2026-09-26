@@ -49,7 +49,9 @@ int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
 
     if (br_u(&r, 1) != 0) return 0;          /* BCCH-DL-SCH type CHOICE -> c1 */
     if (br_u(&r, 1) != 1) return 0;          /* c1 CHOICE -> SIB1             */
-    (void)br_u(&r, 1);                        /* SIB1 extension bit           */
+    /* SystemInformationBlockType1 has NO extension marker (it grows through
+     * nonCriticalExtension); reading one here put every later field one bit
+     * late, and no real SIB1 ever parsed (Bill's B13 capture, 2026-09-26). */
     has_pmax = (int)br_u(&r, 1);              /* p-Max present                */
     has_tdd  = (int)br_u(&r, 1);              /* tdd-Config present           */
     (void)br_u(&r, 1);                        /* nonCriticalExtension present */
@@ -84,8 +86,11 @@ int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
 
     /* -- scheduling (best-effort; identity above is what gates the return) -- */
     save = r.pos;
-    (void)br_u(&r, 1);                          /* q-RxLevMinOffset present   */
-    (void)br_u(&r, nbits_for(49));              /* q-RxLevMin (-70..-22)      */
+    {
+        int has_qoff = (int)br_u(&r, 1);        /* q-RxLevMinOffset present   */
+        (void)br_u(&r, nbits_for(49));          /* q-RxLevMin (-70..-22)      */
+        if (has_qoff) (void)br_u(&r, 3);        /* q-RxLevMinOffset (1..8)    */
+    }
     if (has_pmax) (void)br_u(&r, nbits_for(64));/* p-Max                      */
     out->freq_band = (int)br_u(&r, nbits_for(64)) + 1;   /* freqBandIndicator */
     nsi = (int)br_u(&r, nbits_for(32)) + 1;     /* schedulingInfoList 1..32   */
@@ -101,9 +106,16 @@ int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
             sc->n_sibs = 0;
         }
         for (j = 0; j < nmap; ++j) {
+            /* SIB-Type: 16 root values (sibType3..18), then an extension:
+             * sibType19, 20, 21, 24, 25, 26 as a normally-small number */
+            static const int EXT[6] = {19, 20, 21, 24, 25, 26};
             int sib;
-            (void)br_u(&r, 1);                  /* SIB-Type ext bit           */
-            sib = (int)br_u(&r, nbits_for(9)) + 3;
+            if (br_u(&r, 1)) {
+                int big = (int)br_u(&r, 1), e = (int)br_u(&r, 6);
+                sib = (!big && e < 6) ? EXT[e] : 0;
+            } else {
+                sib = (int)br_u(&r, 4) + 3;
+            }
             if (sc && sc->n_sibs < ATKDSP_LTE_MAX_SIBMAP)
                 sc->sibs[sc->n_sibs++] = sib;
         }

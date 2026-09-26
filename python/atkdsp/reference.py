@@ -1687,7 +1687,7 @@ def lte_sib1_encode(plmns, tac, cellid, csg_identity=None, sched=None,
     b = []
     _sib1_write(b, 0, 1)                 # BCCH-DL-SCH type CHOICE -> c1
     _sib1_write(b, 1, 1)                 # c1 CHOICE -> systemInformationBlockType1
-    _sib1_write(b, 0, 1)                 # SIB1 extension bit
+    # (SIB1 has no extension marker — see lte_sib1_decode)
     _sib1_write(b, 0, 1)                 # p-Max absent
     _sib1_write(b, 0, 1)                 # tdd-Config absent
     _sib1_write(b, 0, 1)                 # nonCriticalExtension absent
@@ -1724,7 +1724,7 @@ def lte_sib1_encode(plmns, tac, cellid, csg_identity=None, sched=None,
         _sib1_write(b, len(mapping), _sib1_nbits(32))    # SIB-MappingInfo SIZE(0..31)
         for sib_type in mapping:
             _sib1_write(b, 0, 1)                          # SIB-Type ext bit
-            _sib1_write(b, sib_type - 3, _sib1_nbits(9))  # sibType3->0, root 9
+            _sib1_write(b, sib_type - 3, 4)               # sibType3->0, root 16
     # (tdd-Config absent) ; si-WindowLength (7) ; systemInfoValueTag (0..31)
     _sib1_write(b, si_window_idx, _sib1_nbits(7))
     _sib1_write(b, 0, 5)
@@ -1741,7 +1741,9 @@ def lte_sib1_decode(bits):
         return None                     # not c1
     if r.u(1) != 1:
         return None                     # not SIB1
-    _ext = r.u(1)
+    # SystemInformationBlockType1 has NO extension marker; reading one put
+    # every later field one bit late and no real SIB1 ever parsed (Bill's B13
+    # capture, 2026-09-26 — this twin and the C agreed with each other).
     has_pmax = r.u(1); has_tdd = r.u(1); r.u(1)   # p-Max / tdd / nonCrit present
     csg_present = r.u(1)
     n_plmn = r.u(_sib1_nbits(6)) + 1
@@ -1773,8 +1775,10 @@ def lte_sib1_decode(bits):
            "freq_band": 0, "sched": [], "si_window_ms": 0, "si_window_idx": -1}
     # -- scheduling (best-effort; identity above is what gates the return) --
     save = r.pos
-    r.u(1)                              # q-RxLevMinOffset present
+    has_qoff = r.u(1)                   # q-RxLevMinOffset present
     r.u(_sib1_nbits(49))               # q-RxLevMin
+    if has_qoff:
+        r.u(3)                         # q-RxLevMinOffset (1..8)
     if has_pmax:
         r.u(_sib1_nbits(64))           # p-Max
     freq_band = r.u(_sib1_nbits(64)) + 1
@@ -1785,8 +1789,12 @@ def lte_sib1_decode(bits):
         nmap = r.u(_sib1_nbits(32))
         sibs = []
         for _ in range(nmap):
-            r.u(1)                     # SIB-Type ext bit
-            sibs.append(r.u(_sib1_nbits(9)) + 3)
+            if r.u(1):                 # SIB-Type past its extension marker
+                big, e = r.u(1), r.u(6)
+                sibs.append((19, 20, 21, 24, 25, 26)[e]
+                            if not big and e < 6 else 0)
+            else:                      # 16 root values: sibType3..18
+                sibs.append(r.u(4) + 3)
         sched.append({"periodicity_idx": per_idx,
                       "periodicity_rf": (_SI_PERIODICITY_RF[per_idx]
                                          if per_idx < 7 else 0),

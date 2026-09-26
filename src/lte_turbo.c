@@ -174,8 +174,11 @@ static void subblock_maps(int D, int *idx01, int *idx2, int *R_out, int *KPi_out
     *R_out = R; *KPi_out = KPi;
 }
 
-/* rate de-match: E LLRs -> d0,d1,d2 (each length D). rv=0 assumed for SIB
- * (k0 = 2R); Ncb = 3*KPi (no soft-buffer limiting for a broadcast TB). */
+/* rate de-match: E LLRs -> d0,d1,d2 (each length D). Ncb = 3*KPi (no
+ * soft-buffer limiting for a broadcast TB); the read starts at 36.212
+ * 5.1.4.1.2's k0 = R*(2*ceil(Ncb/(8R))*rv + 2). SIB1 is sent with RV 0, 2, 3,
+ * 1 in turn; this used to assume rv=0, so three SIB1 transmissions in four
+ * never passed CRC on air (Bill's B13 recording, 2026-09-26). */
 static void rate_dematch(const double *e_llr, int E, int D, int rv,
                          double *d0, double *d1, double *d2) {
     int R, KPi, Ncb, j, k, kk, i;
@@ -184,7 +187,6 @@ static void rate_dematch(const double *e_llr, int E, int D, int rv,
     /* size idx arrays to KPi; D+32 >= KPi since KPi <= D+31 */
     signed char *isnull;
     double *w, *v0, *v1, *v2;
-    (void)rv;
     subblock_maps(D, idx01, idx2, &R, &KPi);
     Ncb = 3 * KPi;
     isnull = (signed char *)calloc((size_t)Ncb, 1);
@@ -194,7 +196,7 @@ static void rate_dematch(const double *e_llr, int E, int D, int rv,
         if (idx01[i] < 0) { isnull[i] = 1; isnull[KPi + 2 * i] = 1; }
         if (idx2[i]  < 0) isnull[KPi + 2 * i + 1] = 1;
     }
-    j = 2 * R;                                  /* k0 for rv=0 */
+    j = R * (2 * ((Ncb + 8 * R - 1) / (8 * R)) * (rv & 3) + 2);   /* k0 */
     k = 0;
     while (k < E) {
         int pos = j % Ncb;

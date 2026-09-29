@@ -10,6 +10,9 @@ sweeps before porting. Downlink broadcast only; no subscriber identity.
 - turbo_proto.py  — LTE turbo codec + rate matching (validated)
 - sib1_asn1.py    — CRC-24A + SIB1 ASN.1 UPER -> PLMN/TAC/ECI (validated)
 - sib1_phy.py     — full-BW grid, OFDM/CRS, PCFICH/PDCCH/PDSCH (validated e2e)
+- nr_ssb_proto.py — 5G NR SS/PBCH block search: PSS/SSS -> PCI, timing,
+                    CFO, 20 ms confirmation (validated 2026-09-29; C port
+                    pending, ATK's band plan is atk/core/nr_bands.py)
 - test_*.py       — the validation harnesses.
 
 SIB1 status: the full chain decodes end to end in Python (subframe ->

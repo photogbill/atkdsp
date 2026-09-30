@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 11
-#define ATKDSP_VERSION_STRING "0.10.3"
+#define ATKDSP_ABI_VERSION 13
+#define ATKDSP_VERSION_STRING "0.12.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -80,6 +80,12 @@ extern "C" {
  * (§10) routes to it for exactly those non-integer rates it used to refuse (an
  * integer ratio still takes the exact rational path), so a channel off an
  * uncalibrated or fractional clock is native instead of returning NULL. */
+/* 11 -> 12: atkdsp_symdump (symbol integrate-and-dump) and atkdsp_sync_search
+ * (sync-word correlation) — the FSK/AFSK front-end spine shared by the pager
+ * and data decoders (§12, src/fsk.c). */
+/* 12 -> 13: atkdsp_dc_track (adaptive DC/baseline removal for an off-centre
+ * channel) and atkdsp_agc (adaptive amplitude normalisation) — the flexible
+ * front end for sub-optimal RF (§12, src/fsk.c). */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -705,6 +711,58 @@ ATKDSP_API int atkdsp_lte_si_decode(const atkdsp_cf32 *samples, size_t n,
                                     int n_rb, int n_id, int n_ports,
                                     int subframe, double cfo_hz,
                                     int equalize, atkdsp_lte_si *out);
+
+/* ---- 12. FSK front end: symbol integrate-and-dump + sync-word search -----
+ * The shared spine for FSK/AFSK decoders (POCSAG, FLEX, ...). See src/fsk.c.
+ *
+ * atkdsp_symdump: integrate-and-dump matched filter. Averages each symbol's
+ * worth of samples of a real baseband stream (an FM discriminator output) into
+ * one soft value. `sps` may be fractional (POCSAG-512 at 48 kHz = 93.75); the
+ * symbol boundary is tracked with a real accumulator and `phase` (0..sps)
+ * positions the first boundary — data-aided timing, the caller picks the phase
+ * that maximises symbol amplitude. Open-loop and deterministic; all state is
+ * carried, so a block boundary is invisible. out_max bounds a call's symbol
+ * count; process returns the exact count. A tracked timing loop (M&M/Gardner)
+ * for a drifting clock is a later increment. */
+typedef struct atkdsp_symdump atkdsp_symdump;
+ATKDSP_API atkdsp_symdump *atkdsp_symdump_create(double sps, double phase);
+ATKDSP_API void      atkdsp_symdump_destroy(atkdsp_symdump *s);
+ATKDSP_API void      atkdsp_symdump_reset(atkdsp_symdump *s);
+ATKDSP_API size_t    atkdsp_symdump_out_max(const atkdsp_symdump *s, size_t n_in);
+ATKDSP_API ptrdiff_t atkdsp_symdump_process(atkdsp_symdump *s, const float *in, size_t n,
+                                            float *out, size_t out_cap);
+
+/* atkdsp_sync_search: slide a bit pattern (0/1) over the SIGN of soft symbols
+ * (soft < 0 => bit 1) and report matches within max_err bits, each with a
+ * polarity (0 = pattern, 1 = complement, an inverted FSK stream) and the
+ * position of the first symbol after the match. Returns hits, or ATKDSP_E_CAP
+ * when more than cap exist. */
+typedef struct {
+    long long pos;        /* index of the first symbol AFTER the match      */
+    int       polarity;   /* 0 = pattern, 1 = complement (inverted stream)  */
+    int       errors;     /* bit mismatches in the winning polarity         */
+} atkdsp_sync_hit;
+ATKDSP_API ptrdiff_t atkdsp_sync_search(const float *sym, size_t n,
+                                        const signed char *pattern, size_t plen,
+                                        int max_err, atkdsp_sync_hit *out, size_t cap);
+
+/* atkdsp_dc_track: adaptive DC/baseline removal for a real stream. A carrier
+ * offset on an FM-discriminator output is a constant pedestal; a leaky
+ * integrator tracks the slow mean and subtracts it (out = in - s;
+ * s += alpha*(in-s)), so a zero-threshold slicer is right however far
+ * off-centre the channel sits. `alpha` in (0,1] is the tracking rate (corner
+ * ~ alpha*fs/2pi) — set it WELL BELOW the symbol rate so it follows
+ * offset/drift, not the data. alpha<=0 copies. *state (one float) is the
+ * carried estimate; zero it once. in and out may alias. */
+ATKDSP_API void atkdsp_dc_track(const float *in, size_t n, float *out,
+                                float *state, float alpha);
+/* atkdsp_agc: adaptive amplitude normalisation. Tracks the mean magnitude and
+ * scales toward `ref`: a += alpha*(|in|-a); out = in*ref/max(a,eps). Makes
+ * soft symbols' scale invariant to each transmitter's deviation/level, and
+ * gives a 4-level slicer a normalised input. alpha<=0 copies; ref<=0 uses 1.
+ * *state (one float) is the carried amplitude; zero it once. in/out alias. */
+ATKDSP_API void atkdsp_agc(const float *in, size_t n, float *out,
+                           float *state, float alpha, float ref);
 
 #ifdef __cplusplus
 }

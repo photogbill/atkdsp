@@ -36,13 +36,16 @@ __all__ = [
     "spectrum_reduce", "spectrum_stats", "window_stats",
     "fm_demod", "am_demod", "db_to_pixels", "decimate_max",
     "median", "detect_channels", "stitch_max", "Channel",
+    "SymDump", "sync_search", "SyncHit", "dc_track", "agc",
 ]
 
 #: The ABI this binding was written against. A library reporting anything
 #: else is refused by :func:`load`.
 #: 11 adds the arbitrary/fractional resampler (§4b) and the DDC's use of it for
 #: non-integer output rates.
-ABI_VERSION = 11
+#: 12 adds the FSK front end: symdump (integrate-and-dump) + sync_search (§12).
+#: 13 adds dc_track + agc (adaptive DC removal + AGC) for off-centre RF (§12).
+ABI_VERSION = 13
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -1202,3 +1205,111 @@ __all__ += ["design_lowpass", "Ddc", "Lte", "lte_pss_symbol", "lte_sss_symbol",
             "LTE_PBCH_OFFSET", "LTE_PBCH_BLOCK", "Prach", "prach_zc", "PRACH_NZC",
             "lte_crc24a", "lte_turbo_decode", "lte_sib1_parse", "lte_sib1_decode",
             "lte_si_parse", "lte_si_decode"]
+
+# -- 12. FSK front end: symbol integrate-and-dump + sync-word search -----------
+class _SyncHit(C.Structure):
+    _fields_ = [("pos", C.c_longlong), ("polarity", C.c_int), ("errors", C.c_int)]
+
+
+class SyncHit:
+    """One sync-word match: pos (first symbol after the sync), polarity
+    (0 normal, 1 inverted), errors (bit mismatches)."""
+    __slots__ = ("pos", "polarity", "errors")
+
+    def __init__(self, pos, polarity, errors):
+        self.pos = int(pos); self.polarity = int(polarity); self.errors = int(errors)
+
+    def __repr__(self):
+        return f"SyncHit(pos={self.pos}, polarity={self.polarity}, errors={self.errors})"
+
+    def __eq__(self, other):
+        return (isinstance(other, SyncHit)
+                and (self.pos, self.polarity, self.errors)
+                == (other.pos, other.polarity, other.errors))
+
+
+def _bind_fsk(lib) -> None:
+    P = C.POINTER
+    fp = P(C.c_float)
+    lib.atkdsp_symdump_create.restype = C.c_void_p
+    lib.atkdsp_symdump_create.argtypes = [C.c_double, C.c_double]
+    lib.atkdsp_symdump_destroy.argtypes = [C.c_void_p]
+    lib.atkdsp_symdump_reset.argtypes = [C.c_void_p]
+    lib.atkdsp_symdump_out_max.restype = C.c_size_t
+    lib.atkdsp_symdump_out_max.argtypes = [C.c_void_p, C.c_size_t]
+    lib.atkdsp_symdump_process.restype = C.c_ssize_t
+    lib.atkdsp_symdump_process.argtypes = [C.c_void_p, fp, C.c_size_t, fp, C.c_size_t]
+    lib.atkdsp_sync_search.restype = C.c_ssize_t
+    lib.atkdsp_sync_search.argtypes = [fp, C.c_size_t, P(C.c_byte), C.c_size_t, C.c_int,
+                                       P(_SyncHit), C.c_size_t]
+    lib.atkdsp_dc_track.argtypes = [fp, C.c_size_t, fp, fp, C.c_float]
+    lib.atkdsp_agc.argtypes = [fp, C.c_size_t, fp, fp, C.c_float, C.c_float]
+
+
+_BIND_EXTRA.append(_bind_fsk)
+
+
+class SymDump:
+    """FSK symbol integrate-and-dump; see atkdsp.h §12."""
+
+    def __init__(self, sps: float, phase: float = 0.0):
+        self._lib = load()
+        self._h = self._lib.atkdsp_symdump_create(float(sps), float(phase))
+        if not self._h:
+            raise AtkDspError("symdump_create failed (need sps >= 1)")
+        self.sps = float(sps)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_symdump_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_symdump_reset(self._h)
+
+    def out_max(self, n_in: int) -> int:
+        return int(self._lib.atkdsp_symdump_out_max(self._h, int(n_in)))
+
+    def process(self, x, out=None) -> np.ndarray:
+        x = _f32(x, "x")
+        cap = self.out_max(x.size)
+        if out is None:
+            out = np.empty(cap, dtype=np.float32)
+        got = _check(self._lib.atkdsp_symdump_process(self._h, _fp(x), x.size,
+                                                      _fp(out), out.size), "symdump_process")
+        return out[:got]
+
+
+def sync_search(sym, pattern, max_err: int = 0, cap: int = 4096) -> list:
+    """Find `pattern` (0/1 bits) in the sign of soft symbols `sym`. Returns a
+    list of SyncHit. See atkdsp.h §12."""
+    lib = load()
+    s = _f32(sym, "sym")
+    pat = np.ascontiguousarray(pattern, dtype=np.int8)
+    out = (_SyncHit * int(cap))()
+    n = _check(lib.atkdsp_sync_search(_fp(s), s.size,
+                                      pat.ctypes.data_as(C.POINTER(C.c_byte)), pat.size,
+                                      int(max_err), out, int(cap)), "sync_search")
+    return [SyncHit(out[i].pos, out[i].polarity, out[i].errors) for i in range(n)]
+
+def dc_track(x, state=None, alpha: float = 0.01) -> np.ndarray:
+    """Adaptive DC/baseline removal (atkdsp.h §12). `state` is a float32[1] the
+    caller carries across calls (or None for a one-shot). Returns the tracked
+    signal (input minus the slow mean)."""
+    lib = load()
+    x = _f32(x, "x")
+    out = np.empty_like(x)
+    st = np.zeros(1, np.float32) if state is None else state
+    lib.atkdsp_dc_track(_fp(x), x.size, _fp(out), _fp(st), C.c_float(alpha))
+    return out
+
+
+def agc(x, state=None, alpha: float = 0.01, ref: float = 1.0) -> np.ndarray:
+    """Adaptive amplitude normalisation (atkdsp.h §12). `state` is a float32[1]
+    carried across calls (or None). Scales the signal toward `ref`."""
+    lib = load()
+    x = _f32(x, "x")
+    out = np.empty_like(x)
+    st = np.zeros(1, np.float32) if state is None else state
+    lib.atkdsp_agc(_fp(x), x.size, _fp(out), _fp(st), C.c_float(alpha), C.c_float(ref))
+    return out

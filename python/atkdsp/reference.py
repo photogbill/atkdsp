@@ -2633,3 +2633,88 @@ def lte_si_decode(bits):
     if r.bad:
         return None
     return {"sibs": sibs}
+
+# ---- 12. FSK front end: symbol integrate-and-dump + sync-word search ----------
+class SymDump:
+    """Integrate-and-dump symbol extractor; twin of atkdsp.SymDump (atkdsp.h §12)."""
+
+    def __init__(self, sps, phase=0.0):
+        if not (sps >= 1.0):
+            raise ValueError("sps >= 1")
+        self.sps = float(sps)
+        if phase < 0.0 or phase >= self.sps:
+            phase = 0.0
+        self.acc = float(phase)
+        self.sum = 0.0
+        self.cnt = 0
+
+    def reset(self):
+        self.acc = 0.0; self.sum = 0.0; self.cnt = 0
+
+    def out_max(self, n_in):
+        return int(n_in / self.sps) + 2
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        out = []
+        for i in range(x.size):
+            self.sum += float(x[i])
+            self.cnt += 1
+            self.acc += 1.0
+            if self.acc >= self.sps:
+                self.acc -= self.sps
+                out.append(np.float32(self.sum / self.cnt))
+                self.sum = 0.0
+                self.cnt = 0
+        return np.asarray(out, dtype=np.float32)
+
+
+def sync_search(sym, pattern, max_err=0):
+    """Twin of atkdsp.sync_search. Returns a list of (pos, polarity, errors)."""
+    sym = np.asarray(sym, dtype=np.float32)
+    pat = np.asarray(pattern, dtype=np.int8)
+    P = pat.size
+    if sym.size < P:
+        return []
+    bits = (sym < 0).astype(np.int8)
+    hits = []
+    for i in range(0, sym.size - P + 1):
+        err = int(np.sum(bits[i:i + P] != pat))
+        if err <= max_err:
+            hits.append((i + P, 0, err))
+        elif P - err <= max_err:
+            hits.append((i + P, 1, P - err))
+    return hits
+
+def dc_track(x, state=None, alpha=0.01):
+    """Twin of atkdsp.dc_track. Leaky-integrator baseline removal."""
+    x = np.asarray(x, dtype=np.float32)
+    if not (alpha > 0.0):
+        return x.copy()
+    s = 0.0 if state is None else float(state[0])
+    out = np.empty_like(x)
+    for i in range(x.size):
+        xi = float(x[i])
+        s += alpha * (xi - s)
+        out[i] = np.float32(xi - s)
+    if state is not None and x.size:
+        state[0] = np.float32(s)
+    return out
+
+
+def agc(x, state=None, alpha=0.01, ref=1.0):
+    """Twin of atkdsp.agc. Leaky-integrator amplitude normalisation."""
+    x = np.asarray(x, dtype=np.float32)
+    if not (ref > 0.0):
+        ref = 1.0
+    if not (alpha > 0.0):
+        return x.copy()
+    a = 0.0 if state is None else float(state[0])
+    out = np.empty_like(x)
+    for i in range(x.size):
+        xi = float(x[i])
+        a += alpha * (abs(xi) - a)
+        out[i] = np.float32(xi * (ref / (a if a > 1e-9 else 1e-9)))
+    if state is not None and x.size:
+        state[0] = np.float32(a)
+    return out

@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.10.0"
+    assert atkdsp.version() == "0.12.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -1609,3 +1609,114 @@ def test_lte_detect_multicell_invents_nothing_in_noise():
         z = (r.standard_normal(38400) + 1j * r.standard_normal(38400))
         false += len(lte.detect(z.astype(np.complex64), min_metric=0.15))
     assert false == 0, f"{false} cells invented in noise"
+
+# ---- 12. FSK front end ------------------------------------------------------
+def _fsk_disc(bits, sps, fdev=0.2, noise=0.05, seed=1):
+    """A discriminator-style near-rectangular baseband from bits at `sps`."""
+    r = np.random.default_rng(seed)
+    sym = (np.repeat(bits, sps) * 2 - 1).astype(float)
+    phase = 2 * np.pi * np.cumsum(sym * fdev)
+    x = np.exp(1j * phase) + noise * (r.standard_normal(sym.size) + 1j * r.standard_normal(sym.size))
+    return np.angle(x[1:] * np.conj(x[:-1])).astype(np.float32)
+
+
+@pytest.mark.parametrize("sps", [40.0, 93.75, 16.0])
+def test_symdump_matches_twin_across_uneven_blocks(sps):
+    x = (rng.standard_normal(20000)).astype(np.float32)
+    a = atkdsp.SymDump(sps, 1.0)
+    b = ref.SymDump(sps, 1.0)
+    sizes = [3, 17, 1, 5000, 999, 9000]
+    ya = np.concatenate([a.process(blk) for blk in blocks(x, sizes)])
+    yb = np.concatenate([b.process(blk) for blk in blocks(x, sizes)])
+    assert ya.size == yb.size
+    np.testing.assert_allclose(ya, yb, rtol=0, atol=1e-5)
+    y1 = ref.SymDump(sps, 1.0).process(x)
+    assert ya.size == y1.size
+    np.testing.assert_allclose(ya, y1, rtol=0, atol=1e-5)
+
+
+def test_symdump_recovers_symbols_at_the_best_phase():
+    r = np.random.default_rng(4)
+    sps = 8
+    bits = r.integers(0, 2, 1500)
+    disc = _fsk_disc(bits, sps, noise=0.1, seed=4)
+    best = 1.0
+    for phase in range(sps):                    # data-aided phase search
+        y = atkdsp.SymDump(float(sps), float(phase)).process(disc)
+        dec = (y > 0).astype(int)               # +1 -> bit1
+        for off in (-1, 0, 1):
+            if off >= 0:
+                aa, bb = dec[off:], bits[:dec.size - off]
+            else:
+                aa, bb = dec[:dec.size + off], bits[-off:]
+            m = min(aa.size, bb.size)
+            if m < 500:
+                continue
+            best = min(best, float(np.mean(aa[-500:] != bb[-500:])))
+    assert best < 0.01, f"symdump could not recover the symbols (best BER {best:.3f})"
+
+
+def test_sync_search_matches_twin_and_finds_a_known_word():
+    r = np.random.default_rng(3)
+    word = np.array([1,1,0,1,0,0,1,0,1,1,1,0,0,1,0,1], dtype=np.int8)
+    sbits = r.integers(0, 2, 600).astype(np.int8)
+    for at in (100, 400):
+        sbits[at:at + word.size] = word
+    soft = ((1 - 2 * sbits) + 0.05 * r.standard_normal(sbits.size)).astype(np.float32)
+    ha = atkdsp.sync_search(soft, word, max_err=0)
+    hb = ref.sync_search(soft, word, max_err=0)
+    assert [(h.pos, h.polarity, h.errors) for h in ha] == hb
+    positions = [h.pos - word.size for h in ha]
+    assert 100 in positions and 400 in positions
+    hi = atkdsp.sync_search((-soft).astype(np.float32), word, max_err=0)
+    assert any(h.polarity == 1 for h in hi)
+
+# ---- 12b. adaptive front-end conditioning (dc_track / agc) -------------------
+def test_dc_track_matches_twin_across_uneven_blocks():
+    x = (rng.standard_normal(20000).astype(np.float32) + 0.7)   # signal with DC
+    sa = np.zeros(1, np.float32); sb = np.zeros(1, np.float32)
+    sizes = [3, 17, 1, 5000, 999, 9000]
+    a = np.concatenate([atkdsp.dc_track(blk, sa, 0.02) for blk in blocks(x, sizes)])
+    b = np.concatenate([ref.dc_track(blk, sb, 0.02) for blk in blocks(x, sizes)])
+    np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
+    b1 = ref.dc_track(x, np.zeros(1, np.float32), 0.02)
+    np.testing.assert_allclose(a, b1, rtol=0, atol=1e-4)
+    assert abs(float(np.mean(a[5000:]))) < 0.05      # DC actually removed
+
+
+def test_agc_matches_twin_across_uneven_blocks():
+    x = (rng.standard_normal(20000).astype(np.float32) * 3.0)
+    sa = np.ones(1, np.float32); sb = np.ones(1, np.float32)
+    sizes = [7, 1, 4000, 111, 15000]
+    a = np.concatenate([atkdsp.agc(blk, sa, 0.02, 1.0) for blk in blocks(x, sizes)])
+    b = np.concatenate([ref.agc(blk, sb, 0.02, 1.0) for blk in blocks(x, sizes)])
+    np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-5)
+    assert 0.6 < float(np.mean(np.abs(a[5000:]))) < 1.6   # normalised toward ref
+
+
+def test_dc_track_recovers_off_centre_slicing():
+    """The point of the whole thing: an off-centre channel (pedestal > deviation)
+    breaks a fixed zero-threshold slicer; dc_track restores it."""
+    r = np.random.default_rng(9)
+    sps = 8
+    bits = r.integers(0, 2, 1500)
+    disc = ((np.repeat(bits, sps) * 2 - 1) * 0.6).astype(np.float64)   # +-0.6 data
+    disc += 0.9                                                        # off-centre: bias > dev
+    disc = (disc + 0.05 * r.standard_normal(disc.size)).astype(np.float32)
+
+    def ber(decbits):
+        best = 1.0
+        for off in (-1, 0, 1):
+            a, b = (decbits[off:], bits[:decbits.size - off]) if off >= 0 \
+                else (decbits[:decbits.size + off], bits[-off:])
+            if min(a.size, b.size) < 800:
+                continue
+            best = min(best, float(np.mean(a[-800:] != b[-800:])))
+        return best
+
+    naive = atkdsp.SymDump(float(sps), 0.0).process(disc)
+    naive_ber = ber((naive > 0).astype(int))
+    fixed = atkdsp.SymDump(float(sps), 0.0).process(atkdsp.dc_track(disc, alpha=0.01))
+    fixed_ber = ber((fixed > 0).astype(int))
+    assert naive_ber > 0.30, f"expected the naive slicer to fail (got {naive_ber:.3f})"
+    assert fixed_ber < 0.02, f"dc_track should recover it (got {fixed_ber:.3f})"

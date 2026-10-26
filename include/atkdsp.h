@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 13
-#define ATKDSP_VERSION_STRING "0.12.0"
+#define ATKDSP_ABI_VERSION 14
+#define ATKDSP_VERSION_STRING "0.13.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -86,6 +86,9 @@ extern "C" {
 /* 12 -> 13: atkdsp_dc_track (adaptive DC/baseline removal for an off-centre
  * channel) and atkdsp_agc (adaptive amplitude normalisation) — the flexible
  * front end for sub-optimal RF (§12, src/fsk.c). */
+/* 13 -> 14: atkdsp_dmr_sync — the DMR / P25 sync correlator (§13,
+ * src/dmr_sync.c): pilot-aided steering vectors and burst timing for the
+ * KrakenSDR DF engine (ATK KRAKEN_DF_PLAN §6.5, §7.1). */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -763,6 +766,91 @@ ATKDSP_API void atkdsp_dc_track(const float *in, size_t n, float *out,
  * *state (one float) is the carried amplitude; zero it once. in/out alias. */
 ATKDSP_API void atkdsp_agc(const float *in, size_t n, float *out,
                            float *state, float alpha, float ref);
+
+/* ---- 13. 4FSK sync correlator: DMR / P25 pilots and burst timing --------
+ * A complex-baseband matched filter for the 24-symbol sync words of DMR (ETSI
+ * TS 102 361-1 Table 9.2: BS and MS voice/data, MS reverse channel, the four
+ * direct-mode slot words) and the P25 Phase 1 frame sync, with a bank of
+ * carrier-offset hypotheses, across 1..64 phase-coherent channels at once.
+ * The model and the measurements are in src/dmr_sync.c and the twin
+ * (python/atkdsp/reference.py §13). Two jobs (ATK KRAKEN_DF_PLAN):
+ *   - pilot-aided DF (§6.5): a hit carries the per-channel complex amplitude
+ *     of THAT emitter's sync, phase at the window centre; amps[c] / amps[0]
+ *     is the steering vector, with 24 coherent symbols of processing gain,
+ *     and a co-channel emitter that is not sending a sync does not pull it;
+ *   - decoder-clocked DoA (§7.1): the sync's sample-exact position and type
+ *     (BS / MS / direct-mode slot — the repeater-vs-handset path tag).
+ * Input: complex baseband centred on the channel at 9.6..384 kHz (channelise
+ * first; 24 or 48 kHz is right), channel c at in[c*ch_stride + i]. State is
+ * carried: a hit is bit-identical however the stream is chunked. A peak is
+ * reported once `guard` samples have passed it with nothing better (guard 0 =
+ * 66 symbols, the rest of a DMR burst either side, which also swallows the
+ * partial matches its own payload makes); _flush reports a pending one at
+ * the end of a stream or of a one-shot buffer.
+ *   score   normalised correlation 0..1, summed over channels: gain-free,
+ *           about SNR/(1+SNR) for a true sync in its own channel bandwidth.
+ *   errors  sync symbols whose frequency SIGN reads wrong, DSD's test, summed
+ *           over channels. <= 3 means the pattern label can be trusted
+ *           (measured: one channel at +3 dB, 84 % of true syncs; five channels
+ *           at 0 dB, 99 %); a burst with no sync (DMR voice B-F) makes partial
+ *           matches that read 5 or more — the label is wrong, but it is still
+ *           that emitter, so the amplitudes are still its steering vector.
+ * `pattern_mask` selects patterns by set index (bit p; 0 bits = refused);
+ * `alpha` is the RRC roll-off of the frequency pulses (NaN = the set's 0.2,
+ * negative = rectangular); `cfo_step_hz` 0 = 100 Hz (half the 5 ms sync's
+ * resolution: <= 0.9 dB between bins). Returns NULL on a bad argument. */
+#define ATKDSP_SYNC_DMR      0     /* 9 patterns; +3 = +1944 Hz              */
+#define ATKDSP_SYNC_P25      1     /* 1 pattern;  +3 = +1800 Hz              */
+#define ATKDSP_SYNC_INVERT   1     /* flags: a spectrally inverted stream    */
+#define ATKDSP_SYNC_SYMBOLS  24
+#define ATKDSP_SYNC_RATE     4800.0
+
+typedef struct {
+    long long start;     /* stream index of the best window's first sample   */
+    double    frac;      /* sub-sample refinement, -0.5..0.5; the sync's
+                            leading edge is at start + frac - 0.5            */
+    double    cfo_hz;    /* carrier offset, refined between bins             */
+    float     score;     /* normalised correlation 0..1 at the refined offset */
+    int       errors;    /* sync symbols with the wrong frequency sign, 0..24 */
+    int       pattern;   /* index in the set (atkdsp_dmr_sync_pattern_name)  */
+    int       reserved;  /* 0                                                 */
+} atkdsp_dmr_sync_hit;   /* 40 bytes */
+
+typedef struct atkdsp_dmr_sync atkdsp_dmr_sync;
+/* The tables, for the binding, the twin's cross-check and a caller's labels. */
+ATKDSP_API int         atkdsp_dmr_sync_patterns(int set);
+ATKDSP_API int         atkdsp_dmr_sync_pattern(int set, int idx, signed char *sym,
+                                               size_t cap);          /* +-3, +-1 */
+ATKDSP_API const char *atkdsp_dmr_sync_pattern_name(int set, int idx);
+ATKDSP_API atkdsp_dmr_sync *atkdsp_dmr_sync_create(int set, double sample_rate,
+                                    int n_channels, unsigned pattern_mask,
+                                    double cfo_span_hz, double cfo_step_hz,
+                                    float threshold, int guard, double alpha,
+                                    int flags);
+ATKDSP_API void      atkdsp_dmr_sync_destroy(atkdsp_dmr_sync *s);
+ATKDSP_API void      atkdsp_dmr_sync_reset(atkdsp_dmr_sync *s);
+/* Window length L (samples), offset bins, bin spacing, guard. Any may be NULL. */
+ATKDSP_API int       atkdsp_dmr_sync_info(const atkdsp_dmr_sync *s, int *window,
+                                          int *n_cfo, double *cfo_step_hz, int *guard);
+/* A process() call of n_in samples writes at most this many hits; cap below
+ * it is refused before anything is consumed (ATKDSP_E_CAP). */
+ATKDSP_API size_t    atkdsp_dmr_sync_hits_max(const atkdsp_dmr_sync *s, size_t n_in);
+/* `amps` (NULL to skip) receives n_channels values per hit, hit-major. */
+ATKDSP_API ptrdiff_t atkdsp_dmr_sync_process(atkdsp_dmr_sync *s, const atkdsp_cf32 *in,
+                                    size_t n, size_t ch_stride,
+                                    atkdsp_dmr_sync_hit *hits, atkdsp_cf32 *amps,
+                                    size_t cap);
+/* Report the pending peak now (0 or 1 hit). The stream may continue. */
+ATKDSP_API ptrdiff_t atkdsp_dmr_sync_flush(atkdsp_dmr_sync *s, atkdsp_dmr_sync_hit *hits,
+                                    atkdsp_cf32 *amps, size_t cap);
+/* The reference waveform of one pattern (any in the set): L unit-modulus
+ * samples, phase zero at the window centre. Returns L. */
+ATKDSP_API int       atkdsp_dmr_sync_reference(const atkdsp_dmr_sync *s, int pattern,
+                                    atkdsp_cf32 *out, size_t cap);
+/* "DMR sync: 48000 Hz (10.00 sps), 240-sample window, 9 patterns, CFO +-1000
+ * Hz in 21 bins of 100 Hz, threshold 0.30, guard 660, RRC a=0.20, 5 channels" */
+ATKDSP_API int       atkdsp_dmr_sync_describe(const atkdsp_dmr_sync *s, char *buf,
+                                    size_t cap);
 
 #ifdef __cplusplus
 }

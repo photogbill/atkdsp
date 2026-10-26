@@ -45,7 +45,8 @@ __all__ = [
 #: non-integer output rates.
 #: 12 adds the FSK front end: symdump (integrate-and-dump) + sync_search (§12).
 #: 13 adds dc_track + agc (adaptive DC removal + AGC) for off-centre RF (§12).
-ABI_VERSION = 13
+#: 14 adds the DMR / P25 sync correlator, DmrSync (§13).
+ABI_VERSION = 14
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -1313,3 +1314,202 @@ def agc(x, state=None, alpha: float = 0.01, ref: float = 1.0) -> np.ndarray:
     st = np.zeros(1, np.float32) if state is None else state
     lib.atkdsp_agc(_fp(x), x.size, _fp(out), _fp(st), C.c_float(alpha), C.c_float(ref))
     return out
+
+
+# -- 13. 4FSK sync correlator: DMR / P25 pilots and burst timing ----------------
+# The model, the defaults and what they were measured against are in atkdsp.h
+# §13, src/dmr_sync.c and the twin (reference.py §13). The pattern TAGS (BS/MS/
+# direct, voice/data, slot) are Python-side metadata and come from the twin's
+# table, so there is one copy of them; the C has the names, and the tests hold
+# the two tables to each other.
+import logging as _logging                                   # noqa: E402
+
+from . import reference as _ref                               # noqa: E402
+
+_dmr_log = _logging.getLogger("atkdsp.dmr_sync")
+
+SYNC_DMR = 0
+SYNC_P25 = 1
+SYNC_INVERT = 1
+SYNC_SYMBOLS = 24
+SYNC_RATE = 4800.0
+SYNC_CONFIRM_ERRORS = _ref.SYNC_CONFIRM_ERRORS
+
+
+class _DmrSyncHit(C.Structure):
+    _fields_ = [("start", C.c_longlong), ("frac", C.c_double), ("cfo_hz", C.c_double),
+                ("score", C.c_float), ("errors", C.c_int), ("pattern", C.c_int),
+                ("reserved", C.c_int)]
+
+
+def _bind_dmr_sync(lib) -> None:
+    P = C.POINTER
+    cf = P(_Cf32)
+    lib.atkdsp_dmr_sync_patterns.restype = C.c_int
+    lib.atkdsp_dmr_sync_patterns.argtypes = [C.c_int]
+    lib.atkdsp_dmr_sync_pattern.restype = C.c_int
+    lib.atkdsp_dmr_sync_pattern.argtypes = [C.c_int, C.c_int, P(C.c_byte), C.c_size_t]
+    lib.atkdsp_dmr_sync_pattern_name.restype = C.c_char_p
+    lib.atkdsp_dmr_sync_pattern_name.argtypes = [C.c_int, C.c_int]
+    lib.atkdsp_dmr_sync_create.restype = C.c_void_p
+    lib.atkdsp_dmr_sync_create.argtypes = [C.c_int, C.c_double, C.c_int, C.c_uint,
+                                           C.c_double, C.c_double, C.c_float, C.c_int,
+                                           C.c_double, C.c_int]
+    lib.atkdsp_dmr_sync_destroy.argtypes = [C.c_void_p]
+    lib.atkdsp_dmr_sync_reset.argtypes = [C.c_void_p]
+    lib.atkdsp_dmr_sync_info.restype = C.c_int
+    lib.atkdsp_dmr_sync_info.argtypes = [C.c_void_p, P(C.c_int), P(C.c_int),
+                                         P(C.c_double), P(C.c_int)]
+    lib.atkdsp_dmr_sync_hits_max.restype = C.c_size_t
+    lib.atkdsp_dmr_sync_hits_max.argtypes = [C.c_void_p, C.c_size_t]
+    lib.atkdsp_dmr_sync_process.restype = C.c_ssize_t
+    lib.atkdsp_dmr_sync_process.argtypes = [C.c_void_p, cf, C.c_size_t, C.c_size_t,
+                                            P(_DmrSyncHit), cf, C.c_size_t]
+    lib.atkdsp_dmr_sync_flush.restype = C.c_ssize_t
+    lib.atkdsp_dmr_sync_flush.argtypes = [C.c_void_p, P(_DmrSyncHit), cf, C.c_size_t]
+    lib.atkdsp_dmr_sync_reference.restype = C.c_int
+    lib.atkdsp_dmr_sync_reference.argtypes = [C.c_void_p, C.c_int, cf, C.c_size_t]
+    lib.atkdsp_dmr_sync_describe.restype = C.c_int
+    lib.atkdsp_dmr_sync_describe.argtypes = [C.c_void_p, C.c_char_p, C.c_size_t]
+
+
+_BIND_EXTRA.append(_bind_dmr_sync)
+
+
+def dmr_sync_patterns(sync_set=SYNC_DMR) -> int:
+    """How many sync words the set has (DMR 9, P25 1)."""
+    return _check(load().atkdsp_dmr_sync_patterns(_ref.sync_set_id(sync_set)),
+                  "dmr_sync_patterns")
+
+
+def dmr_sync_pattern(sync_set, idx) -> np.ndarray:
+    """The 24 symbols (+-3, +-1) of one sync word, as the library holds them."""
+    out = np.zeros(SYNC_SYMBOLS, dtype=np.int8)
+    _check(load().atkdsp_dmr_sync_pattern(_ref.sync_set_id(sync_set), int(idx),
+                                          out.ctypes.data_as(C.POINTER(C.c_byte)), out.size),
+           "dmr_sync_pattern")
+    return out
+
+
+def dmr_sync_pattern_name(sync_set, idx) -> str:
+    name = load().atkdsp_dmr_sync_pattern_name(_ref.sync_set_id(sync_set), int(idx))
+    if name is None:
+        raise AtkDspError(f"dmr_sync_pattern_name: no pattern {idx}")
+    return name.decode()
+
+
+class DmrSync:
+    """Streaming DMR / P25 sync correlator over 1..64 coherent channels; see
+    atkdsp.h §13. Same constructor, methods and hit dicts as the twin
+    (atkdsp.reference.DmrSync), so ATK's fallback is a drop-in.
+
+    Feed `process` blocks of shape (N,) for one channel or (n_channels, N),
+    complex baseband centred on the channel at `sample_rate` (24 or 48 kHz).
+    It returns the hits whose peaks are final; `flush` returns a pending one.
+    Each hit is a dict: start, frac, cfo_hz, score, errors, confirmed,
+    pattern, name, source, kind, slot, amps (complex64, one per channel;
+    amps / amps[0] is the steering vector)."""
+
+    def __init__(self, sample_rate: float, n_channels: int = 1, sync_set=SYNC_DMR,
+                 patterns=None, cfo_span_hz: float = 1000.0, cfo_step_hz: float = 0.0,
+                 threshold=None, guard: int = 0, alpha=None, invert: bool = False):
+        self._lib = load()
+        sid = _ref.sync_set_id(sync_set)
+        if threshold is None:
+            threshold = _ref.sync_default_threshold(n_channels)
+        mask = _ref._sync_mask(sid, patterns)
+        a = float("nan") if alpha is None else float(alpha)
+        self._h = self._lib.atkdsp_dmr_sync_create(
+            sid, float(sample_rate), int(n_channels), int(mask), float(cfo_span_hz),
+            float(cfo_step_hz), float(threshold), int(guard), a,
+            SYNC_INVERT if invert else 0)
+        if not self._h:
+            raise AtkDspError(
+                f"dmr_sync_create(set={sid}, fs={sample_rate}, channels={n_channels}, "
+                f"mask={mask:#x}, span={cfo_span_hz}, step={cfo_step_hz}, "
+                f"threshold={threshold}, guard={guard}, alpha={alpha}) refused — "
+                f"fs 9600..384000, channels 1..64, a pattern selected, span 0..5000, "
+                f"<= 201 bins, threshold in (0, 1], guard <= 16 windows, alpha <= 1")
+        win, ncfo, gd = C.c_int(), C.c_int(), C.c_int()
+        stp = C.c_double()
+        self._lib.atkdsp_dmr_sync_info(self._h, C.byref(win), C.byref(ncfo),
+                                       C.byref(stp), C.byref(gd))
+        self.sync_set = sid
+        self.sample_rate = float(sample_rate)
+        self.n_channels = int(n_channels)
+        self.mask = mask
+        self.active = [p for p in range(_ref.dmr_sync_patterns(sid)) if mask >> p & 1]
+        self.alpha = _ref._sync_alpha(sid, alpha)
+        self.invert = bool(invert)
+        self.L = int(win.value)
+        self.n_cfo = int(ncfo.value)
+        self.kmax = (self.n_cfo - 1) // 2
+        self.cfo_step = float(stp.value)
+        self.cfo_span = float(cfo_span_hz)
+        self.threshold = float(threshold)
+        self.guard = int(gd.value)
+        _dmr_log.info("dmr_sync created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_dmr_sync_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_dmr_sync_reset(self._h)
+
+    def hits_max(self, n_in: int) -> int:
+        return int(self._lib.atkdsp_dmr_sync_hits_max(self._h, int(n_in)))
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_dmr_sync_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def reference(self, idx) -> np.ndarray:
+        out = np.empty(self.L, dtype=np.complex64)
+        _check(self._lib.atkdsp_dmr_sync_reference(self._h, int(idx), _cfp(out), out.size),
+               "dmr_sync_reference")
+        return out
+
+    def _hits(self, buf, amps, n) -> list:
+        hits = []
+        for i in range(n):
+            h = buf[i]
+            d = {"start": int(h.start), "frac": float(h.frac), "cfo_hz": float(h.cfo_hz),
+                 "score": float(h.score), "errors": int(h.errors),
+                 "confirmed": int(h.errors) <= SYNC_CONFIRM_ERRORS, "pattern": int(h.pattern)}
+            d.update(_ref.dmr_sync_pattern_info(self.sync_set, int(h.pattern)))
+            d["amps"] = amps[i].copy()
+            hits.append(d)
+            _dmr_log.debug("dmr_sync hit: %s at %d%+.2f, score %.3f, %d errors, cfo %+.1f Hz",
+                           d["name"], d["start"], d["frac"], d["score"], d["errors"], d["cfo_hz"])
+        return hits
+
+    def process(self, x) -> list:
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x[None, :]
+        if x.ndim != 2 or x.shape[0] != self.n_channels:
+            raise AtkDspError(f"dmr_sync: expected shape ({self.n_channels}, N), got {x.shape}")
+        x = np.ascontiguousarray(x, dtype=np.complex64)
+        n = x.shape[1]
+        cap = self.hits_max(n)
+        buf = (_DmrSyncHit * cap)()
+        amps = np.zeros((cap, self.n_channels), dtype=np.complex64)
+        got = _check(self._lib.atkdsp_dmr_sync_process(
+            self._h, x.ctypes.data_as(C.POINTER(_Cf32)), n, n, buf, _cfp(amps), cap),
+            "dmr_sync_process")
+        return self._hits(buf, amps, got)
+
+    def flush(self) -> list:
+        buf = (_DmrSyncHit * 1)()
+        amps = np.zeros((1, self.n_channels), dtype=np.complex64)
+        got = _check(self._lib.atkdsp_dmr_sync_flush(self._h, buf, _cfp(amps), 1),
+                     "dmr_sync_flush")
+        return self._hits(buf, amps, got)
+
+
+__all__ += ["SYNC_DMR", "SYNC_P25", "SYNC_INVERT", "SYNC_SYMBOLS", "SYNC_RATE",
+            "SYNC_CONFIRM_ERRORS", "DmrSync", "dmr_sync_patterns", "dmr_sync_pattern",
+            "dmr_sync_pattern_name"]

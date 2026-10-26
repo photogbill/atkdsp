@@ -36,7 +36,8 @@ matters, because the display reduction uses every core it is given.
 ```
 include/atkdsp.h        THE ABI. Read its header comment first.
 src/                    C99 kernels, one file per group (convert, nco, fir,
-                        resample, fft, demod, display, detect)
+                        resample, fft, demod, display, detect, ddc, lte*,
+                        fsk, dmr_sync)
 vendor/pocketfft/       Martin Reinecke's pocketfft (C, BSD-3) — the only
                         third-party code, used through src/fft.c only
 python/atkdsp/          __init__.py  the ctypes binding
@@ -81,7 +82,82 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.10.3 (ABI 11)
+## What is in v0.13.0 (ABI 14)
+
+**`atkdsp_dmr_sync` — the DMR / P25 sync correlator** (`src/dmr_sync.c`,
+header §13, twin `reference.py` §13), the first thing the KrakenSDR DF engine
+was waiting on (ATK `docs/KRAKEN_DF_PLAN.md` §6.5, §7.1; `CUED_DF_PLAN.md`).
+A complex-baseband matched filter for the 24-symbol sync words — DMR's nine
+(BS/MS voice and data, MS reverse channel, the four direct-mode slot words,
+ETSI TS 102 361-1 Table 9.2) and the P25 Phase 1 frame sync — with a bank of
+carrier-offset hypotheses, run across 1..64 phase-coherent channels at once.
+Each hit carries:
+
+- **the per-channel complex amplitude** of that emitter's sync, phase at the
+  window centre. `amps / amps[0]` is the array's steering vector for THAT
+  emitter: 24 coherent symbols of processing gain, and blind to a co-channel
+  emitter that is not sending a sync at that moment. Because the reference is
+  the same for every element, any mismatch between it and a real radio is
+  common-mode: it costs SNR, never bearing bias.
+- **sample-exact timing** (integer window start + a parabolic sub-sample
+  refinement) and **the carrier offset** (between bins, ±1 kHz by default),
+- **the sync type and its path tag** — BS (a repeater), MS (a handset),
+  direct-mode slot 1/2, voice/data — which is what stops a repeater's bearing
+  being fused as a handset's (§7.1),
+- **`errors`**: how many sync symbols read the wrong frequency sign, DSD's
+  own test. `<= 3` is "confirmed": the label can be trusted.
+
+Measured when it was written (synthetic DMR through a 12.5 kHz channel filter;
+SNR in the channel):
+
+| what | result |
+|---|---|
+| 5-element UCA, target −3 dB per element, a 4FSK emitter 3 dB **stronger** on the same channel 40–140° away | pilot bearing median **2.2°** (p90 6.2°); a covariance bearing over the same burst median **~80°** — it finds the stronger one |
+| same, no interferer | pilot median 1.2°, p90 3.0° (covariance 0.5°: it integrates the whole burst) |
+| found / confirmed at the default thresholds, 150 bursts per row | **one channel**: −3 dB 42 % / 1 %, 0 dB 99 % / 21 %, +3 dB 100 % / 84 %. **Five channels**: −9 dB 75 % / 1 %, −6 dB 99 % / 3 %, −3 dB 100 % / 42 %, 0 dB 100 % / 99 % |
+| what "confirmed" protects | the partial matches a voice burst's payload makes read 5+ errors and are never confirmed (test). A FOUND hit's amplitudes are its emitter's steering vector whatever the label; only the label needs confirming |
+| noise, 12.5 kHz channel | default thresholds 0.33 / 0.20 / 0.11 for 1 / 2 / 5 channels — about one hit in five minutes, none confirmed (`sync_default_threshold`). Score is averaged over channels, so noise tightens with more of them: that is the five-element gain above |
+| cost, 2.1 GHz AVX2 VM, 9 patterns | 0.65 µs/sample/channel at 48 kHz (3 % of a core); 5 channels at 24 kHz, 5 % |
+
+How it is built, and why each piece is the way it is:
+
+- **Offset bank by per-symbol partials.** One partial correlation per symbol,
+  then a phasor per symbol per offset: 24 MACs per hypothesis instead of L.
+  The loss inside a symbol is 0.15 dB at 500 Hz, 0.6 dB at 1 kHz.
+- **Pruning that is exact.** `(Σ_m |p_m|)²` bounds every offset's `|C|²`
+  (triangle inequality), so a pattern that cannot reach the threshold at any
+  offset skips its bank — in noise, nearly every sample.
+- **All patterns at once, one SIMD lane each.** The references are stored
+  transposed and the hot loop is written in AVX2 with eight accumulators in
+  flight. Left to themselves gcc's vectoriser produced scalar code here
+  (measured 4–8x slower); a plain-C fallback is the same arithmetic.
+- **Offset first, then timing.** For FSK a residual carrier offset looks like
+  a timing error, so the timing parabola is fitted to EXACT scores at the
+  refined offset. The other order biased the sub-sample timing by up to 0.45
+  of a sample.
+- **One refinement-only bin beyond each edge** of the bank, so a burst at
+  −950 Hz is not reported at −1000 for lack of a neighbour (a test caught it).
+- **Streaming, bit-identical however it is chunked** — tested with blocks of
+  1, 7, 239..241, 999, 4096, 8192 against one call.
+- **`flush()`** reports a peak whose guard has not passed: the end of a stream,
+  or a one-shot burst span cut from the ring (the §6.5 call).
+
+Not yet proved: **a real DMR radio.** The sync words were checked symbol for
+symbol against dsd-neo's table (an independent source; a test holds them), and
+the pulse model is DMR's root-raised-cosine, but no recording of a real DMR
+channel has been through it. ATK's `dmr_sync_check.bat` runs it over a
+SigMF recording and reports what it finds — that is the test that settles it.
+P25's C4FM is approximated by the same RRC pulse.
+
+## What was in v0.12.0 (ABI 13) and v0.11.0 (ABI 12)
+
+**The FSK front end** (`src/fsk.c`, header §12) for ATK's pager decoders:
+`atkdsp_symdump` (integrate-and-dump with a fractional samples-per-symbol),
+`atkdsp_sync_search` (a bit pattern over soft symbols, either polarity) in
+0.11.0; `atkdsp_dc_track` and `atkdsp_agc` (adaptive baseline removal and
+amplitude normalisation for an off-centre or weak channel) in 0.12.0.
+
+## What was in v0.10.3 (ABI 11)
 
 **The DDC keeps a wide channel's edges.** The final rational resampler's
 passband was 0.8 of the output Nyquist whatever the channel: a 10 MHz LTE
@@ -292,8 +368,8 @@ depending on whether cmake happened to be installed, with only the
    m-th power, delay-and-multiply — the Signals Analysis bench's inner loops.
 6. Higher-order cumulants (C20 … C63) for modulation classification.
 7. Cyclostationary engines (FAM / SSCA) and pseudo Wigner-Ville.
-8. Correlators: sync-word search, LFSR descrambler search, Gardner /
-   Mueller-Müller timing.
+8. Correlators: sync-word search (**DMR / P25 done, 0.13.0**), LFSR
+   descrambler search, Gardner / Mueller-Müller timing.
 9. Multi-channel: spatial covariance, cross-ambiguity (TDOA/FDOA), MUSIC —
    for a two-channel bladeRF 2.0 and the KrakenSDR.
 10. Cellular survey: PSS/SSS/SSB **correlators** belong here; the broadcast

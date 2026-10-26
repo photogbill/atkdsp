@@ -2718,3 +2718,573 @@ def agc(x, state=None, alpha=0.01, ref=1.0):
     if state is not None and x.size:
         state[0] = np.float32(a)
     return out
+
+
+# ---- 13. 4FSK sync correlator: DMR / P25 pilots (the spec src/dmr_sync.c is held to)
+#
+# A COMPLEX-BASEBAND matched filter for the 24-symbol sync words of DMR (ETSI
+# TS 102 361-1 Table 9.2) and the P25 Phase 1 frame sync (TIA-102.BAAA), with a
+# bank of carrier-offset hypotheses, run across one or more phase-coherent
+# channels at once (the KrakenSDR's five elements). ATK's KRAKEN_DF_PLAN has two
+# consumers for it:
+#
+#   §6.5 pilot-aided steering vectors: the per-channel complex amplitude of THAT
+#        emitter's sync at its peak. Its ratios are the array's steering vector,
+#        with the processing gain of 24 coherently-integrated symbols (~14 dB)
+#        over an energy estimate. Because the reference waveform is the same for
+#        every element, any mismatch between it and the real transmitter is
+#        common-mode: it costs SNR, never bearing bias.
+#   §7.1 decoder-clocked DoA: sample-exact burst timing and the sync TYPE —
+#        BS- or MS-sourced, direct-mode slot, voice or data — which is the path
+#        tag that keeps a repeater's bearing from being fused as a handset's.
+#
+# The model. A sync symbol a in {+3, +1, -1, -3} is a frequency of (a/3)*dev
+# (DMR: +3 -> +1944 Hz; P25: +1800 Hz). Each symbol's frequency pulse is a
+# root-raised-cosine (DMR's transmit filter, alpha 0.2; used for P25's C4FM as
+# an approximation) truncated to +-4 symbols, or a rectangle (plain CPFSK) when
+# alpha < 0. The phase is 2*pi*(dev/R)*sum_m (a_m/3)*G(u - m - 1/2), with G the
+# pulse's running integral (unit total area) and u the time in symbols from the
+# sync's leading edge. Reference sample i sits at u = (i + 1/2)/sps, the window
+# is L = round(24*sps) samples, and the phase is zero at the window centre, so
+# an amplitude's phase is the carrier's phase at the middle of the sync.
+#
+# The correlator. Per window (ending at stream sample n), per pattern, per
+# channel: one partial correlation per SYMBOL, p_m = sum_{i in symbol m}
+# x[i]*conj(r[i]). A carrier offset df is then a phasor per symbol,
+# C = sum_m p_m * exp(-j*2*pi*df*tau_m/fs) (tau_m the symbol's centre relative
+# to the window's), so the bank costs 24 complex MACs per hypothesis instead of
+# L. Within one symbol the offset is not compensated: at 1 kHz that loses 0.6 dB,
+# at 500 Hz 0.15 dB. The score is the normalised correlation summed over
+# channels — sum_c |C_c|^2 / (L * sum_c E_c), E_c the window's energy — in
+# [0, 1], independent of gain, and non-coherent across channels so detection
+# needs no bearing.
+#
+# Peak picking, streamed. A window scoring >= threshold becomes the candidate
+# if none is pending or it beats the pending one; a candidate is emitted once
+# `guard` samples have passed it with nothing better. Each emitted hit is then
+# refined: a parabola through the scores at n-1, n, n+1 gives the sub-sample
+# timing, one through the neighbouring offset bins the frequency, and the
+# per-channel amplitudes are taken at that refined offset by exact per-sample
+# derotation (no per-symbol approximation), with the score recomputed the same
+# way. Everything depends only on the samples, so a block boundary is
+# invisible: the C is bit-identical however the stream is chunked.
+
+SYNC_DMR = 0
+SYNC_P25 = 1
+SYNC_INVERT = 1               # flags: the stream is spectrally inverted
+SYNC_SYMBOLS = 24
+SYNC_RATE = 4800.0            # symbols/s, both sets
+SYNC_PULSE_SPAN = 4           # the RRC pulse is truncated to +-4 symbols
+SYNC_PULSE_RES = 64           # running-integral table points per symbol
+SYNC_FS_MIN = 9600.0          # 2 samples/symbol
+SYNC_FS_MAX = 384000.0        # 80 samples/symbol — channelise wider streams first
+SYNC_MAX_CHANNELS = 64
+SYNC_SPAN_MAX = 5000.0
+SYNC_MAX_BINS = 201
+SYNC_GUARD_SYMBOLS = 66       # default guard: the rest of a DMR burst either side
+SYNC_CONFIRM_ERRORS = 3       # a hit with <= this many symbol errors is "confirmed"
+
+# (name, 48-bit pattern, source, kind, slot). ETSI TS 102 361-1 Table 9.2;
+# checked symbol for symbol against dsd-neo's sync_patterns.h (an independent
+# source) on 2026-10-25. "source" is the path tag: BS = a repeater/base station
+# transmitted it, MS = a handset did, direct = handset-to-handset (DMO).
+_DMR_SYNC = (
+    ("BS voice", 0x755FD7DF75F7, "BS", "voice", 0),
+    ("BS data", 0xDFF57D75DF5D, "BS", "data", 0),
+    ("MS voice", 0x7F7D5DD57DFD, "MS", "voice", 0),
+    ("MS data", 0xD5D7F77FD757, "MS", "data", 0),
+    ("MS RC", 0x77D55F7DFD77, "MS", "rc", 0),
+    ("DM TS1 voice", 0x5D577F7757FF, "direct", "voice", 1),
+    ("DM TS1 data", 0xF7FDD5DDFD55, "direct", "data", 1),
+    ("DM TS2 voice", 0x7DFFD5F55D5F, "direct", "voice", 2),
+    ("DM TS2 data", 0xD7557F5FF7F5, "direct", "data", 2),
+)
+# TIA-102.BAAA frame sync. Inbound and outbound share it, so there is no path tag.
+_P25_SYNC = (
+    ("P25 frame sync", 0x5575F5FF77FF, "", "sync", 0),
+)
+SYNC_SETS = {
+    SYNC_DMR: {"name": "DMR", "dev_hz": 1944.0, "alpha": 0.2, "patterns": _DMR_SYNC},
+    SYNC_P25: {"name": "P25", "dev_hz": 1800.0, "alpha": 0.2, "patterns": _P25_SYNC},
+}
+# Dibit -> symbol, ETSI TS 102 361-1 Table 10.3 (and TIA-102.BAAA): 01 +3,
+# 00 +1, 10 -1, 11 -3. Every sync word uses only the outer two.
+_SYNC_DIBIT = {1: 3, 0: 1, 2: -1, 3: -3}
+
+
+def sync_set_id(s) -> int:
+    """'dmr' / 'p25' / SYNC_DMR / SYNC_P25 -> the set number."""
+    if isinstance(s, str):
+        key = s.strip().lower()
+        for k, v in SYNC_SETS.items():
+            if v["name"].lower() == key:
+                return k
+        raise ValueError(f"unknown sync set {s!r} (dmr, p25)")
+    s = int(s)
+    if s not in SYNC_SETS:
+        raise ValueError(f"unknown sync set {s}")
+    return s
+
+
+def dmr_sync_patterns(sync_set=SYNC_DMR) -> int:
+    """How many sync words the set has."""
+    return len(SYNC_SETS[sync_set_id(sync_set)]["patterns"])
+
+
+def dmr_sync_pattern(sync_set, idx) -> np.ndarray:
+    """The 24 symbols (+-3, +-1) of one sync word, first transmitted first."""
+    pats = SYNC_SETS[sync_set_id(sync_set)]["patterns"]
+    if not 0 <= int(idx) < len(pats):
+        raise ValueError(f"pattern {idx} out of range")
+    word = pats[int(idx)][1]
+    return np.array([_SYNC_DIBIT[(word >> (46 - 2 * i)) & 3] for i in range(SYNC_SYMBOLS)],
+                    dtype=np.int8)
+
+
+def dmr_sync_pattern_name(sync_set, idx) -> str:
+    pats = SYNC_SETS[sync_set_id(sync_set)]["patterns"]
+    if not 0 <= int(idx) < len(pats):
+        raise ValueError(f"pattern {idx} out of range")
+    return pats[int(idx)][0]
+
+
+def dmr_sync_pattern_info(sync_set, idx) -> dict:
+    """name / source / kind / slot for one pattern (the tags a hit carries)."""
+    name, _, source, kind, slot = SYNC_SETS[sync_set_id(sync_set)]["patterns"][int(idx)]
+    return {"name": name, "source": source, "kind": kind, "slot": slot}
+
+
+def _sync_mask(sync_set, patterns) -> int:
+    """None -> every pattern; an int -> a bitmask as given; else an iterable
+    of indices or names."""
+    n = dmr_sync_patterns(sync_set)
+    full = (1 << n) - 1
+    if patterns is None:
+        return full
+    if isinstance(patterns, (int, np.integer)):
+        return int(patterns) & full
+    names = [p[0].lower() for p in SYNC_SETS[sync_set_id(sync_set)]["patterns"]]
+    mask = 0
+    for p in patterns:
+        if isinstance(p, str):
+            try:
+                mask |= 1 << names.index(p.strip().lower())
+            except ValueError:
+                raise ValueError(f"unknown pattern {p!r}; the set has {names}") from None
+        else:
+            if not 0 <= int(p) < n:
+                raise ValueError(f"pattern {p} out of range")
+            mask |= 1 << int(p)
+    return mask
+
+
+def _sync_rrc(u: float, alpha: float) -> float:
+    """Root-raised-cosine impulse response at u symbols (peak 1 - a + 4a/pi)."""
+    if u == 0.0:
+        return 1.0 - alpha + 4.0 * alpha / np.pi
+    if alpha > 0.0 and abs(1.0 - 16.0 * alpha * alpha * u * u) < 1e-9:
+        q = np.pi / (4.0 * alpha)
+        return (alpha / np.sqrt(2.0)) * ((1.0 + 2.0 / np.pi) * np.sin(q)
+                                         + (1.0 - 2.0 / np.pi) * np.cos(q))
+    num = np.sin(np.pi * u * (1.0 - alpha)) + 4.0 * alpha * u * np.cos(np.pi * u * (1.0 + alpha))
+    den = np.pi * u * (1.0 - 16.0 * alpha * alpha * u * u)
+    return num / den
+
+
+def _sync_pulse_table(alpha: float):
+    """Running integral of the frequency pulse on u = -4 .. +4 in 1/64-symbol
+    steps (trapezoid), normalised to a total of exactly 1. None = rectangle."""
+    if alpha < 0.0:
+        return None
+    n = 2 * SYNC_PULSE_SPAN * SYNC_PULSE_RES
+    du = 1.0 / SYNC_PULSE_RES
+    h = [_sync_rrc(-SYNC_PULSE_SPAN + k * du, alpha) for k in range(n + 1)]
+    g = np.zeros(n + 1)
+    acc = 0.0
+    for k in range(1, n + 1):
+        acc += 0.5 * (h[k - 1] + h[k]) * du
+        g[k] = acc
+    return g / g[n]
+
+
+def _sync_cum(tab, u: np.ndarray) -> np.ndarray:
+    """G(u): the pulse's running integral, 0 before it and 1 after it."""
+    u = np.asarray(u, dtype=np.float64)
+    if tab is None:
+        return np.clip(u + 0.5, 0.0, 1.0)
+    span = float(SYNC_PULSE_SPAN)
+    out = np.where(u >= span, 1.0, 0.0)
+    inside = (u > -span) & (u < span)
+    x = (u[inside] + span) * SYNC_PULSE_RES
+    k = np.floor(x).astype(np.int64)
+    k = np.minimum(k, tab.size - 2)
+    f = x - k
+    out[inside] = tab[k] + f * (tab[k + 1] - tab[k])
+    return out
+
+
+def _sync_alpha(sync_set, alpha) -> float:
+    if alpha is None or (isinstance(alpha, float) and np.isnan(alpha)):
+        return float(SYNC_SETS[sync_set_id(sync_set)]["alpha"])
+    return float(alpha)
+
+
+def _sync_window(sample_rate: float) -> int:
+    return int(np.floor(SYNC_SYMBOLS * sample_rate / SYNC_RATE + 0.5))
+
+
+def _sync_phase(sym, dev_hz, tab, u) -> np.ndarray:
+    """2*pi*(dev/R)*sum_m (a_m/3)*G(u - m - 1/2), at every u."""
+    u = np.asarray(u, dtype=np.float64)
+    acc = np.zeros(u.shape)
+    for m in range(len(sym)):                       # ascending m, as the C sums
+        acc += (float(sym[m]) / 3.0) * _sync_cum(tab, u - m - 0.5)
+    return 2.0 * np.pi * (dev_hz / SYNC_RATE) * acc
+
+
+def sync_reference(sync_set, idx, sample_rate: float, alpha=None, invert: bool = False) -> np.ndarray:
+    """The reference waveform of one sync word at `sample_rate`: L unit-modulus
+    complex samples, phase zero at the window centre. Twin of
+    atkdsp_dmr_sync_reference."""
+    sid = sync_set_id(sync_set)
+    a = _sync_alpha(sid, alpha)
+    sym = dmr_sync_pattern(sid, idx)
+    sps = float(sample_rate) / SYNC_RATE
+    L = _sync_window(sample_rate)
+    tab = _sync_pulse_table(a)
+    dev = SYNC_SETS[sid]["dev_hz"]
+    u = (np.arange(L) + 0.5) / sps
+    ph = _sync_phase(sym, dev, tab, u) - _sync_phase(sym, dev, tab, np.array([L / (2.0 * sps)]))[0]
+    r = np.exp(1j * ph)
+    return np.conj(r) if invert else r
+
+
+def sync_segments(sample_rate: float) -> np.ndarray:
+    """Symbol boundaries in the window: 25 indices, segment m = [b_m, b_m+1)."""
+    sps = float(sample_rate) / SYNC_RATE
+    L = _sync_window(sample_rate)
+    b = [min(L, max(0, int(np.ceil(m * sps - 0.5)))) for m in range(SYNC_SYMBOLS)]
+    b.append(L)
+    return np.array(b, dtype=np.int64)
+
+
+def sync_build_burst(sync_set, idx, sample_rate: float, payload=None, rng=None,
+                     alpha=None, cfo_hz: float = 0.0, phase: float = 0.0,
+                     invert: bool = False):
+    """A synthetic burst for tests and simulation: 54 payload symbols, the sync
+    word, 54 more (DMR's 132-symbol burst, sync in the middle), shaped and
+    frequency-modulated exactly as the reference is. Returns (iq complex64,
+    window_start) — the index the correlator should report as `start` (exact
+    when 54*sps is an integer)."""
+    sid = sync_set_id(sync_set)
+    a = _sync_alpha(sid, alpha)
+    sync = dmr_sync_pattern(sid, idx).astype(np.float64)
+    if payload is None:
+        rng = np.random.default_rng(0) if rng is None else rng
+        payload = rng.choice(np.array([3, 1, -1, -3]), size=108)
+    payload = np.asarray(payload, dtype=np.float64)
+    half = payload.size // 2
+    sym = np.concatenate([payload[:half], sync, payload[half:]])
+    sps = float(sample_rate) / SYNC_RATE
+    n = int(np.floor(sym.size * sps + 0.5))
+    tab = _sync_pulse_table(a)
+    dev = SYNC_SETS[sid]["dev_hz"]
+    u = (np.arange(n) + 0.5) / sps
+    ph = _sync_phase(sym, dev, tab, u)
+    if invert:
+        ph = -ph
+    t = np.arange(n) / float(sample_rate)
+    iq = np.exp(1j * (ph + 2.0 * np.pi * cfo_hz * t + phase))
+    return iq.astype(np.complex64), int(np.floor(half * sps + 0.5))
+
+
+def _sync_symbol_errors(w, seg, sym, cfo_hz, fs, invert) -> int:
+    """How many of the 24 sync symbols have the wrong frequency SIGN, measured
+    DSD-style from the phase advance inside each symbol (sum over channels of
+    x[i] * conj(x[i-1]), carrier offset removed). The channels' phases cancel in
+    the product, so this needs no bearing. A true sync reads 0 down to a few dB
+    SNR; a partial match in payload reads several."""
+    rot = np.exp(-2j * np.pi * cfo_hz / fs)
+    d = w[:, 1:] * np.conj(w[:, :-1])                  # d[:, i-1] is the step into sample i
+    errors = 0
+    for m in range(SYNC_SYMBOLS):
+        acc = np.sum(d[:, seg[m]:seg[m + 1] - 1]) * rot if seg[m + 1] - seg[m] > 1 else 0j
+        # the pairs (i-1, i) for i in (b_m, b_m+1): both samples inside the symbol
+        want = 1 if sym[m] > 0 else -1
+        if invert:
+            want = -want
+        got = 1 if acc.imag > 0 else (-1 if acc.imag < 0 else 0)
+        errors += got != want
+    return int(errors)
+
+
+def sync_default_threshold(n_channels: int) -> float:
+    """The default score threshold for n channels: the level that pure noise in
+    a 12.5 kHz channel crosses about once in five minutes (and never with a
+    confirmed hit). Measured 2026-10-25 on 4-5 minutes of filtered noise each:
+    one channel 0.33, two 0.20, five 0.11 — the score is averaged across
+    channels, so noise tightens and the threshold can fall, which is what lets
+    the five-element Kraken detect syncs well below 0 dB per element. Between
+    and beyond the measured points: 0.33 * n^-0.68, then 0.08 * sqrt(8/n)
+    past eight channels (above the Gamma-tail model, on the safe side)."""
+    n = max(1, int(n_channels))
+    if n <= 8:
+        return round(float(0.33 * n ** -0.68), 3)
+    return round(float(0.08 * np.sqrt(8.0 / n)), 3)
+
+
+def _sync_parab(a, b, c) -> float:
+    """Vertex offset (-0.5..0.5) of the parabola through (-1,a), (0,b), (1,c);
+    0 when a side is missing or it is not a maximum."""
+    if a is None or c is None:
+        return 0.0
+    den = a - 2.0 * b + c
+    if not den < 0.0:
+        return 0.0
+    return float(min(0.5, max(-0.5, 0.5 * (a - c) / den)))
+
+
+class DmrSync:
+    """Streaming 4FSK sync correlator; twin of atkdsp.DmrSync (atkdsp.h §13).
+
+    Feed it phase-coherent channels — shape (N,) for one, (n_channels, N) for
+    several — at `sample_rate`, in blocks of any size. `process` returns the
+    syncs whose peaks are final (a peak is final once `guard` samples have
+    passed it; `flush` emits a pending one at the end of a stream or a one-shot
+    buffer), each a dict:
+
+      start    stream index of the window's first sample (the sync's leading
+               edge is at start + frac - 1/2)
+      frac     sub-sample timing refinement, -0.5 .. 0.5
+      cfo_hz   carrier offset, refined between bins
+      score    normalised correlation, 0..1, summed over channels
+      errors   sync symbols whose frequency SIGN reads wrong (0..24)
+      confirmed  errors <= SYNC_CONFIRM_ERRORS: the type label can be trusted
+      pattern  index in the set; name / source (BS, MS, direct) / kind / slot
+      amps     complex64 per channel: the sync's complex amplitude, phase at
+               the window centre. amps / amps[0] is the steering vector.
+
+    An unconfirmed hit inside an emitter's burst is a partial match in its
+    payload: the label is wrong, but it is still THAT emitter's signal, so its
+    amps are still its steering vector (at less SNR)."""
+
+    def __init__(self, sample_rate: float, n_channels: int = 1, sync_set=SYNC_DMR,
+                 patterns=None, cfo_span_hz: float = 1000.0, cfo_step_hz: float = 0.0,
+                 threshold=None, guard: int = 0, alpha=None, invert: bool = False):
+        sid = sync_set_id(sync_set)
+        fs = float(sample_rate)
+        if threshold is None:
+            threshold = sync_default_threshold(n_channels)
+        if not SYNC_FS_MIN <= fs <= SYNC_FS_MAX:
+            raise ValueError(f"sample_rate {fs} outside {SYNC_FS_MIN:.0f}..{SYNC_FS_MAX:.0f} Hz "
+                             f"(channelise to the 12.5 kHz channel first)")
+        if not 1 <= int(n_channels) <= SYNC_MAX_CHANNELS:
+            raise ValueError("n_channels 1..64")
+        mask = _sync_mask(sid, patterns)
+        if mask == 0:
+            raise ValueError("no patterns selected")
+        a = _sync_alpha(sid, alpha)
+        if a > 1.0:
+            raise ValueError("alpha <= 1 (negative = rectangular pulses)")
+        span = float(cfo_span_hz)
+        if not 0.0 <= span <= SYNC_SPAN_MAX:
+            raise ValueError("cfo_span_hz 0..5000")
+        step = float(cfo_step_hz)
+        if step < 0.0:
+            raise ValueError("cfo_step_hz >= 0 (0 = automatic)")
+        if step == 0.0:
+            step = 0.5 * SYNC_RATE / SYNC_SYMBOLS
+        kmax = int(np.ceil(span / step - 1e-9)) if span > 0.0 else 0
+        if 2 * kmax + 1 > SYNC_MAX_BINS:
+            raise ValueError("too many offset bins (cfo_span_hz / cfo_step_hz > 100)")
+        thr = float(threshold)
+        if not 0.0 < thr <= 1.0:
+            raise ValueError("threshold in (0, 1]")
+        L = _sync_window(fs)
+        g = int(guard) if int(guard) > 0 else int(np.floor(SYNC_GUARD_SYMBOLS * fs / SYNC_RATE + 0.5))
+        if g > 16 * L:
+            raise ValueError("guard <= 16 windows")
+        self.sync_set = sid
+        self.sample_rate = fs
+        self.n_channels = int(n_channels)
+        self.mask = mask
+        self.active = [p for p in range(dmr_sync_patterns(sid)) if mask >> p & 1]
+        self.alpha = a
+        self.invert = bool(invert)
+        self.L = L
+        self.cfo_step = step
+        self.kmax = kmax
+        self.n_cfo = 2 * kmax + 1
+        self.cfo_span = span
+        self.threshold = thr
+        self.guard = g
+        self.history = L + g + 2
+        self._ref = [sync_reference(sid, p, fs, a, invert) for p in range(dmr_sync_patterns(sid))]
+        self._seg = sync_segments(fs)
+        M = SYNC_SYMBOLS
+        tau = (self._seg[:-1] + self._seg[1:] - 1) / 2.0 - (L - 1) / 2.0
+        # bins -1 .. K: the outer two exist only so an edge hit can be refined
+        df = (np.arange(-1, self.n_cfo + 1) - kmax) * step
+        self._rot = np.exp(-2j * np.pi * df[:, None] * tau[None, :] / fs)       # (K+2, M)
+        P = len(self.active)
+        R = np.zeros((L, P * M), dtype=np.complex128)
+        for pa, p in enumerate(self.active):
+            cr = np.conj(self._ref[p])
+            for m in range(M):
+                R[self._seg[m]:self._seg[m + 1], pa * M + m] = cr[self._seg[m]:self._seg[m + 1]]
+        self._R = R
+        self.reset()
+
+    # -- state ---------------------------------------------------------------
+    def reset(self):
+        self._hist = np.zeros((self.n_channels, 0), dtype=np.complex64)
+        self._total = 0
+        self._cand = None          # (n_abs, score, active index, cfo bin)
+
+    def hits_max(self, n_in: int) -> int:
+        return int(n_in) // self.guard + 2
+
+    def reference(self, idx) -> np.ndarray:
+        return self._ref[int(idx)].astype(np.complex64)
+
+    def describe(self) -> str:
+        return _sync_describe(self)
+
+    # -- the arithmetic --------------------------------------------------------
+    def _scores(self, buf, e_lo, e_hi):
+        """Best (score, active*K + bin) for windows ending at e_lo .. e_hi-1."""
+        L, K, M = self.L, self.n_cfo, SYNC_SYMBOLS
+        P = len(self.active)
+        n = e_hi - e_lo
+        best = np.full(n, -1.0)
+        arg = np.zeros(n, dtype=np.int64)
+        step = 4096
+        for c0 in range(0, n, step):
+            c1 = min(n, c0 + step)
+            acc = np.zeros((c1 - c0, P, K))
+            E = np.zeros(c1 - c0)
+            for c in range(self.n_channels):
+                xc = buf[c].astype(np.complex128)
+                W = np.lib.stride_tricks.sliding_window_view(xc, L)[e_lo - L + 1 + c0:e_lo - L + 1 + c1]
+                parts = (W @ self._R).reshape(c1 - c0, P, M)
+                C = parts @ self._rot[1:-1].T                                   # (n, P, K)
+                acc += C.real ** 2 + C.imag ** 2
+                E += np.sum(W.real ** 2 + W.imag ** 2, axis=1)
+            ok = E > 1e-30
+            s = np.zeros_like(acc)
+            s[ok] = acc[ok] / (L * E[ok])[:, None, None]
+            flat = s.reshape(c1 - c0, P * K)
+            a = np.argmax(flat, axis=1)
+            b = flat[np.arange(c1 - c0), a]
+            b[~ok] = -1.0
+            best[c0:c1] = b
+            arg[c0:c1] = a
+        return best, arg
+
+    def _score_at(self, buf, e, pa, k) -> float:
+        L = self.L
+        w = buf[:, e - L + 1:e + 1].astype(np.complex128)
+        prod = w * np.conj(self._ref[self.active[pa]])[None, :]
+        parts = np.add.reduceat(prod, self._seg[:-1], axis=1)                   # (ch, M)
+        C = parts @ self._rot[k + 1]
+        E = float(np.sum(w.real ** 2 + w.imag ** 2))
+        if E <= 1e-30:
+            return 0.0
+        return float(np.sum(C.real ** 2 + C.imag ** 2) / (L * E))
+
+    def _exact(self, buf, e, ref):
+        """(amps, score) of the window ending at e against `ref` (conj(r) times
+        the refined derotation) — exact per-sample, no per-symbol phasors."""
+        L = self.L
+        w = buf[:, e - L + 1:e + 1].astype(np.complex128)
+        amps = (w * ref[None, :]).sum(axis=1) / L
+        E = float(np.sum(w.real ** 2 + w.imag ** 2))
+        score = float(L * np.sum(np.abs(amps) ** 2) / E) if E > 1e-30 else 0.0
+        return amps, score
+
+    def _emit(self, buf, base, cand) -> dict:
+        # The offset first (a parabola through the neighbouring bins), THEN the
+        # timing, from exact scores at that offset: for FSK a residual offset
+        # looks like a timing error, so the other order biases the timing.
+        n_abs, _, pa, k = cand
+        L, fs = self.L, self.sample_rate
+        e = n_abs - base
+        g0 = self._score_at(buf, e, pa, k)
+        gm = self._score_at(buf, e, pa, k - 1)          # bins -1 and K exist for this
+        gp = self._score_at(buf, e, pa, k + 1)
+        cfo = (k - self.kmax + _sync_parab(gm, g0, gp)) * self.cfo_step
+        p = self.active[pa]
+        i = np.arange(L)
+        ref = np.conj(self._ref[p]) * np.exp(-2j * np.pi * cfo * (i - (L - 1) / 2.0) / fs)
+        amps, score = self._exact(buf, e, ref)
+        sm = self._exact(buf, e - 1, ref)[1] if n_abs - 1 >= L - 1 else None
+        sp = self._exact(buf, e + 1, ref)[1] if e + 1 < buf.shape[1] else None
+        dt = _sync_parab(sm, score, sp)
+        w = buf[:, e - L + 1:e + 1].astype(np.complex128)
+        errors = _sync_symbol_errors(w, self._seg, dmr_sync_pattern(self.sync_set, p),
+                                     cfo, fs, self.invert)
+        hit = {"start": int(n_abs - L + 1), "frac": dt, "cfo_hz": float(cfo),
+               "score": score, "errors": errors,
+               "confirmed": errors <= SYNC_CONFIRM_ERRORS, "pattern": int(p)}
+        hit.update(dmr_sync_pattern_info(self.sync_set, p))
+        hit["amps"] = amps.astype(np.complex64)
+        return hit
+
+    def process(self, x) -> list:
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x[None, :]
+        if x.ndim != 2 or x.shape[0] != self.n_channels:
+            raise ValueError(f"expected shape ({self.n_channels}, N)")
+        x = x.astype(np.complex64)
+        N = x.shape[1]
+        hist_len = self._hist.shape[1]
+        buf = np.concatenate([self._hist, x], axis=1)
+        base = self._total - hist_len
+        best = np.full(N, -1.0)
+        arg = np.zeros(N, dtype=np.int64)
+        e_lo = max(self.L - 1, hist_len)
+        if e_lo < hist_len + N:
+            b, a = self._scores(buf, e_lo, hist_len + N)
+            best[e_lo - hist_len:] = b
+            arg[e_lo - hist_len:] = a
+        K, G = self.n_cfo, self.guard
+        hits = []
+        for j in np.flatnonzero(best >= self.threshold):
+            n = self._total + int(j)
+            if self._cand is not None and n - self._cand[0] >= G:
+                hits.append(self._emit(buf, base, self._cand))
+                self._cand = None
+            if self._cand is None or best[j] > self._cand[1]:
+                self._cand = (n, float(best[j]), int(arg[j]) // K, int(arg[j]) % K)
+        if self._cand is not None and N > 0 and (self._total + N - 1) - self._cand[0] >= G:
+            hits.append(self._emit(buf, base, self._cand))
+            self._cand = None
+        self._total += N
+        keep = min(self.history, buf.shape[1])
+        self._hist = buf[:, buf.shape[1] - keep:].copy()
+        return hits
+
+    def flush(self) -> list:
+        """Emit the pending candidate now, without waiting out its guard — for
+        the end of a stream or a one-shot buffer (a burst span from the ring).
+        The stream may continue afterwards; a later, better peak within the
+        guard is then reported as well."""
+        if self._cand is None:
+            return []
+        base = self._total - self._hist.shape[1]
+        hit = self._emit(self._hist, base, self._cand)
+        self._cand = None
+        return [hit]
+
+
+def _sync_describe(s) -> str:
+    """The same sentence atkdsp_dmr_sync_describe writes."""
+    pulse = "rect" if s.alpha < 0 else f"RRC a={s.alpha:.2f}"
+    return (f"{SYNC_SETS[s.sync_set]['name']} sync: {s.sample_rate:.0f} Hz "
+            f"({s.sample_rate / SYNC_RATE:.2f} sps), {s.L}-sample window, "
+            f"{len(s.active)} pattern{'s' if len(s.active) != 1 else ''}, "
+            f"CFO +-{s.kmax * s.cfo_step:.0f} Hz in {s.n_cfo} bin{'s' if s.n_cfo != 1 else ''} "
+            f"of {s.cfo_step:.0f} Hz, threshold {s.threshold:.2f}, guard {s.guard}, {pulse}, "
+            f"{s.n_channels} channel{'s' if s.n_channels != 1 else ''}"
+            f"{', inverted' if s.invert else ''}")

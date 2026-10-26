@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.12.0"
+    assert atkdsp.version() == "0.13.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -73,7 +73,9 @@ def test_every_bound_symbol_exists_in_this_library():
     lib = atkdsp.load()
     for name in ("atkdsp_unpack", "atkdsp_unpack_dc", "atkdsp_nco_mix",
                  "atkdsp_fir_process", "atkdsp_ddc_process",
-                 "atkdsp_spectrum_reduce", "atkdsp_design_lowpass"):
+                 "atkdsp_spectrum_reduce", "atkdsp_design_lowpass",
+                 "atkdsp_dmr_sync_create", "atkdsp_dmr_sync_process",
+                 "atkdsp_dmr_sync_flush"):
         assert getattr(lib, name, None) is not None, f"{name} is not in the library"
 
 
@@ -1720,3 +1722,386 @@ def test_dc_track_recovers_off_centre_slicing():
     fixed_ber = ber((fixed > 0).astype(int))
     assert naive_ber > 0.30, f"expected the naive slicer to fail (got {naive_ber:.3f})"
     assert fixed_ber < 0.02, f"dc_track should recover it (got {fixed_ber:.3f})"
+
+
+
+# ---- 13. DMR / P25 sync correlator ---------------------------------------------
+# The sync words as an INDEPENDENT source writes them: dsd-neo's
+# include/dsd-neo/core/sync_patterns.h (and dsd-fme's dsd.h), dibit strings
+# where '1' is +3 and '3' is -3. The library and the twin both hold ETSI's hex
+# words; this is the check that the hex was copied right — the lesson of the
+# LTE MIB (both sides agreed with each other and not with the spec).
+DSD_SYNC = {
+    (0, 0): "131111333113313313113313",   # DMR_BS_VOICE_SYNC
+    (0, 1): "313333111331131131331131",   # DMR_BS_DATA_SYNC
+    (0, 2): "133313311131311113313331",   # DMR_MS_VOICE_SYNC
+    (0, 3): "311131133313133331131113",   # DMR_MS_DATA_SYNC
+    (0, 4): "131331111133133133311313",   # DMR_MS_RC_SYNC (0x77D55F7DFD77)
+    (0, 5): "113111131333131311133333",   # DMR_DIRECT_MODE_TS1_VOICE_SYNC
+    (0, 6): "331333313111313133311111",   # DMR_DIRECT_MODE_TS1_DATA_SYNC
+    (0, 7): "133133333111331111311133",   # DMR_DIRECT_MODE_TS2_VOICE_SYNC
+    (0, 8): "311311111333113333133311",   # DMR_DIRECT_MODE_TS2_DATA_SYNC
+    (1, 0): "111113113311333313133333",   # P25P1_SYNC
+}
+_SYM_TO_DIBIT = {3: "1", 1: "0", -1: "2", -3: "3"}
+
+
+def _chan_filter(fs):
+    return lowpass(6000.0, fs, 127)
+
+
+def _noise_for(n, snr_db, h, shape=()):
+    """Complex white noise scaled so that AFTER filter h its power is
+    10^(-snr/10) (the bursts are unit power): SNR in the channel bandwidth."""
+    w = (rng.standard_normal(shape + (n,)) + 1j * rng.standard_normal(shape + (n,))) / np.sqrt(2)
+    return w * (10 ** (-snr_db / 20) / np.sqrt(np.sum(h.astype(np.float64) ** 2)))
+
+
+def _filt(x, h):
+    x = np.atleast_2d(x)
+    return np.stack([np.convolve(r, h, mode="same") for r in x]).astype(np.complex64)
+
+
+def _dmr_stream(fs, plan, sync_set=0, n_ch=1, steer=None, gap=300, tail=1200):
+    """Bursts back to back with `gap` samples of silence before each. `plan` is
+    a list of (pattern, cfo_hz). Returns (x (n_ch, N) complex128, truth
+    [(start, pattern)])."""
+    parts, truth, pos = [], [], 0
+    for p, cfo in plan:
+        iq, st = ref.sync_build_burst(sync_set, p, fs, rng=rng, cfo_hz=cfo,
+                                      phase=float(rng.uniform(0, 2 * np.pi)))
+        parts += [np.zeros(gap, np.complex128), iq.astype(np.complex128)]
+        truth.append((pos + gap + st, p))
+        pos += gap + iq.size
+    x = np.concatenate(parts + [np.zeros(tail, np.complex128)])
+    a = np.ones(n_ch) if steer is None else np.asarray(steer)
+    return np.outer(a, x), truth
+
+
+def _assert_hits_agree(c, t):
+    assert len(c) == len(t), (len(c), len(t))
+    for a, b in zip(c, t):
+        assert (a["start"], a["pattern"], a["errors"]) == (b["start"], b["pattern"], b["errors"])
+        assert a["name"] == b["name"] and a["source"] == b["source"] and a["kind"] == b["kind"]
+        assert abs(a["score"] - b["score"]) < 2e-4
+        assert abs(a["frac"] - b["frac"]) < 2e-3
+        assert abs(a["cfo_hz"] - b["cfo_hz"]) < 0.05
+        assert np.max(np.abs(a["amps"] - b["amps"])) < 1e-4 * max(1.0, float(np.max(np.abs(b["amps"]))))
+
+
+def test_dmr_sync_patterns_match_the_twin_and_an_independent_source():
+    for sid, n in ((0, 9), (1, 1)):
+        assert atkdsp.dmr_sync_patterns(sid) == ref.dmr_sync_patterns(sid) == n
+        for p in range(n):
+            c = atkdsp.dmr_sync_pattern(sid, p)
+            assert np.array_equal(c, ref.dmr_sync_pattern(sid, p))
+            assert "".join(_SYM_TO_DIBIT[int(v)] for v in c) == DSD_SYNC[(sid, p)]
+            assert atkdsp.dmr_sync_pattern_name(sid, p) == ref.dmr_sync_pattern_name(sid, p)
+            assert set(int(v) for v in c) <= {3, -3}           # outer symbols only
+
+
+def test_dmr_sync_voice_and_data_words_are_frequency_mirrors():
+    """Why a spectrally inverted stream swaps voice <-> data but never BS <-> MS:
+    each data word is its voice word with every symbol negated."""
+    for v, d in ((0, 1), (2, 3), (5, 6), (7, 8)):
+        assert np.array_equal(ref.dmr_sync_pattern(0, v), -ref.dmr_sync_pattern(0, d))
+
+
+@pytest.mark.parametrize("fs,alpha,invert", [(48000, None, False), (24000, None, True),
+                                             (50000, 0.35, False), (9600, -1.0, False),
+                                             (384000, None, False)])
+def test_dmr_sync_reference_matches_its_twin(fs, alpha, invert):
+    c = atkdsp.DmrSync(fs, alpha=alpha, invert=invert)
+    for p in range(9):
+        r = ref.sync_reference(0, p, fs, alpha, invert)
+        assert r.size == c.L == int(np.floor(24 * fs / 4800 + 0.5))
+        np.testing.assert_allclose(c.reference(p), r, atol=2e-6)
+        np.testing.assert_allclose(np.abs(r), 1.0, atol=1e-12)
+
+
+def test_dmr_sync_describe_matches_its_twin():
+    for kw in ({}, {"n_channels": 5, "sync_set": "p25", "invert": True},
+               {"sample_rate": 24000.0, "patterns": ["BS voice", "MS voice"], "alpha": -1.0,
+                "cfo_span_hz": 0.0, "guard": 500, "threshold": 0.45}):
+        args = dict({"sample_rate": 48000.0}, **kw)
+        assert atkdsp.DmrSync(**args).describe() == ref.DmrSync(**args).describe()
+
+
+@pytest.mark.parametrize("fs,n_ch", [(48000, 1), (24000, 5)])
+def test_dmr_sync_matches_its_twin_on_a_noisy_stream(fs, n_ch):
+    h = _chan_filter(fs)
+    plan = [(p, float(rng.uniform(-700, 700))) for p in rng.permutation(9)]
+    steer = np.exp(1j * rng.uniform(0, 2 * np.pi, n_ch))
+    x, truth = _dmr_stream(fs, plan, n_ch=n_ch, steer=steer)
+    y = _filt(x + _noise_for(x.shape[1], 6.0, h, (n_ch,)), h)
+    c = atkdsp.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+    t = ref.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+    hc = c.process(y) + c.flush()
+    ht = t.process(y) + t.flush()
+    _assert_hits_agree(hc, ht)
+    found = {(hh["start"], hh["pattern"]) for hh in hc if hh["confirmed"]}
+    for st, p in truth:
+        assert any(abs(a - st) <= 1 and q == p for a, q in found), (st, p)
+
+
+def test_dmr_sync_is_bit_identical_however_it_is_chunked():
+    fs, n_ch = 48000, 3
+    h = _chan_filter(fs)
+    x, _ = _dmr_stream(fs, [(0, 300.0), (3, -450.0), (6, 0.0), (8, 820.0)], n_ch=n_ch,
+                       steer=np.exp(1j * np.array([0.0, 1.0, 2.5])))
+    y = _filt(x + _noise_for(x.shape[1], 3.0, h, (n_ch,)), h)
+    whole = atkdsp.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+    want = whole.process(y) + whole.flush()
+    assert len(want) >= 4
+    for sizes in ([1, 999, 4096, 7, 5000, 3, 4097], [8192] * 4, [239, 240, 241, 660, 661]):
+        d = atkdsp.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+        got, i = [], 0
+        for b in blocks(np.arange(y.shape[1]), sizes):
+            got += d.process(y[:, b[0]:b[-1] + 1] if b.size else y[:, :0])
+        got += d.flush()
+        assert len(got) == len(want)
+        for a, b in zip(got, want):
+            assert {k: v for k, v in a.items() if k != "amps"} == \
+                   {k: v for k, v in b.items() if k != "amps"}
+            assert np.array_equal(a["amps"], b["amps"])
+    # and the twin agrees with ITSELF across chunking, to its precision
+    t1 = ref.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+    t2 = ref.DmrSync(fs, n_channels=n_ch, threshold=0.2)
+    a1 = t1.process(y) + t1.flush()
+    a2 = []
+    for b in blocks(np.arange(y.shape[1]), [1, 999, 4096, 7, 5000]):
+        a2 += t2.process(y[:, b[0]:b[-1] + 1] if b.size else y[:, :0])
+    a2 += t2.flush()
+    _assert_hits_agree(a2, a1)
+
+
+@pytest.mark.parametrize("sid,p", [(0, p) for p in range(9)] + [(1, 0)])
+def test_dmr_sync_finds_and_labels_every_word_clean(sid, p):
+    fs = 48000
+    x, truth = _dmr_stream(fs, [(p, 0.0)], sync_set=sid)
+    d = atkdsp.DmrSync(fs, sync_set=sid)
+    hits = d.process(x[0]) + d.flush()
+    best = max(hits, key=lambda q: q["score"])
+    assert (best["start"], best["pattern"]) == truth[0]
+    assert abs(best["frac"]) < 0.1 and abs(best["cfo_hz"]) < 5.0
+    assert best["errors"] == 0 and best["confirmed"] and best["score"] > 0.97
+    assert abs(abs(best["amps"][0]) - 1.0) < 0.02
+
+
+@pytest.mark.parametrize("cfo", [-950.0, -333.0, 0.0, 61.0, 512.0, 990.0])
+def test_dmr_sync_measures_the_carrier_offset(cfo):
+    fs = 48000
+    x, truth = _dmr_stream(fs, [(2, cfo)])
+    d = atkdsp.DmrSync(fs)
+    hits = d.process(x[0]) + d.flush()
+    best = max(hits, key=lambda q: q["score"])
+    assert (best["start"], best["pattern"]) == truth[0]
+    assert abs(best["cfo_hz"] - cfo) < 10.0
+    assert abs(best["frac"]) < 0.2 and best["score"] > 0.95
+
+
+def test_dmr_sync_inverted_stream_with_and_without_the_flag():
+    """A spectrally inverted receiver (I/Q swapped) negates every frequency:
+    with ATKDSP_SYNC_INVERT the label is right; without it voice and data
+    swap but the path tag (BS / MS / slot) survives — so a path tag is safe
+    even when nobody knew the stream was inverted."""
+    fs = 48000
+    x, truth = _dmr_stream(fs, [(0, 120.0), (2, -200.0), (5, 0.0)])
+    xi = np.conj(x[0])
+    right = atkdsp.DmrSync(fs, invert=True)
+    hr = [q for q in right.process(xi) + right.flush() if q["confirmed"]]
+    assert [(q["start"], q["pattern"]) for q in hr] == truth
+    plain = atkdsp.DmrSync(fs)
+    hp = [q for q in plain.process(xi) + plain.flush() if q["confirmed"]]
+    assert [q["pattern"] for q in hp] == [1, 3, 6]               # voice -> data
+    assert [q["source"] for q in hp] == ["BS", "MS", "direct"]
+    for q, want in zip(hr, (-120.0, 200.0, 0.0)):                 # offsets negate too
+        assert abs(q["cfo_hz"] - want) < 10.0
+
+
+def test_dmr_sync_amplitudes_are_the_steering_vector():
+    fs, n_ch = 24000, 5
+    a = 0.7 * np.exp(1j * np.array([0.0, 0.9, -2.1, 3.0, 1.7])) * np.array([1, 0.8, 1.1, 0.9, 1.2])
+    x, truth = _dmr_stream(fs, [(3, 250.0)], n_ch=n_ch, steer=a)
+    d = atkdsp.DmrSync(fs, n_channels=n_ch)
+    hits = d.process(x) + d.flush()
+    best = max(hits, key=lambda q: q["score"])
+    assert (best["start"], best["pattern"]) == truth[0]
+    v = best["amps"] / best["amps"][0]
+    np.testing.assert_allclose(v, a / a[0], atol=2e-3)
+
+
+def test_dmr_sync_score_does_not_move_with_gain():
+    fs = 48000
+    h = _chan_filter(fs)
+    x, _ = _dmr_stream(fs, [(1, 0.0), (4, 300.0)])
+    y = _filt(x + _noise_for(x.shape[1], 3.0, h, (1,)), h)
+    out = []
+    for g in (1e-4, 1.0, 1e3):
+        d = atkdsp.DmrSync(fs, threshold=0.2)
+        out.append(d.process(y * np.float32(g)) + d.flush())
+    for hs in out[1:]:
+        assert [(q["start"], q["pattern"], q["errors"]) for q in hs] == \
+               [(q["start"], q["pattern"], q["errors"]) for q in out[0]]
+        for q, r in zip(hs, out[0]):
+            assert abs(q["score"] - r["score"]) < 1e-4
+
+
+def test_dmr_sync_flush_reports_the_pending_peak():
+    fs = 48000
+    iq, st = ref.sync_build_burst(0, 0, fs, rng=rng)
+    d = atkdsp.DmrSync(fs)
+    assert d.process(iq) == []                  # the guard has not passed yet
+    hits = d.flush()
+    assert len(hits) == 1 and hits[0]["start"] == st and hits[0]["name"] == "BS voice"
+    assert d.flush() == []
+
+
+def test_dmr_sync_partial_matches_in_voice_bursts_are_never_confirmed():
+    """A repeater's slot carrying a voice superframe sends the sync in burst A
+    only; B-F carry voice and EMB where the sync would be, and that payload
+    partially matches other words. Every CONFIRMED hit must be a real sync."""
+    fs = 48000
+    sps = 10
+    h = _chan_filter(fs)
+    tab = ref._sync_pulse_table(0.2)
+    parts, truth, pos = [], [], 0
+    for f in range(18):
+        slot = f % 2
+        if slot == 0 and (f // 2) % 6 != 0:     # voice B-F: no sync word
+            sym = rng.choice(np.array([3.0, 1.0, -1.0, -3.0]), size=132)
+            u = (np.arange(132 * sps) + 0.5) / sps
+            iq = np.exp(1j * ref._sync_phase(sym, 1944.0, tab, u))
+            st = None
+        else:
+            iq, st = ref.sync_build_burst(0, 0 if slot == 0 else 1, fs, rng=rng)
+        cach = np.exp(1j * rng.uniform(0, 2 * np.pi, 12 * sps))
+        parts += [cach, iq]
+        if st is not None:
+            truth.append((pos + 12 * sps + st, 0 if slot == 0 else 1))
+        pos += 12 * sps + iq.size
+    x = np.concatenate(parts + [np.zeros(1000)])
+    for snr in (30.0, 6.0):
+        y = _filt(x + _noise_for(x.size, snr, h), h)
+        d = atkdsp.DmrSync(fs, threshold=0.2)
+        hits = d.process(y) + d.flush()
+        conf = [(q["start"], q["pattern"]) for q in hits if q["confirmed"]]
+        for st, p in conf:
+            assert any(abs(st - a) <= 1 and p == b for a, b in truth), (snr, st, p)
+        assert len(conf) >= len(truth) - (0 if snr > 10 else 1)
+
+
+def _uca(n=5, spacing=0.5):
+    r = spacing / (2 * np.sin(np.pi / n))
+    phi = 2 * np.pi * np.arange(n) / n
+    return lambda th: np.exp(1j * 2 * np.pi * r * np.cos(np.deg2rad(th) - phi))
+
+
+def test_dmr_sync_pilot_bearing_survives_a_co_channel_emitter():
+    """ATK KRAKEN_DF_PLAN §6.5 / CUED_DF_PLAN's acceptance: the planted bearing
+    at -3 dB per element. Made harder on purpose: a second 4FSK emitter on
+    the same channel, 40-140 degrees away and 3 dB STRONGER (0 dB per element),
+    sending payload (no sync) at the same time. A covariance (energy) bearing
+    locks onto the stronger one; the pilot bearing — Bartlett on amps — is the
+    sync's emitter's. Measured when written: pilot median 2.2 deg, covariance
+    median ~80."""
+    fs, n_ch, sps = 48000, 5, 10
+    h = _chan_filter(fs)
+    steer = _uca(n_ch)
+    grid = np.arange(0.0, 360.0, 0.25)
+    A = np.stack([steer(t) for t in grid])
+    tab = ref._sync_pulse_table(0.2)
+
+    def err(a, b):
+        return abs((a - b + 180.0) % 360.0 - 180.0)
+
+    e_pilot, e_cov = [], []
+    for trial in range(16):
+        th = float(rng.uniform(0, 360))
+        thi = (th + float(rng.uniform(40, 140)) * rng.choice([-1, 1])) % 360
+        p = int(rng.integers(0, 9))
+        iq, st = ref.sync_build_burst(0, p, fs, rng=rng, cfo_hz=float(rng.uniform(-400, 400)),
+                                      phase=float(rng.uniform(0, 2 * np.pi)))
+        sym = rng.choice(np.array([3.0, 1.0, -1.0, -3.0]), size=132)
+        u = (np.arange(iq.size) + 0.5) / sps
+        jam = np.exp(1j * (ref._sync_phase(sym, 1944.0, tab, u)
+                           + 2 * np.pi * float(rng.uniform(-300, 300)) * np.arange(iq.size) / fs))
+        sig = 10 ** (-3 / 20)                                # -3 dB per element
+        X = np.outer(steer(th), iq) * sig + np.outer(steer(thi), jam)   # jammer 0 dB
+        Y = _filt(X + _noise_for(iq.size, 0.0, h, (n_ch,)), h)
+        d = atkdsp.DmrSync(fs, n_channels=n_ch, threshold=0.05, guard=1320)
+        hits = [q for q in d.process(Y) + d.flush() if abs(q["start"] - st) <= 3]
+        if not hits:
+            continue
+        v = max(hits, key=lambda q: q["score"])["amps"].astype(np.complex128)
+        e_pilot.append(err(grid[np.argmax(np.abs(A.conj() @ v))], th))
+        R = Y.astype(np.complex128) @ Y.astype(np.complex128).conj().T
+        e_cov.append(err(grid[np.argmax(np.real(np.einsum("gi,ij,gj->g", A.conj(), R, A)))], th))
+    assert len(e_pilot) >= 13
+    assert np.median(e_pilot) < 4.0, e_pilot
+    assert np.median(e_cov) > 20.0, e_cov                    # why the pilot exists
+
+
+def test_dmr_sync_is_quiet_on_noise_at_the_default_threshold():
+    """Ten seconds of noise in a 12.5 kHz channel, one channel and five: no
+    confirmed hit. (The default thresholds were set from minutes of this;
+    see the twin's sync_default_threshold.)"""
+    fs = 24000
+    h = _chan_filter(fs)
+    for n_ch in (1, 5):
+        d = atkdsp.DmrSync(fs, n_channels=n_ch)
+        y = _filt(_noise_for(fs * 10, 0.0, h, (n_ch,)), h)
+        hits = d.process(y) + d.flush()
+        assert [q for q in hits if q["confirmed"]] == []
+        assert len(hits) <= 1
+
+
+def test_dmr_sync_default_threshold_falls_with_more_channels():
+    t = [ref.sync_default_threshold(n) for n in (1, 2, 3, 4, 5, 8, 16, 64)]
+    assert all(a > b for a, b in zip(t, t[1:]))
+    assert atkdsp.DmrSync(48000).threshold == ref.DmrSync(48000).threshold == t[0]
+    assert atkdsp.DmrSync(48000, n_channels=5).threshold == ref.sync_default_threshold(5)
+
+
+def test_dmr_sync_masks_patterns():
+    fs = 48000
+    x, truth = _dmr_stream(fs, [(0, 0.0), (2, 0.0), (3, 0.0)])
+    d = atkdsp.DmrSync(fs, patterns=["MS voice", "MS data"])
+    assert d.active == [2, 3]
+    got = [(q["start"], q["pattern"]) for q in d.process(x[0]) + d.flush() if q["confirmed"]]
+    assert got == truth[1:]
+
+
+def test_dmr_sync_refuses_what_it_cannot_do():
+    lib = atkdsp.load()
+    nan = float("nan")
+    bad = [(0, 9599.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0),     # fs too low
+           (0, 400000.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0),   # fs too high
+           (2, 48000.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0),    # no such set
+           (0, 48000.0, 0, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0),    # no channels
+           (0, 48000.0, 65, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0),   # too many
+           (0, 48000.0, 1, 0x000, 1000.0, 0.0, 0.3, 0, nan, 0),    # no pattern
+           (1, 48000.0, 1, 0x1FE, 1000.0, 0.0, 0.3, 0, nan, 0),    # P25 has only bit 0
+           (0, 48000.0, 1, 0x1FF, 6000.0, 0.0, 0.3, 0, nan, 0),    # span
+           (0, 48000.0, 1, 0x1FF, 1000.0, 5.0, 0.3, 0, nan, 0),    # 401 bins
+           (0, 48000.0, 1, 0x1FF, 1000.0, 0.0, 0.0, 0, nan, 0),    # threshold 0
+           (0, 48000.0, 1, 0x1FF, 1000.0, 0.0, 1.5, 0, nan, 0),    # threshold > 1
+           (0, 48000.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 4000, nan, 0), # guard > 16 windows
+           (0, 48000.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 0, 1.5, 0)]    # alpha > 1
+    for args in bad:
+        assert not lib.atkdsp_dmr_sync_create(*args), args
+        with pytest.raises((ValueError, atkdsp.AtkDspError)):
+            ref.DmrSync(sync_set=args[0], sample_rate=args[1], n_channels=args[2],
+                        patterns=args[3], cfo_span_hz=args[4], cfo_step_hz=args[5],
+                        threshold=args[6], guard=args[7],
+                        alpha=None if np.isnan(args[8]) else args[8])
+    h = lib.atkdsp_dmr_sync_create(0, 48000.0, 1, 0x1FF, 1000.0, 0.0, 0.3, 0, nan, 0)
+    try:
+        x = np.zeros(10000, np.complex64)
+        need = lib.atkdsp_dmr_sync_hits_max(h, x.size)
+        buf = (atkdsp._DmrSyncHit * need)()
+        rc = lib.atkdsp_dmr_sync_process(h, x.ctypes.data_as(atkdsp.C.POINTER(atkdsp._Cf32)),
+                                         x.size, x.size, buf, None, need - 1)
+        assert rc == -3                                          # ATKDSP_E_CAP, nothing consumed
+    finally:
+        lib.atkdsp_dmr_sync_destroy(h)

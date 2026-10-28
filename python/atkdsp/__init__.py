@@ -47,7 +47,8 @@ __all__ = [
 #: 13 adds dc_track + agc (adaptive DC removal + AGC) for off-centre RF (§12).
 #: 14 adds the DMR / P25 sync correlator, DmrSync (§13).
 #: 15 adds the bitstream engine (§14-17): bit primitives, scramblers, FEC, CRC.
-ABI_VERSION = 15
+#: 16 adds naming the code (§18): rank scan, block / conv / RS / interleaver id.
+ABI_VERSION = 16
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -2134,3 +2135,155 @@ __all__ += ["BITS_INVERTED", "BITS_REVERSED", "SYNC_MAXBITS", "SYNC_REPETITIVE",
             "descramble_mult", "scramble_mult", "scrambler_search", "conv_encode", "Viterbi",
             "RS", "BCH", "BlockCode", "SMALL_CODES", "cyclic_generator_matrix",
             "extend_with_parity", "crc", "crc_catalog", "crc_spec", "crc_recover", "ascii_bits"]
+
+
+# ============================================================================
+# §18 NAMING THE CODE — rank scan, block / convolutional / RS / interleaver
+# recognition. Same names and returns as reference.py §18 (dicts), so ATK's
+# fallback is a drop-in. Each result carries its evidence (log10_pfa,
+# deficiency, decode -> re-encode agreement); "no code found" is a result.
+# ============================================================================
+_id_log = _logging.getLogger("atkdsp.coderec")
+
+
+class _BlockId(C.Structure):
+    _fields_ = [("n", C.c_int), ("k", C.c_int), ("offset", C.c_int), ("deficiency", C.c_int),
+                ("cyclic", C.c_int), ("extended", C.c_int), ("dmin", C.c_int),
+                ("rows_used", C.c_int), ("robust", C.c_int), ("shortened", C.c_int),
+                ("log10_pfa", C.c_double), ("ber_est", C.c_double), ("agreement", C.c_double),
+                ("valid_words", C.c_double), ("name", C.c_char * 48)]
+
+
+class _ConvId(C.Structure):
+    _fields_ = [("n", C.c_int), ("k", C.c_int), ("K", C.c_int), ("phase", C.c_int),
+                ("polys", C.c_uint32 * 8), ("robust", C.c_int), ("rows_used", C.c_int),
+                ("density", C.c_double), ("log10_pfa", C.c_double), ("ber_est", C.c_double),
+                ("agreement", C.c_double), ("name", C.c_char * 64)]
+
+
+class _RsId(C.Structure):
+    _fields_ = [("m", C.c_int), ("n", C.c_int), ("k", C.c_int), ("nroots", C.c_int),
+                ("fcr", C.c_int), ("prim", C.c_int), ("gfpoly", C.c_uint32),
+                ("dual_basis", C.c_int), ("lsb_first", C.c_int), ("rows_used", C.c_int),
+                ("log10_pfa", C.c_double), ("valid_words", C.c_double),
+                ("agreement", C.c_double), ("name", C.c_char * 48)]
+
+
+class _IlvId(C.Structure):
+    _fields_ = [("period", C.c_int), ("offset", C.c_int), ("rows", C.c_int), ("cols", C.c_int),
+                ("inner_width", C.c_int), ("inner_deficiency", C.c_int),
+                ("log10_pfa", C.c_double)]
+
+
+def _bind_coderec(lib) -> None:
+    P = C.POINTER
+    u8 = P(C.c_uint8)
+    sz = C.c_size_t
+    lib.atkdsp_gf2_rank_scan.restype = C.c_int
+    lib.atkdsp_gf2_rank_scan.argtypes = [u8, sz, sz, sz, sz, sz, P(C.c_int16)]
+    lib.atkdsp_block_code_id.restype = C.c_int
+    lib.atkdsp_block_code_id.argtypes = [u8, sz, C.c_int, C.c_int, C.c_double, C.c_uint64,
+                                         P(_BlockId), u8, sz, u8, sz]
+    lib.atkdsp_conv_code_id.restype = C.c_int
+    lib.atkdsp_conv_code_id.argtypes = [u8, sz, C.c_int, C.c_int, C.c_double, C.c_uint64,
+                                        P(_ConvId)]
+    lib.atkdsp_rs_code_id.restype = C.c_int
+    lib.atkdsp_rs_code_id.argtypes = [u8, sz, sz, C.c_int, C.c_int, C.c_double, P(_RsId)]
+    lib.atkdsp_interleaver_id.restype = C.c_int
+    lib.atkdsp_interleaver_id.argtypes = [u8, sz, C.c_int, C.c_int, C.c_double, C.c_uint64,
+                                          P(_IlvId)]
+
+
+_BIND_EXTRA.append(_bind_coderec)
+
+
+def _struct_dict(s) -> dict:
+    out = {}
+    for name, _t in s._fields_:
+        v = getattr(s, name)
+        if name == "name":
+            v = v.decode(errors="replace")
+        elif name == "polys":
+            v = [int(x) for x in v]
+        out[name] = v
+    out.pop("reserved", None)
+    return out
+
+
+def gf2_rank_scan(b, w_lo: int, w_hi: int, n_offsets: int = 1, rows: int = 0) -> np.ndarray:
+    """Deficiency heat map, int16 [width][offset] (-1 = not computed). See §18."""
+    b = _u8(b)
+    out = np.empty((w_hi - w_lo + 1, n_offsets), np.int16)
+    _chk(load().atkdsp_gf2_rank_scan(_u8p(b), b.size, int(w_lo), int(w_hi), int(n_offsets),
+                                     int(rows), out.ctypes.data_as(C.POINTER(C.c_int16))),
+         "gf2_rank_scan", n=b.size, w_lo=w_lo, w_hi=w_hi, n_offsets=n_offsets)
+    return out
+
+
+def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """Name a block code (§18). The dict carries the atkdsp_blockid fields plus
+    'found', 'G' (k x n uint8, canonical) and 'gpoly' (highest degree first)."""
+    b = _u8(b)
+    s = _BlockId()
+    G = np.zeros(512 * 512, np.uint8)
+    gp = np.zeros(513, np.uint8)
+    rc = _chk(load().atkdsp_block_code_id(_u8p(b), b.size, int(n_lo), int(n_hi), float(pfa),
+                                          int(seed), C.byref(s), _u8p(G), G.size, _u8p(gp), gp.size),
+              "block_code_id", n=b.size, n_lo=n_lo, n_hi=n_hi)
+    d = _struct_dict(s)
+    d["found"] = bool(rc)
+    d["G"] = G[:s.k * s.n].reshape(s.k, s.n).copy() if rc else None
+    nz = np.flatnonzero(gp)                     # g(0) = 1: the last coefficient is set
+    d["gpoly"] = (gp[:nz[-1] + 1].copy() if rc and (s.cyclic or s.extended or s.shortened) and nz.size
+                  else None)
+    _id_log.info("block_code_id: %s (n=%d k=%d offset=%d, log10_pfa %.1f, agreement %s)",
+                 d["name"], s.n, s.k, s.offset, s.log10_pfa, s.agreement)
+    return d
+
+
+def conv_code_id(b, max_n: int = 8, max_K: int = 15, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """Name a convolutional code (§18): rate k/n (n <= max_n), and for k = 1
+    the constraint length and generators (octal, §16a convention, stream
+    order) with Viterbi re-encode agreement. 'polys' is [] when k > 1."""
+    b = _u8(b)
+    s = _ConvId()
+    rc = _chk(load().atkdsp_conv_code_id(_u8p(b), b.size, int(max_n), int(max_K), float(pfa),
+                                         int(seed), C.byref(s)),
+              "conv_code_id", n=b.size, max_n=max_n, max_K=max_K)
+    d = _struct_dict(s)
+    d["found"] = bool(rc)
+    d["polys"] = d["polys"][:s.n] if rc and s.K else []     # k > 1: no generators
+    _id_log.info("conv_code_id: %s (agreement %s)", d["name"], s.agreement)
+    return d
+
+
+def rs_code_id(b, offset: int = 0, m: int = 0, nsym: int = 0, pfa: float = 1e-3) -> dict:
+    """Name a Reed-Solomon code (§18) on codeword-aligned bits from `offset`:
+    m (0 = 3..8), field polynomial, bit order, dual basis, n, k, fcr, prim,
+    with the §16b decoder's valid words and agreement."""
+    b = _u8(b)
+    s = _RsId()
+    rc = _chk(load().atkdsp_rs_code_id(_u8p(b), b.size, int(offset), int(m), int(nsym),
+                                       float(pfa), C.byref(s)),
+              "rs_code_id", n=b.size, offset=offset, m=m, nsym=nsym)
+    d = _struct_dict(s)
+    d["found"] = bool(rc)
+    _id_log.info("rs_code_id: %s (valid %s)", d["name"], s.valid_words)
+    return d
+
+
+def interleaver_id(b, n_lo: int = 8, n_hi: int = 512, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """A block interleaver's period, block start and rows x cols (written by
+    rows, read by columns), from the inner code's reappearance (§18)."""
+    b = _u8(b)
+    s = _IlvId()
+    rc = _chk(load().atkdsp_interleaver_id(_u8p(b), b.size, int(n_lo), int(n_hi), float(pfa),
+                                           int(seed), C.byref(s)),
+              "interleaver_id", n=b.size, n_lo=n_lo, n_hi=n_hi)
+    d = _struct_dict(s)
+    d["found"] = bool(rc)
+    _id_log.info("interleaver_id: period %d rows %d cols %d", s.period, s.rows, s.cols)
+    return d
+
+
+__all__ += ["gf2_rank_scan", "block_code_id", "conv_code_id", "rs_code_id", "interleaver_id"]

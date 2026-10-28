@@ -5,15 +5,40 @@
 > rest of your lists …"* — and on the bitstream section: *"Please, this
 > section is extremely important to me as a signals analyst."*
 
-**Status (2026-10-28): phase 1a is BUILT — atkdsp v0.14.0 / ABI 15** (§D1,
-§D2, §D3, §D5 and the SIB1 housekeeping; README "What is in v0.14.0"). Linux:
-smoke test and 579 tests pass (361 cross-check + 218 bitstream), the bitstream
-suite also under ASan + UBSan after an independent review (README). The Windows
-build has not been run yet. Everything else below is still plan; next in §G is
-1b (naming the code, §D4), then 1c (the bench in ATK, §D6).
+**Status (2026-10-28): phases 1a and 1b are BUILT.** 1a — atkdsp v0.14.0 /
+ABI 15 (§D1, §D2, §D3, §D5 and the SIB1 housekeeping; README "What was in
+v0.14.0"). 1b — atkdsp v0.15.0 / ABI 16 (§D4, naming the code; README "What
+is in v0.15.0"). Linux: smoke test and the whole suite pass (361 cross-check +
+218 bitstream + 180 code-recognition tests), also under ASan + UBSan. The
+Windows build has not been run yet. Everything else below is still plan; next
+in §G is 1c (the bench in ATK, §D6).
 
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
+
+**What building 1b changed in this plan** (the README has the detail):
+- The robust (noisy-stream) search is three methods, not one: a cyclic-root
+  count for cyclic codes (one comparison per window and irreducible factor —
+  BCH(255,239) at 1e-3 from 24 codewords, where random row subsets cannot
+  work), random row subsets for other block codes (each candidate check
+  verified on the rows not drawn, and refused if it holds in a row-index
+  pattern), and short contiguous stretches for convolutional codes.
+- `block_code_id` also names shortened cyclic codes and an RS code's binary
+  image, and says "no block code (linear recurrence)" / "(sliding, period
+  P)" when the structure repeats under a shift smaller than the length.
+- `rs_code_id` needs codeword alignment (a sync word, or `block_code_id` for
+  short RS codes); punctured convolutional codes are reported as their rate,
+  without generators.
+- The ABI signatures take `n_lo/n_hi`, `pfa` and `seed` (the robust search's
+  generator), and the result structs carry `robust` (how it was found) and
+  the evidence fields.
+- Naming a code needs refusals as much as detections: every recogniser first
+  refuses streams its statistics do not fit (biased bits, a short linear
+  recurrence), and `block_code_id` refuses structure whose failures do not
+  look like channel noise (patterned by row, or with arbitrary syndromes).
+  An independent review and truth-oracle stress sweeps (a named code must
+  hold on the noise-free stream) drove these; the last section of
+  `tests/test_coderec.py` holds each finding.
 
 **What building 1a changed in this plan** (the README has the detail):
 - `crc_recover` returns EVERY parameter set that reproduces the frames, not
@@ -1412,7 +1437,7 @@ checked first).
 | Phase | Contents | Size | Why here |
 |---|---|---|---|
 | **1a** ✅ v0.14.0 | **Bitstream engine:** D1 primitives, D2 scrambling + Berlekamp–Massey, D3 Viterbi / RS / BCH / small codes / CRC engine, D5 CRC recovery (+ the SIB1 housekeeping) | L | Bill's top priority. Pure mathematics, fully verifiable against known answers with no hardware, and it touches nothing the other instances are editing in the RF path |
-| **1b** | **Name the code:** D4 — rank scan, block / convolutional / RS / interleaver recognition, the robust (noisy-stream) variant | M–L | Needs 1a's encoders and decoders for its decode → re-encode evidence |
+| **1b** ✅ v0.15.0 | **Name the code:** D4 — rank scan, block / convolutional / RS / interleaver recognition, the robust (noisy-stream) variant | M–L | Needs 1a's encoders and decoders for its decode → re-encode evidence |
 | **1c** | **Bitstream bench in ATK:** D6 — dossier, raster colours, chain, the new siga modules | L | The engine is only useful to an analyst once the bench drives it |
 | 2 | **Detection track:** B1 CFAR, B2 burst descriptors + TDMA, A3 C ring | M–L | Cued DF, Bug Sniffer and Drone Discovery all wait on it |
 | 3 | **Small, high value:** C3 analog IDs, B4 cyclic probes, B3 pulse runs | M | ID-tagged analog bearings, waterfall captions, live PDWs |

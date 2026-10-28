@@ -114,6 +114,29 @@ uint64_t atk_crc_register(const uint8_t *bits, size_t nbits, int width, uint64_t
 uint64_t atk_crc_check_value(const atkdsp_crcspec *s);
 int      atk_crc_catalog_find(const atkdsp_crcspec *s);
 
+/* GF(2) linear algebra for naming the code (src/gf2.c). */
+#define ATK_ROBUST_TMAX 64
+#define ATK_ROBUST_PMAX 0.05      /* the highest channel BER the robust search assumes */
+#define ATK_ROBUST_VMIN 32        /* validation rows beyond the subset, at least       */
+#define ATK_PERIODIC_L10 (-6.0)   /* a check holding in a row-index pattern is rejected */
+typedef struct {
+    double log10_pfa, ber;
+    int    trials;
+    int    complete;     /* some trial's subset gave the whole span, every vector kept */
+} atk_robust_info;
+void     atk_rng_seed(uint64_t *s, uint64_t seed);
+uint64_t atk_rng(uint64_t *s);
+int  atk_gf2_canon(uint64_t *v, int m, int w);
+int  atk_gf2_rank(uint64_t *M, int R, int w);
+int  atk_gf2_nullspace(const uint64_t *rows, int R, int w, uint64_t *basis, int cap);
+int  atk_gf2_unsat(const uint64_t *rows, int R, int nw, const uint64_t *h);
+int  atk_gf2_robust(const uint64_t *rows, int R, int w, uint64_t seed, double pfa,
+                    uint64_t *basis, int cap, atk_robust_info *info);
+int  atk_gf2_robust_q(const uint64_t *rows, int R, int w, uint64_t seed, double pfa,
+                      uint64_t *basis, int cap, atk_robust_info *info, int quit);
+void atk_gf2_rows(const uint64_t *bw, size_t off, int w, int R, int stride, uint64_t *M);
+double atk_ok_period_l10(const uint8_t *ok, int R, int pmax);   /* <= ATK_PERIODIC_L10: patterned */
+
 /* Valid turbo code-block sizes (36.212 Table 5.1.3-3), for the SIB1 PHY's
  * CRC-gated K search. Defined in src/lte_turbo.c; not part of the ABI. */
 int atk_qpp_count(void);

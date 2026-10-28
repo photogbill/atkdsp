@@ -55,8 +55,7 @@ SYNC32 = np.array([int(c) for c in format(0x1ACFFC1D, "032b")], np.uint8)   # CC
 # §14 bit primitives
 # ============================================================================
 def test_version_and_symbols():
-    assert atkdsp.ABI_VERSION == 15
-    assert atkdsp.version() == "0.14.0"
+    assert atkdsp.ABI_VERSION >= 15            # §14-17 arrived in 15 (v0.14.0)
     lib = atkdsp.load()
     for name in ("atkdsp_bits_autocorr", "atkdsp_bm", "atkdsp_scrambler_search",
                  "atkdsp_viterbi_decode", "atkdsp_rs_decode", "atkdsp_bch_decode",

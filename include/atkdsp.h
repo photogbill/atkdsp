@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 15
-#define ATKDSP_VERSION_STRING "0.14.0"
+#define ATKDSP_ABI_VERSION 16
+#define ATKDSP_VERSION_STRING "0.15.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -93,6 +93,9 @@ extern "C" {
  * bit primitives, sync discovery and bit statistics; Berlekamp-Massey and the
  * scramblers; Viterbi, Reed-Solomon, BCH and small block codes; the CRC engine,
  * its catalogue and CRC recovery. ATKDSP_E_DECODE (-5) is new. */
+/* 15 -> 16: naming the code (§18; docs/ATKDSP_PLAN.md §D4, phase 1b) — the
+ * rank-deficiency heat map, block / convolutional / Reed-Solomon / block
+ * interleaver recognition, each with a robust (noisy-stream) search. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -1302,6 +1305,317 @@ typedef struct {
 ATKDSP_API ptrdiff_t atkdsp_crc_recover(const uint8_t *bits, const size_t *nbits, int nframes,
                                         int width, int pos, int max_header, double pfa,
                                         atkdsp_crccand *out, size_t cap);
+
+/* ---- 18. naming the code (v0.15.0, ABI 16; docs/ATKDSP_PLAN.md §D4) -------
+ * Codes recognised from the bits alone. Every answer carries its evidence
+ * (Bill, 2026-10-04): the structure found, a log10_pfa (how likely random
+ * bits are to show it, every test counted) and decode -> re-encode
+ * agreement. Random bits come back "no code found"; so does a stream beyond
+ * the method's reach, with the estimated BER when there is one.
+ *
+ * Rank deficiency. Cut the stream into rows of w bits. Rows that are
+ * codewords of a linear (n, k) code span k dimensions, so the GF(2) rank
+ * falls n - k short of n: a RANK DEFICIENCY, and the null space of the row
+ * matrix is the code's parity checks. A width of 2n holds one whole codeword
+ * at the same place in every row whatever the stream's alignment, so the
+ * deficiency shows at 2n without knowing where codewords start; at width n
+ * the aligned offset carries all n - k checks and any other only those that
+ * fit in a codeword's head or tail. R random rows of w bits lose d dimensions
+ * with probability below 4 * 2^-(d (R - w + d)), so an exact deficiency d
+ * scores log10_pfa = log10 4 - d (R - w + d) log10 2, plus log10 of the widths
+ * and offsets tried.
+ *
+ * What the statistics assume. Every log10_pfa is computed for uniform,
+ * memoryless bits apart from the code, so a stream that is not is refused
+ * first, by every function here: a bias, |P(1) - 1/2| > 0.1 over 2000 bits or
+ * more ("no code found (biased: P(1) = 0.10)"), and a short linear recurrence
+ * — a Berlekamp-Massey linear complexity LC over the first 8192 bits with
+ * 2 LC + 64 below the bits examined, which an LFSR, a constant or a periodic
+ * stream has and coded random data does not ("no block code (linear
+ * recurrence)" from block_code_id, "no code found (linear recurrence)" from
+ * conv_code_id and rs_code_id; interleaver_id returns 0).
+ *
+ * Noise. One bit error in a row breaks plain elimination. After exact
+ * elimination, three remedies:
+ *  - Cyclic roots (block codes). Every codeword of a cyclic code is a
+ *    multiple of its generator g, so each irreducible factor q of g divides
+ *    every error-free codeword, and a random word with probability 2^-deg q.
+ *    With P_t the polynomial of bits 0..t-1 (first bit highest degree), q
+ *    divides the window of bits [t, t + L) exactly when x^-t P_t and
+ *    x^-(t+L) P_(t+L) agree mod q: one comparison per window and factor.
+ *    Counting divisible windows needs only a fair share of clean codewords,
+ *    (1 - p)^n, so BCH(255,239) is named at BER 1e-3 from 24 codewords.
+ *    Extended codes (n - 1 cyclic bits and a parity bit) and shortened codes
+ *    are covered. The clean share the counts imply must be at least
+ *    (1 - 0.08)^n, what BER 8 % would leave, and at least 10 %: structure
+ *    that divides only a few windows (a code outside the length range, or
+ *    one seen at a wrong length — Golay(24,12) at length 47 fits 5 phases of
+ *    24, 7 % of the windows) is not a code at this length. At the limits
+ *    stated below the clean share is 23 % or more.
+ *  - The robust null space. Random subsets of w + 2 rows, each subset's null
+ *    space (an error only SHRINKS it), and a candidate check h is kept when
+ *    it holds on enough of the OTHER rows: with u failures among V,
+ *        log10 P(Bin(V, 1/2) <= u) + log10(64 w) <= log10(pfa),
+ *    no more failures than BER 5 % could cause on a check of its weight, and
+ *    no pattern by row index (periods 2..32, G-test at 1e-6) — a wrong width
+ *    cuts codewords at an alignment that cycles from row to row, so a
+ *    relation fitting one phase holds on that phase's rows only. A check of
+ *    weight m failing on a fraction f estimates the BER,
+ *    p = (1 - (1 - 2f)^(1/m)) / 2. The span is complete when a clean subset
+ *    gave all of it, or when 8 trials in a row found checks but nothing new
+ *    (a trial with b bad rows yields a random subspace of the dual; while the
+ *    span is short of the dual, such a subspace falls inside it with
+ *    probability <= 1/2). It needs about (w + 34) w bits, and works while a
+ *    subset of about w rows of w bits holds fewer errors than the code has
+ *    checks: short codes to a few percent BER, n = 40 to about 1e-3.
+ *  - Short contiguous stretches (convolutional codes). Sliding windows share
+ *    bits, so a short stretch is error-free far more often than a random row
+ *    subset, and noise only ever lowers an exact deficiency: the largest over
+ *    64 stretches is the true one once any stretch is clean.
+ * The random subsets come from a fixed xorshift64* generator (seed in `seed`,
+ * 0 = the default), so a result repeats exactly and the twin reproduces it.
+ *
+ * Every null space reported is in CANONICAL form — reduced row echelon with
+ * the pivot at each vector's highest set bit, highest pivot first — so the
+ * same code always prints the same matrix. Bit j of a row (or of a check) is
+ * the j-th bit of the row in time; a generator or check matrix is returned
+ * one bit per byte, row-major. Polynomials follow §16: a codeword's first bit
+ * is its highest-degree coefficient. */
+
+/* The deficiency heat map. def[(w - w_lo) * n_offsets + o] = w - rank of the
+ * matrix of `rows` consecutive w-bit rows starting at bit o (rows 0 = w + 32,
+ * each limited by the data), for w in w_lo..w_hi (2..4096) and o in
+ * 0..n_offsets-1 (see below for -1). Exact
+ * elimination, no noise tolerance: random rows give 0 except with probability
+ * about 2^-(d (R - w + d)) for a deficiency d. n_offsets = 1 is the quick scan
+ * (offset 0, enough to find 2n); n_offsets = w_hi the full map. A cell is -1
+ * where o >= w, or where fewer than w + 16 rows are used — whether the data
+ * or a small `rows` limits them. */
+ATKDSP_API int atkdsp_gf2_rank_scan(const uint8_t *b, size_t n, size_t w_lo, size_t w_hi,
+                                    size_t n_offsets, size_t rows, int16_t *def);
+
+/* Block codes, lengths n_lo..n_hi (2..512). After the stream check above, in
+ * order:
+ *   1. exact elimination at widths n_lo..2 n_hi from bit 0 (the first
+ *      deficient width w0), then each divisor N of w0 in range, smallest
+ *      first: the offset with the largest deficiency at width N is the
+ *      alignment, accepted only if that deficiency holds over every codeword
+ *      (up to 4096) and over three more stretches of the stream. A deficiency
+ *      that repeats under a shift smaller than N is not a block code: "no
+ *      block code (linear recurrence)" for an LFSR, a constant or a periodic
+ *      stream, "(sliding, period P)" for a convolutional stream — returns 0;
+ *   2. the cyclic-root count over every length (3 or more, with 8+ codewords)
+ *      and offset (factors of x^L - 1 and the primitive polynomials of the
+ *      field holding L, degree <= 11): the best (length, offset) by summed
+ *      significance, the generator from up to 1024 codewords (a factor must
+ *      divide as many as the strongest factor does), the clean floor above;
+ *      when the generator's order divides a shorter length in range, that
+ *      length is counted too and kept if it gives a generator (a multiple of
+ *      the true length scores nearly as well). Then the robust search on the
+ *      aligned codewords adds any checks a non-cyclic subcode has;
+ *   3. the robust search at widths 2N, N ascending; where it finds checks,
+ *      the robust search at width N over every offset gives the alignment.
+ * Then one reduction and two refusals (a refusal returns 0 with n, offset,
+ * deficiency and log10_pfa filled):
+ *   - checks found at a multiple m L of a code's length (m copies of the
+ *     length-L checks, block by block) are reduced to length L first;
+ *   - checks that hold as well P bits along (P a proper divisor of N: the
+ *     shifted rows keep 80 % of the aligned rows' excess over chance; a
+ *     repetition code, the nearest block case, keeps 50 %) are not a block
+ *     code of length N: "no block code (same checks at every offset)" for a
+ *     recurrence, "no block code (sliding, period P)" for a convolutional
+ *     stream — or a block code of length P below n_lo, seen at a multiple
+ *     (the bits cannot tell those two apart; the step 1 names mean the same);
+ *   - the failing codewords must fail the way channel noise makes them.
+ *     Noise strikes rows at random, so which rows fail has no pattern by row
+ *     index, where structure that fits some rows only (a wrong length, a code
+ *     outside the range) fails by the phase of an alignment that cycles from
+ *     row to row: refused when a G-test over row periods 2..64 (each residue
+ *     with 16 rows or more) gives log10 p <= -6, every period counted. And at
+ *     a BER low enough to name a code most failing words carry ONE error, so
+ *     their syndrome is a column of the check matrix, where partial structure
+ *     fails with arbitrary syndromes: with V the valid fraction, p = 1 -
+ *     V^(1/n) and the expected share of single-error syndromes among the F
+ *     failures q = n p (1-p)^(n-1) / (1 - (1-p)^n), S seen with
+ *     log10 P(Bin(F, q) <= S) <= -4 and S < 0.8 q F is refused (fewer than 8
+ *     failures pass). Either refusal is "no code found (n=N fails unlike
+ *     noise)".
+ * Then the code is named and its evidence gathered:
+ *   cyclic   every cyclic shift of a codeword is a codeword; the generator
+ *            polynomial is the GCD of the codewords' polynomials (gpoly)
+ *   name     "Hamming(7,4)", "Golay(23,12)", "BCH(31,21) t=2" (the largest t
+ *            whose consecutive roots g has), "extended Golay(24,12)" (with
+ *            " parity first" when the parity bit leads the codeword),
+ *            "shortened BCH(63,51) t=2 as (50,38)", "RS(15,11) GF(2^4) binary
+ *            image" (a length of m-bit symbols is put to rs_code_id at the
+ *            alignment found, and taken when every row of G is an RS
+ *            codeword), "cyclic (n,k)" or "linear (n,k)" — named by generator
+ *            polynomial, against every primitive polynomial of the field
+ *   dmin     exact when n <= 32 and n - k <= 20 (the §16d table), else 0
+ *   evidence agreement = 1 - (bits changed by decoding) / (bits decoded)
+ *            with that table, the §16c decoder for a named BCH/Hamming code
+ *            (shortened too), or the §16b decoder for RS; valid_words =
+ *            codewords with a zero syndrome; ber_est from the checks' failures
+ * G (k x n, may be NULL) receives the generator in canonical form (identity
+ * on its pivot columns: systematic on those positions); gpoly (may be NULL)
+ * the generator polynomial, highest degree first, when cyclic (n - k + 1
+ * coefficients), shortened (n - k + 1) or extended (of the n - 1 cyclic bits:
+ * n - k coefficients). gcap / pcap are their sizes in bytes. When the checks
+ * found are verified but no subset was ever clean the dimension is only a
+ * lower bound: out->name is "no code found (n=N too noisy)" with n, offset
+ * and ber_est filled, and 0 returned.
+ * Measured (tests/test_coderec.py; 3000 codewords, 6 trials): Hamming(7,4),
+ * extended Hamming(8,4) and Golay(23,12) / (24,12) to BER 5e-2 (5 or 6 of
+ * 6); Hamming(15,11) and extended (16,11) to 2e-2 (3e-2: 5 of 6);
+ * Hamming(31,26) to 2e-2 (3e-2: 1 of 6); BCH(63) to 1e-2, BCH(127) to 5e-3, BCH(255) to
+ * 3e-3 (what limits it is the count of clean codewords among 24); random
+ * (n, n/2) codes to 1e-2 at n = 40. Cost on random bits (the worst case: no
+ * early exit): 2 Mbit in 0.9 s at n_hi = 256, 5 s at 512.
+ * Returns 1 when a code is found, 0 when not, or an error. */
+typedef struct {
+    int    n, k, offset;      /* block length, dimension, first aligned bit   */
+    int    deficiency;        /* n - k as measured                            */
+    int    cyclic, extended;  /* see above                                    */
+    int    dmin;              /* 0 = not computed                             */
+    int    rows_used;         /* aligned codewords examined                   */
+    int    robust;            /* how: 0 exact, 1 robust search, 2 cyclic roots */
+    int    shortened;         /* shortened cyclic: mother length - n, else 0  */
+    double log10_pfa;         /* chance random bits show this structure       */
+    double ber_est;           /* channel BER from the checks' failures        */
+    double agreement;         /* decode -> re-encode, fraction of bits kept   */
+    double valid_words;       /* fraction of codewords with a zero syndrome   */
+    char   name[48];
+} atkdsp_blockid;             /* 120 bytes */
+ATKDSP_API int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi,
+                                    double pfa, uint64_t seed, atkdsp_blockid *out,
+                                    uint8_t *G, size_t gcap, uint8_t *gpoly, size_t pcap);
+
+/* Convolutional codes, rate k/n (n 2..max_n <= 8). The stream is cut into
+ * windows of L + 1 steps of n0 bits, sliding one step; for the true n the
+ * deficiency grows by n - k per step, so the REDUNDANCY DENSITY (growth per
+ * step / n0) is 1 - k/n at the true n and its multiples, and less at any
+ * other n0 (a wrong n0 sees a time-varying code). For each n0 the onset L0
+ * (the first window length with a significant deficiency) and the growth
+ * over 4 more steps give the density; the smallest n0 within 0.05 of the
+ * largest is n, and k = n - round(density n). Deficiencies are the best of 64
+ * short stretches (above). For k = 1 the generators are then solved directly:
+ * c_1 g_i = c_i g_1 for every output i (each stream is the input times its
+ * generator), a null space of n K unknowns, at the smallest K (2..max_K <=
+ * 15) over the n bit alignments (a wrong alignment is the same code with one
+ * generator delayed, so it needs a larger K) — exact null spaces over 64
+ * stretches, a candidate kept only if every generator is nonzero, it holds
+ * on up to 4096 equations from the whole stream (binomial against 1/2, every
+ * stretch, K and alignment counted) and each output's equations fail no more
+ * often than BER 5 % allows. A density below half a check per step (k = n)
+ * is "no code found". A k / n with k | n is tried as rate 1 / (n / k); an
+ * uncertain density (one clean stretch) tries every divisor of n. A rate
+ * 1/(m n) code also fits a longer rate 1/n description, with K about m times
+ * larger; so a multiple of n wins when its density showed, its generators are
+ * found and its K is no larger. Generators in §16a's convention (MSB = the
+ * current bit), in stream order, in their shortest form (taps no generator
+ * uses dropped). Evidence: a hard-decision Viterbi decode (at most 2^25
+ * trellis steps x states) re-encoded, agreement = fraction of coded bits
+ * kept; ber_est = 1 - agreement. A true k > 1 code (punctured) is reported as
+ * its rate with polys 0. Catalogued codes are named ("K=7 r=1/2 (171,133)
+ * NASA/CCSDS, 802.11, DVB-S"). robust = 1 when noise was seen (a stretch
+ * below the best, or the generators' equations failing somewhere). `seed` is
+ * kept for the ABI: the stretches are fixed, so nothing is drawn. Measured:
+ * the catalogue and K up to 15 at BER 1e-2 from 3000 data bits; K = 7 r=1/2
+ * at 3e-2. Returns 1 / 0 / error as above. */
+typedef struct {
+    int      n, k, K;         /* outputs, inputs, constraint length           */
+    int      phase;           /* stream bit where output 1 of a step falls    */
+    uint32_t polys[8];        /* k = 1: generators in stream order            */
+    int      robust, rows_used;
+    double   density;         /* measured redundancy density (1 - k/n)        */
+    double   log10_pfa, ber_est, agreement;
+    char     name[64];
+} atkdsp_convid;              /* 152 bytes */
+ATKDSP_API int atkdsp_conv_code_id(const uint8_t *b, size_t n, int max_n, int max_K,
+                                   double pfa, uint64_t seed, atkdsp_convid *out);
+
+/* Reed-Solomon over GF(2^m), on codeword-ALIGNED input: the first codeword
+ * starts at bit `offset` (from a frame sync, or block_code_id). m 3..8 (0 =
+ * try them all), nsym symbols per codeword (0 = the full 2^m - 1; fewer =
+ * shortened). The representations tried: every primitive field polynomial of
+ * degree m, both bit orders within a symbol and, for m = 8 / 0x187, the CCSDS
+ * dual basis. Stage 1: for each, every field element is evaluated on up to 64
+ * codewords, and the representation scores the summed significance of its
+ * elements' zero counts (a binomial test against 2^-m) — every root of the
+ * generator adds, so the right one stands out even when few codewords are
+ * clean; the best must beat chance over every element of every
+ * representation. Stage 2 recounts it over up to 1024 codewords: an element
+ * that is a zero of more codewords than chance allows (Bonferroni over
+ * elements and representations) is a root of the generator. The roots must
+ * be consecutive powers of some alpha^prim: that gives fcr and prim, nroots =
+ * their number, k = nsym - nroots. A symbol's bits reversed under the
+ * reciprocal polynomial is the same code (roots negated); both are counted
+ * and the one with more roots, then the smaller fcr, then MSB first is
+ * reported. Stage 1 is only a screen (it picks the representation); stage 2's
+ * test is the one log10_pfa reports. Noise only removes codewords from the
+ * count. Half a codeword along the roots must vanish (a window across two
+ * codewords is no codeword): a stream that keeps them — periodic structure —
+ * is "no code found (not codeword-aligned)". Evidence: the §16b decoder over
+ * every codeword. Measured: RS(15,11) and
+ * RS(63,55) at BER 3e-3; CCSDS RS(255,223) and RS(204,188) at 1e-3, which
+ * needs a few hundred codewords (13 % of 2040-bit codewords are then clean).
+ * Returns 1 / 0 / error. */
+typedef struct {
+    int      m, n, k, nroots, fcr, prim;
+    uint32_t gfpoly;
+    int      dual_basis;      /* CCSDS Berlekamp dual basis                    */
+    int      lsb_first;       /* symbol bits sent LSB first                    */
+    int      rows_used;
+    double   log10_pfa;
+    double   valid_words;     /* codewords the decoder accepted               */
+    double   agreement;       /* 1 - symbols corrected / symbols decoded      */
+    char     name[48];
+} atkdsp_rsid;                /* 112 bytes */
+ATKDSP_API int atkdsp_rs_code_id(const uint8_t *b, size_t n, size_t offset, int m, int nsym,
+                                 double pfa, atkdsp_rsid *out);
+
+/* Block interleavers over coded data. The interleaved stream is itself a
+ * linear code of length N = rows x cols, so its period and alignment come
+ * from the block search (exact, then robust; N in n_lo..n_hi <= 1024). The
+ * period found is the smallest with consistent structure, so its multiples up
+ * to 4x and each candidate block start are tried. Each factorisation of N is
+ * undone (written by rows, read by columns; the transposed case is the other
+ * factorisation), and the one whose de-interleaved stream shows structure at
+ * the SMALLEST width (the inner code, local again) gives rows and cols; at
+ * the same width the larger deficiency wins. The block sizes tried: the
+ * period and its multiples to 4x, then the period's divisors (an interleaver
+ * block that is not a multiple of the codeword makes the period their common
+ * multiple; inner widths are then scanned to the period, since the codeword
+ * can be longer than the block). Block starts: every start of a divisor
+ * block in exact mode; otherwise each offset that ties for the period's
+ * largest deficiency (the deficiency alone can leave the alignment ambiguous:
+ * Hamming(8,4) in 5 x 7 blocks, period 280, has three such offsets, one of
+ * them a block start). A plain code is not an interleaver: the inner width
+ * must be at most half the width at which the stream as it stands shows
+ * structure (a cyclic code's decimations have structure too). Exact widths
+ * are scanned at four offsets, so a code of rate below 7/8 shows at its own
+ * length. The smallest equivalent interleaver is reported: 3 x 14 over
+ * Hamming(7,4) is 3 x 7 (the same output, the codewords kept whole).
+ * Data: an interleaver spreads each codeword over its block, so from an
+ * unknown start its structure shows at 2N only — about (2N + 32) 2N bits
+ * (exact) or (2N + 34) 2N (robust, N <= 512), and 64 blocks or more. A
+ * 16 x 7 Hamming(7,4) interleaver at BER 1e-3 is found from 600 blocks
+ * (67 kbit; 6 of 6 trials), not from 520. In noise the robust block search
+ * needs a subset of 2N rows to keep fewer errors than the deficiency: 63-bit
+ * BCH codewords interleaved to a period of 252 or more are out of reach at
+ * BER 1e-3. Cost: under 4 s for the cases in tests/test_coderec.py; 10-30 s
+ * in noise when the period is a common multiple of 280-420 bits. Returns
+ * 1 / 0 / error; on 0 after a period was found, period, offset and
+ * log10_pfa still describe it, with rows = cols = 0. */
+typedef struct {
+    int    period, offset;    /* N and the first bit of an interleaver block  */
+    int    rows, cols;        /* written by rows, read by columns             */
+    int    inner_width;       /* width at which the undone stream first shows structure */
+    int    inner_deficiency;
+    double log10_pfa;
+} atkdsp_ilvid;               /* 32 bytes */
+ATKDSP_API int atkdsp_interleaver_id(const uint8_t *b, size_t n, int n_lo, int n_hi,
+                                     double pfa, uint64_t seed, atkdsp_ilvid *out);
 
 #ifdef __cplusplus
 }

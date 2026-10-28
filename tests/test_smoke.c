@@ -299,6 +299,70 @@ int main(void) {
         atkdsp_crccand cc[4];
         ptrdiff_t ncr = atkdsp_crc_recover(fr, lens, 4, 16, ATKDSP_CRC_END, 0, 0.0, cc, 4);
         CHECK(ncr >= 1 && cc[0].spec.poly == 0x1021 && cc[0].catalog >= 0, "crc_recover finds XMODEM from four frames");
+
+        /* -- naming the code (v0.15.0): one line per recogniser ------------- */
+        {
+            /* data bits from splitmix64 (an LFSR's bits would add a linear
+             * recurrence of their own) */
+            uint8_t *rd = (uint8_t *)malloc(NB);
+            uint64_t sm = 1;
+            for (int i = 0; i < NB; ++i) {
+                uint64_t z = (sm += 0x9E3779B97F4A7C15ULL);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                rd[i] = (uint8_t)((z ^ (z >> 31)) >> 63);
+            }
+            /* Hamming(7,4) codewords from the table encoder, 600 of them */
+            const size_t NW = 600;
+            uint8_t *hs = (uint8_t *)malloc(NW * 7 + 7);
+            atkdsp_blk *h74 = atkdsp_blk_create(7, 4, G74);
+            for (size_t w = 0; w < NW; ++w) atkdsp_blk_encode(h74, rd + 4 * w, hs + 7 * w);
+            atkdsp_blk_destroy(h74);
+            atkdsp_blockid bi;
+            int rb = atkdsp_block_code_id(hs + 3, NW * 7 - 3, 4, 64, 1e-3, 0, &bi, NULL, 0, NULL, 0);
+            CHECK(rb == 1 && bi.n == 7 && bi.k == 4 && strcmp(bi.name, "Hamming(7,4)") == 0 && bi.agreement == 1.0,
+                  "block_code_id names Hamming(7,4)");
+            int16_t def[19 * 8];
+            CHECK(atkdsp_gf2_rank_scan(hs, NW * 7, 2, 20, 8, 0, def) == ATKDSP_OK && def[(7 - 2) * 8] == 3,
+                  "gf2_rank_scan: deficiency 3 at width 7, aligned");
+            /* K = 7 r = 1/2 (171,133) */
+            const uint32_t p2[2] = {0171, 0133};
+            uint8_t *cs = (uint8_t *)malloc(2 * NB + 64);
+            ptrdiff_t nc = atkdsp_conv_encode(7, 2, p2, NULL, 0, ATKDSP_CONV_STREAM, rd, NB, cs, 2 * NB + 64);
+            atkdsp_convid ci;
+            int rcv = atkdsp_conv_code_id(cs + 1, (size_t)nc - 1, 8, 15, 1e-3, 0, &ci);
+            CHECK(rcv == 1 && ci.n == 2 && ci.K == 7 && strstr(ci.name, "NASA/CCSDS") != NULL,
+                  "conv_code_id names K=7 (171,133)");
+            /* RS(15,11) over GF(16), 200 codewords, MSB first */
+            atkdsp_rs *r15 = atkdsp_rs_create(4, 0x13, 0, 1, 4, 0, 0);
+            uint8_t *rb2 = (uint8_t *)malloc(200 * 60);
+            for (int w = 0; w < 200; ++w) {
+                uint16_t sy[15];
+                for (int j = 0; j < 11; ++j) {
+                    const int o2 = (w * 44 + j * 4) % (NB - 4);
+                    sy[j] = (uint16_t)(rd[o2] << 3 | rd[o2 + 1] << 2 | rd[o2 + 2] << 1 | rd[o2 + 3]);
+                }
+                atkdsp_rs_encode(r15, sy, sy + 11);
+                for (int j = 0; j < 15; ++j) for (int q = 0; q < 4; ++q) rb2[w * 60 + j * 4 + q] = (uint8_t)((sy[j] >> (3 - q)) & 1);
+            }
+            atkdsp_rs_destroy(r15);
+            atkdsp_rsid ri;
+            CHECK(atkdsp_rs_code_id(rb2, 200 * 60, 0, 4, 15, 1e-3, &ri) == 1 && ri.k == 11 && ri.gfpoly == 0x13 && ri.fcr == 0,
+                  "rs_code_id names RS(15,11) 0x13 fcr 0");
+            /* the Hamming stream interleaved 8 x 7 */
+            uint8_t *il = (uint8_t *)malloc(NW * 7);
+            const size_t nb8 = (NW * 7) / 56;
+            for (size_t q = 0; q < nb8; ++q)
+                for (int row = 0; row < 8; ++row)
+                    for (int col = 0; col < 7; ++col) il[q * 56 + (size_t)col * 8 + (size_t)row] = hs[q * 56 + (size_t)row * 7 + (size_t)col];
+            atkdsp_ilvid ii;
+            CHECK(atkdsp_interleaver_id(il + 5, nb8 * 56 - 5, 8, 256, 1e-3, 0, &ii) == 1 && ii.period == 56
+                  && ii.rows == 8 && ii.cols == 7, "interleaver_id finds 8 x 7");
+            /* the negative control */
+            CHECK(atkdsp_block_code_id(rd, NB, 4, 64, 1e-3, 0, &bi, NULL, 0, NULL, 0) == 0
+                  && strcmp(bi.name, "no code found") == 0, "block_code_id: no code in random bits");
+            free(rd); free(hs); free(cs); free(rb2); free(il);
+        }
         free(zb); free(seq); free(sc); free(ds); free(pb);
     }
 

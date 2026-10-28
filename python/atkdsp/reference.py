@@ -5287,3 +5287,1511 @@ def _recover_G(ps, Ls, w, hyp):
         return None
     G = _strip_x(G)
     return G if _deg(G) >= w else None
+
+
+# ============================================================================
+# §18 naming the code — the twin of src/gf2.c and src/coderec.c
+# ----------------------------------------------------------------------------
+# The same searches in the same order, the same random draws (xorshift64*),
+# the same canonical forms, so the C answer is reproduced field for field.
+# Rows and checks are Python ints: bit j = column j = the j-th bit in time.
+# Slow, and meant for small cases: the tests compare it with the C on them.
+# ============================================================================
+
+_M64 = (1 << 64) - 1
+_LN2 = 0.693147180559945309417
+_LOG10_2 = 0.30102999566398119521
+ROBUST_TMAX = 64
+ROBUST_PMAX = 0.05
+ROBUST_VMIN = 32
+PERIODIC_L10 = -6.0
+ID_ROWS = 4096
+
+
+def _rng_seed(seed: int) -> int:
+    seed &= _M64
+    return seed if seed else 0x9E3779B97F4A7C15
+
+
+def _rng(s: int):
+    """xorshift64*: (new state, output)."""
+    x = s
+    x ^= x >> 12
+    x = (x ^ (x << 25)) & _M64
+    x ^= x >> 27
+    return x, (x * 0x2545F4914F6CDD1D) & _M64
+
+
+def _pop(x: int) -> int:
+    return bin(x).count("1")
+
+
+def gf2_canon(vs) -> list:
+    """Canonical form: reduced row echelon, pivot = each vector's highest set
+    bit, highest pivot first, zero vectors dropped (unique for the span)."""
+    piv = {}
+    for v in vs:
+        for p in sorted(piv, reverse=True):
+            if (v >> p) & 1:
+                v ^= piv[p]
+        if v:
+            p = v.bit_length() - 1
+            for q in list(piv):
+                if (piv[q] >> p) & 1:
+                    piv[q] ^= v
+            piv[p] = v
+    return [piv[p] for p in sorted(piv, reverse=True)]
+
+
+def gf2_rank(rows) -> int:
+    return len(gf2_canon(rows))
+
+
+def gf2_nullspace(rows, w: int) -> list:
+    """Every h with parity(row & h) = 0 for all rows, canonical."""
+    E = gf2_canon(rows)
+    pivs = [v.bit_length() - 1 for v in E]
+    ps = set(pivs)
+    basis = []
+    for f in range(w - 1, -1, -1):
+        if f in ps:
+            continue
+        v = 1 << f
+        for p, row in zip(pivs, E):
+            if (row >> f) & 1:
+                v |= 1 << p
+        basis.append(v)
+    return gf2_canon(basis)
+
+
+def _unsat(rows, h) -> int:
+    return sum(_pop(r & h) & 1 for r in rows)
+
+
+def _in_span(basis, h) -> bool:
+    for s in basis:
+        if (h >> (s.bit_length() - 1)) & 1:
+            h ^= s
+    return h == 0
+
+
+def _period_l10(rows, h) -> float:
+    return _ok_period_l10([1 - (_pop(r & h) & 1) for r in rows], 32)
+
+
+def _ok_period_l10(ok, pmax) -> float:
+    """The twin of atk_ok_period_l10: periods 2..min(pmax, R/16, 64)."""
+    R = len(ok)
+    cmax = min(R // 16, pmax, 64)
+    if cmax < 2:
+        return 0.0
+    ok = np.array(ok, np.int64)
+    K = int(ok.sum())
+    if K == 0 or K == R:
+        return 0.0
+    pr = K / R
+    idx = np.arange(R)
+    best = 0.0
+    for c in range(2, cmax + 1):
+        nn = np.bincount(idx % c, minlength=c)
+        kk = np.bincount(idx % c, weights=ok, minlength=c).astype(np.int64)
+        G = 0.0
+        for j in range(c):
+            a, b = float(kk[j]), float(nn[j] - kk[j])
+            if a > 0:
+                G += a * _m.log(a / (float(nn[j]) * pr))
+            if b > 0:
+                G += b * _m.log(b / (float(nn[j]) * (1.0 - pr)))
+        l10 = log_igamc(0.5 * (c - 1), G) / _m.log(10.0)
+        if l10 < best:
+            best = l10
+    return best + _m.log10(cmax - 1)
+
+
+def gf2_robust(rows, w: int, seed: int, pfa: float, cap: int, quit: int = 16):
+    """The twin of atk_gf2_robust_q: (canonical basis, info dict)."""
+    R = len(rows)
+    S = w + 2
+    info = {"log10_pfa": 0.0, "ber": float("nan"), "trials": 0, "complete": 0}
+    if R < S + ROBUST_VMIN or cap < 1:
+        return [], info
+    V = R - S
+    thr = _m.log10(pfa if pfa > 0 else 1e-3)
+    ltr = _m.log10(ROBUST_TMAX * w)
+    st = _rng_seed(seed)
+    basis, pest = [], []
+    m = still = best_full = prod = 0
+    weakest = -_m.inf
+    t = 0
+    while t < ROBUST_TMAX:
+        if m == 0 and t >= quit:
+            break
+        if m > 0 and still >= 8:
+            break
+        idx = list(range(R))
+        for i in range(S):
+            st, x = _rng(st)
+            j = i + x % (R - i)
+            idx[i], idx[j] = idx[j], idx[i]
+        sub = [rows[idx[i]] for i in range(S)]
+        val = [rows[idx[i]] for i in range(S, R)]
+        nb = gf2_nullspace(sub, w)
+        grew = kept = 0
+        for h in nb:
+            u = _unsat(val, h)
+            l10 = log10_binom_tail(V, V - u, -_LN2) + ltr
+            if l10 > thr:
+                continue
+            wt = _pop(h)
+            fmax = 0.5 * (1.0 - (1.0 - 2.0 * ROBUST_PMAX) ** wt)
+            if u > V * fmax + 3.0 * _m.sqrt(V * fmax * (1.0 - fmax)):
+                continue
+            fresh = m < cap and not _in_span(basis, h)
+            if fresh and _period_l10(rows, h) <= PERIODIC_L10:
+                continue
+            kept += 1
+            f = u / V
+            pest.append(0.5 * (1.0 - (1.0 - 2.0 * f) ** (1.0 / wt)) if f < 0.5 else 0.5)
+            if l10 > weakest:
+                weakest = l10
+            if fresh:
+                basis = gf2_canon(basis + [h])
+                m = len(basis)
+                grew = 1
+        d = len(nb)
+        if d > 0 and kept == d and d > best_full:
+            best_full = d
+        still = 0 if grew else still + 1
+        prod = 0 if grew else prod + (kept > 0)
+        t += 1
+    info["trials"] = t
+    info["log10_pfa"] = weakest if m > 0 else 0.0
+    if pest:
+        info["ber"] = sorted(pest)[len(pest) // 2]
+    info["complete"] = int(m > 0 and (best_full == m or prod >= 8))
+    return basis, info
+
+
+def _def_l10(d, R, w):
+    """log10 of the bound 4 x 2^-d(R-w+d) on P(deficiency >= d) (header §18)."""
+    return 0.6020599913279624 - d * (R - w + d) * _LOG10_2
+
+
+def _rows(b, off: int, w: int, R: int, stride: int) -> list:
+    """R rows of w bits from bit off, every `stride` bits, as ints."""
+    if R <= 0:
+        return []
+    win = np.lib.stride_tricks.sliding_window_view(b[off:off + (R - 1) * stride + w], w)[::stride][:R]
+    pk = np.packbits(win, axis=1, bitorder="little")
+    return [int.from_bytes(r.tobytes(), "little") for r in pk]
+
+
+def gf2_rank_scan(b, w_lo: int, w_hi: int, n_offsets: int = 1, rows: int = 0) -> np.ndarray:
+    b = _bits(b)
+    n = b.size
+    out = np.full((w_hi - w_lo + 1, n_offsets), -1, np.int16)
+    for w in range(w_lo, w_hi + 1):
+        for o in range(n_offsets):
+            if o >= w or o >= n:
+                continue
+            R = rows if rows else w + 32
+            R = min(R, (n - o) // w)
+            if R < w + 16:
+                continue
+            out[w - w_lo, o] = w - gf2_rank(_rows(b, o, w, R, w))
+    return out
+
+
+# ---- polynomials (Python ints, bit i = x^i) -----------------------------------
+def _word_poly(v: int, n: int) -> int:
+    """A codeword (bit j = position j) as a polynomial: position j = x^(n-1-j)."""
+    p = 0
+    for j in range(n):
+        if (v >> j) & 1:
+            p |= 1 << (n - 1 - j)
+    return p
+
+
+def _pmul(a: int, b: int) -> int:
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a <<= 1
+        b >>= 1
+    return r
+
+
+def _is_primitive(f: int, m: int) -> bool:
+    if (f >> m) != 1 or not f & 1:
+        return False
+    nn = (1 << m) - 1
+    x = 1
+    for i in range(1, nn + 1):
+        x <<= 1
+        if x >> m:
+            x ^= f
+        if x == 1:
+            return i == nn
+    return False
+
+
+def _poly_order(g: int, emax: int) -> int:
+    dg = _deg(g)
+    if dg < 1 or not g & 1:
+        return 0
+    y = 1
+    for e in range(1, emax + 1):
+        y <<= 1
+        if (y >> dg) & 1:
+            y ^= g
+        if y == 1:
+            return e
+    return 0
+
+
+# ---- the block search ---------------------------------------------------------
+def _def_at(b, n, o, w, robust, seed, pfa):
+    """(deficiency or -2, log10_pfa, complete)."""
+    fit = (n - o) // w if o < n else 0
+    if not robust:
+        R = min(w + 32, fit)
+        if R < w + 16:
+            return -2, 0.0, 1
+        d = w - gf2_rank(_rows(b, o, w, R, w))
+        return d, (_def_l10(d, R, w) if d > 0 else 0.0), 1
+    R = min(fit, w + 2 + 1024)
+    if R < w + 2 + ROBUST_VMIN:
+        return -2, 0.0, 1
+    quit = (3 if w > 512 else 6) if robust == 2 else 16
+    basis, info = gf2_robust(_rows(b, o, w, R, w), w, seed, pfa, w, quit)
+    d = len(basis)
+    return d, (info["log10_pfa"] if d > 0 else 0.0), info["complete"]
+
+
+def _def_period(dv, N):
+    for P in range(1, N):
+        if N % P:
+            continue
+        if all(dv[o] == dv[(o + P) % N] for o in range(N)):
+            return P
+    return N
+
+
+TIES_MAX = 8
+
+
+def _block_search(b, n, n_lo, n_hi, pfa, seed, modes):
+    f = {"N": 0, "offset": 0, "robust": 0, "w0": 0, "d0": 0, "complete": 0, "slide": 0,
+         "log10_pfa": 0.0, "ties": []}
+    thr = _m.log10(pfa)
+    wlo, whi = n_lo, 2 * n_hi
+    lw = _m.log10(whi - wlo + 1)
+    found = False
+    if modes & 1:
+        w0, l0 = 0, 0.0
+        for w in range(wlo, whi + 1):
+            d, l, _c = _def_at(b, n, 0, w, 0, 0, pfa)
+            if d == -2:
+                break
+            if d > 0 and l + lw <= thr:
+                w0, l0 = w, l + lw
+                break
+        j = w0 // n_lo if w0 else 0
+        while j >= 1 and not found:
+            if w0 % j == 0 and n_lo <= w0 // j <= n_hi:
+                N = w0 // j
+                bo, bd, bl = -1, 0, 0.0
+                dv = []
+                for o in range(N):
+                    d, l, _c = _def_at(b, n, o, N, 0, 0, pfa)
+                    dv.append(d)
+                    if d > bd:
+                        bd, bo, bl = d, o, l
+                if not (bo < 0 or bl + _m.log10(N) > thr):
+                    P = _def_period(dv, N)
+                    if P < N:
+                        f.update(N=N, offset=bo, d0=bd, slide=P, w0=w0, log10_pfa=bl + _m.log10(N))
+                        found = True
+                        break
+                    fit = (n - bo) // N
+                    Rb = min(fit, ID_ROWS)
+                    same = N - gf2_rank(_rows(b, bo, N, Rb, N)) == bd
+                    R1 = N + 32
+                    jj = 1
+                    while jj <= 3 and same and fit >= 2 * R1:
+                        r0 = jj * (fit - R1) // 3
+                        if N - gf2_rank(_rows(b, bo + r0 * N, N, R1, N)) != bd:
+                            same = False
+                        jj += 1
+                    if not same:
+                        break
+                    f.update(N=N, offset=bo, robust=0, w0=w0, d0=bd, complete=1,
+                             log10_pfa=max(l0, bl + _m.log10(N)),
+                             ties=[o for o in range(N) if dv[o] == bd][:TIES_MAX])
+                    found = True
+            j -= 1
+    if not found and modes & 2:
+        ln = _m.log10(n_hi - n_lo + 1)
+        for N in range(n_lo, min(n_hi, 512) + 1):
+            d2, l, _c = _def_at(b, n, 0, 2 * N, 2, (seed + N) & _M64, pfa)
+            if d2 == -2:
+                break
+            if d2 <= 0 or l + ln > thr:
+                continue
+            l0 = l + ln
+            bo, bd, bl, bc = -1, 0, 0.0, 0
+            ties = []
+            for o in range(N):
+                d, l, c = _def_at(b, n, o, N, 1, (seed + 7919 * (o + 1)) & _M64, pfa)
+                if d > bd:
+                    bd, bo, bl, bc = d, o, l, c
+                    ties = [o]
+                elif d > 0 and d == bd and len(ties) < TIES_MAX:
+                    ties.append(o)
+            lo = bl + _m.log10(N) + ln
+            if bo < 0 or lo > thr:
+                continue
+            f.update(N=N, offset=bo, robust=1, w0=2 * N, d0=bd, complete=bc, log10_pfa=max(l0, lo),
+                     ties=ties)
+            found = True
+            break
+    return found, f
+
+
+# ---- cyclic roots -------------------------------------------------------------
+CYC_DMAX, CYC_R0, CYC_RMIN, CYC_SMIN = 11, 24, 8, 3.0
+_IRR = None
+
+
+def _irr_list():
+    global _IRR
+    if _IRR is None:
+        out = []
+        for d in range(1, CYC_DMAX + 1):
+            for f in range((1 << d) | 1, 2 << d, 2):
+                irr = True
+                for q, dq, _e, _p in out:
+                    if 2 * dq > d:
+                        break
+                    if _pmod(f, q) == 0:
+                        irr = False
+                        break
+                if not irr:
+                    continue
+                y = _pmod(2, f)
+                e = 1
+                while y != 1 and e < (1 << d):
+                    y <<= 1
+                    if y >> d:
+                        y ^= f
+                    e += 1
+                out.append((f, d, e, int(e == (1 << d) - 1)))
+        _IRR = out
+    return _IRR
+
+
+def _cyc_q(b, T, q, e):
+    """Q_t, t = 0..T, over b[0..T)."""
+    v = np.zeros(e, np.int64)
+    y = (q ^ 1) >> 1
+    for i in range(e):
+        v[i] = y
+        y = (y ^ q) >> 1 if y & 1 else y >> 1
+    vals = np.where(b[:T] & 1, v[np.arange(T) % e], 0)
+    return np.concatenate([[0], np.bitwise_xor.accumulate(vals)]) if T else np.zeros(1, np.int64)
+
+
+def _field_m(L):
+    m = 1
+    while (1 << m) - 1 < L:
+        m += 1
+    return m
+
+
+def _cyc_relevant(f, L, var):
+    q, d, e, prim = f
+    if L % e == 0:
+        return True
+    if var:
+        return False
+    m = _field_m(L)
+    return bool(prim) and (d == m or d == m + 1) and e > L
+
+
+def _cyclic_scan(b, n, n_lo, n_hi, pfa):
+    cf = {"N": 0, "offset": 0, "var": 0, "score": 0.0, "smax": 0.0, "log10_pfa": 0.0}
+    irr = _irr_list()
+    n_lo = max(n_lo, 3)
+    if n_hi < n_lo:
+        return False, cf
+    R0, T = {}, 0
+    for N in range(n_lo, n_hi + 1):
+        if N > n:
+            continue
+        r = min((n - N + 1) // N, CYC_R0)
+        if r < CYC_RMIN:
+            continue
+        R0[N] = r
+        T = max(T, (r + 1) * N)
+    T = min(T, n)
+    if not R0:
+        return False, cf
+    sig = {}
+    for r in set(R0.values()):
+        for d in range(1, CYC_DMAX + 1):
+            sig[(r, d)] = [-log10_binom_tail(r, c, -d * _LN2) for c in range(r + 1)]
+    score = {N: np.zeros((2, N)) for N in R0}
+    smax = {N: np.zeros((2, N)) for N in R0}
+    ntests = 0.0
+    for f in irr:
+        q, d, e, _p = f
+        if not any(_cyc_relevant(f, N, 0) or (N > 3 and _cyc_relevant(f, N - 1, 1)) for N in R0):
+            continue
+        Q = _cyc_q(b, T, q, e)
+        for N in sorted(R0):
+            r = R0[N]
+            for var in (0, 1):
+                L = N - var
+                if L < 3 or not _cyc_relevant(f, L, var):
+                    continue
+                base = (np.arange(r)[:, None] * N + np.arange(N)[None, :])
+                cnt = (Q[base] == Q[base + L]).sum(axis=0)
+                s = np.array(sig[(r, d)])[cnt]
+                score[N][var] += np.where(s >= CYC_SMIN, s, 0.0)
+                smax[N][var] = np.maximum(smax[N][var], s)
+                ntests += N
+    best = 0.0
+    for N in sorted(R0):
+        bo, bv, bs = -1, 0, 0.0
+        for var in (0, 1):
+            for o in range(N):
+                s = float(score[N][var][o])
+                if s > bs:
+                    bs, bo, bv = s, o, var
+        if bo < 0:
+            continue
+        if best == 0.0 or bs > 1.25 * best:
+            best = bs
+            cf.update(N=N, offset=bo, var=bv, score=bs, smax=float(smax[N][bv][bo]))
+    cf["log10_pfa"] = -cf["smax"] + _m.log10(ntests if ntests > 1.0 else 1.0)
+    return best > 0.0 and cf["log10_pfa"] <= _m.log10(pfa), cf
+
+
+def _cyclic_generator(b, n, cf):
+    N, L = cf["N"], cf["N"] - cf["var"]
+    R = min((n - cf["offset"]) // N, 1024)
+    if R * N > 262144:
+        R = 262144 // N
+    if R < CYC_RMIN:
+        return 0, 0, 0.0
+    irr = _irr_list()
+    T = R * N
+    s = b[cf["offset"]:cf["offset"] + T]
+    cnt, cq, sq = [], [], []
+    cbest = 0.0
+    for q, d, e, _p in irr:
+        Q = _cyc_q(s, T, q, e)
+        k = np.arange(R) * N
+        c = int((Q[k + L] == Q[k]).sum())
+        pi = 2.0 ** -d
+        fr = c / R
+        cnt.append(c)
+        cq.append((fr - pi) / (1.0 - pi))
+        sq.append(_m.sqrt((fr * (1.0 - fr) + 1.0 / R) / R) / (1.0 - pi))
+        if cq[-1] - 2.0 * sq[-1] > cbest:
+            cbest = cq[-1] - 2.0 * sq[-1]
+    thr = -3.0 - _m.log10(len(irr))
+    g, dg = 1, 0
+    for i, (q, d, e, _p) in enumerate(irr):
+        if cq[i] + 3.0 * sq[i] < cbest:
+            continue
+        if log10_binom_tail(R, cnt[i], -d * _LN2) > thr:
+            continue
+        if dg + d >= L:
+            continue
+        g = _pmul(g, q)
+        dg += d
+    return dg, g, cbest
+
+
+def _cyclic_checks(b, n, cf, g, dg):
+    N, L = cf["N"], cf["N"] - cf["var"]
+    k = L - dg
+    if k < 1:
+        return []
+    ext = 0
+    if cf["var"]:
+        R = min((n - cf["offset"]) // N, 1024)
+        last = first = tot = 0
+        for r in range(R):
+            p0 = cf["offset"] + r * N
+            w = b[p0:p0 + N]
+            p, par = 0, 0
+            for j in range(L):
+                if w[j] & 1:
+                    p |= 1 << (L - 1 - j)
+                    par ^= 1
+            if _pmod(p, g):
+                continue
+            tot += 1
+            last += int((w[L] & 1) == par)
+            if p0 >= 1:
+                first += int((b[p0 - 1] & 1) == par)
+        if tot >= CYC_RMIN and last >= 0.9 * tot:
+            ext = 1
+        elif tot >= CYC_RMIN and first >= 0.9 * tot:
+            ext = 2
+    sh = 1 if ext == 2 else 0
+    G = []
+    for i in range(k):
+        row, par = 0, 0
+        for e in range(dg + 1):
+            if (g >> e) & 1:
+                row |= 1 << (L - 1 - (e + i) + sh)
+                par ^= 1
+        if ext and par:
+            row |= 1 << (L if ext == 1 else 0)
+        G.append(row)
+    if ext == 2:
+        cf["offset"] = (cf["offset"] + N - 1) % N
+    if not ext and cf["var"]:
+        G.append(1 << L)
+    return gf2_nullspace(G, N)
+
+
+# ---- naming -------------------------------------------------------------------
+def _is_cyclic(G, H, n):
+    for c in G:
+        s = ((c >> 1) | ((c & 1) << (n - 1)))
+        if any(_pop(s & h) & 1 for h in H):
+            return False
+    return True
+
+
+def _cyclic_gen(G, n):
+    a = (1 << n) | 1
+    for row in G:
+        a = _pgcd(a, _word_poly(row, n))
+    return a
+
+
+def _name_cyclic(g, L, k, cap):
+    """(name, bch (t, f, m) or None) — the C name_cyclic, the name cut to cap - 1."""
+    dg = _deg(g)
+
+    def cut(s):
+        return s[:cap - 1]
+    if dg == 1:
+        return cut(f"single parity check ({L},{k})"), None
+    if k == 1:
+        return cut(f"repetition ({L},1)"), None
+    if L == 23 and dg == 11 and g in (0xC75, 0xAE3):
+        return cut("Golay(23,12)"), None
+    for m in range(3, 10):
+        if L != (1 << m) - 1:
+            continue
+        for f in range((1 << m) | 1, 2 << m, 2):
+            if not _is_primitive(f, m):
+                continue
+            t, tbest = 1, 0
+            while 2 * t < L:
+                try:
+                    bc = BCH(m, t, 0, f)
+                except ValueError:
+                    break
+                if bc.n - bc.k > dg:
+                    break
+                if bc.n - bc.k == dg:
+                    q = sum(int(c) << dd for dd, c in enumerate(bc.gen))
+                    if q == g:
+                        tbest = t
+                t += 1
+            if tbest:
+                nm = f"Hamming({L},{k})" if tbest == 1 else f"BCH({L},{k}) t={tbest}"
+                return cut(nm), (tbest, f, m)
+    return cut(f"cyclic ({L},{k})"), None
+
+
+BIAS_MAX, LC_BITS, CYC_PMAX, CYC_CMIN = 0.1, 8192, 0.08, 0.1
+
+
+def _cyc_floor(L):
+    return max((1.0 - CYC_PMAX) ** L, CYC_CMIN)
+
+
+def _stream_unfit(b):
+    """(0 fit | 1 biased | 2 recurrence, P(1), linear complexity)."""
+    n = b.size
+    p1, lc = 0.5, -1
+    m = min(n, LC_BITS)
+    if m >= 256:
+        lc = bm(b[:m])[0]
+        if 2 * lc + 64 < m:
+            return 2, p1, lc
+    if n >= 2000:
+        p1 = int(np.count_nonzero(b & 1)) / n
+        if abs(p1 - 0.5) > BIAS_MAX:
+            return 1, p1, lc
+    return 0, p1, lc
+
+
+def _block_copies(H, N, L):
+    """(d0, block checks) when the code is N/L copies of one length-L code, else (0, [])."""
+    m = N // L
+    d = len(H)
+    if m < 2 or N % L or d % m:
+        return 0, []
+    d0 = d // m
+    if d0 < 1:
+        return 0, []
+    mask = (1 << L) - 1
+    blk0 = []
+    for i, h in enumerate(H):
+        top, low = h.bit_length() - 1, (h & -h).bit_length() - 1
+        blk = top // L
+        if low // L != blk or blk != m - 1 - i // d0:
+            return 0, []
+        if blk == 0:
+            blk0.append(h & mask)
+    for i, h in enumerate(H):
+        if (h >> ((m - 1 - i // d0) * L)) & mask != blk0[i % d0]:
+            return 0, []
+    return d0, blk0
+
+
+def _frac_valid(b, off, N, R, H):
+    rows = _rows(b, off, N, R, N)
+    return sum(all(not (_pop(r & h) & 1) for h in H) for r in rows) / R if R else 0.0
+
+
+def _sliding_period(b, n, off, N, H):
+    if off + N - 1 >= n:
+        return 0
+    R = min((n - off - (N - 1)) // N, 1024)
+    if R < 16:
+        return 0
+    chance = 2.0 ** -min(len(H), 60)
+    e0 = _frac_valid(b, off, N, R, H) - chance
+    if e0 <= 0.1:
+        return 0
+    for p in range(1, N):
+        if N % p:
+            continue
+        if _frac_valid(b, off + p, N, R, H) - chance >= 0.8 * e0:
+            return p
+    return 0
+
+
+def _noise_like(rows, N, H):
+    d = len(H)
+    col = []
+    for j in range(N):
+        s = 0
+        for c, h in enumerate(H):
+            if (h >> j) & 1:
+                s |= 1 << c
+        col.append(s)
+    cols = set(col)
+    F = S = 0
+    ok = []
+    for r in rows:
+        s = 0
+        for c, h in enumerate(H):
+            if _pop(r & h) & 1:
+                s |= 1 << c
+        ok.append(0 if s else 1)
+        if not s:
+            continue
+        F += 1
+        S += s in cols
+    if _ok_period_l10(ok, 64) <= PERIODIC_L10:
+        return False
+    if F < 8:
+        return True
+    R = len(rows)
+    V = (R - F) / R
+    p = 1.0 - V ** (1.0 / N) if V > 0.0 else 1.0
+    q = N * p * (1.0 - p) ** (N - 1) / (1.0 - (1.0 - p) ** N) if p < 1.0 else 0.0
+    if not q > 0.0 or q >= 1.0:
+        return True if q >= 1.0 else S >= F // 2
+    l10 = log10_binom_tail(F, F - S, _m.log(1.0 - q))
+    return not (l10 <= -4.0 and S < 0.8 * q * F)
+
+
+def _name_extended(Gm, k, N):
+    """(name, g) of an extended code (parity bit last, or first), or (None, 0)."""
+    L = N - 1
+    if L < 2:
+        return None, 0
+    for first in (0, 1):
+        Gp = gf2_canon([(row >> first) & ((1 << L) - 1) for row in Gm])
+        Hp = gf2_nullspace(Gp, L)
+        if len(Gp) == k and len(Hp) == L - k and _is_cyclic(Gp, Hp, L):
+            g = _cyclic_gen(Gp, L)
+            inner, _b = _name_cyclic(g, L, k, 40)
+            if "(" in inner and ")" in inner[inner.index("("):]:
+                lp = inner.index("(")
+                rp = inner.index(")", lp)
+                nm = f"extended {inner[:lp]}({N},{k}){inner[rp + 1:]}{' parity first' if first else ''}"
+            else:
+                nm = f"extended {inner}"
+            return nm[:47], g
+    return None, 0
+
+
+def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """The twin of atkdsp_block_code_id (header §18); the dict of the
+    binding: the atkdsp_blockid fields, 'found', 'G' and 'gpoly'."""
+    b = _bits(b)
+    n = b.size
+    if not (2 <= n_lo <= n_hi <= 512):
+        raise ValueError("block_code_id: 2 <= n_lo <= n_hi <= 512")
+    if not pfa > 0:
+        pfa = 1e-3
+    out = {"n": 0, "k": 0, "offset": 0, "deficiency": 0, "cyclic": 0, "extended": 0, "dmin": 0,
+           "rows_used": 0, "robust": 0, "shortened": 0, "log10_pfa": 0.0, "ber_est": float("nan"),
+           "agreement": float("nan"), "valid_words": float("nan"), "name": "no code found",
+           "found": False, "G": None, "gpoly": None}
+    u, p1, _lc = _stream_unfit(b)
+    if u == 1:
+        out["name"] = f"no code found (biased: P(1) = {p1:.2f})"
+        return out
+    if u == 2:
+        out["name"] = "no block code (linear recurrence)"
+        return out
+    found, f = _block_search(b, n, n_lo, n_hi, pfa, seed, 1)
+    if found and f["slide"]:
+        out.update(n=f["N"], offset=f["offset"], deficiency=f["d0"], log10_pfa=f["log10_pfa"])
+        out["name"] = ("no block code (linear recurrence)" if f["slide"] == 1
+                       else f"no block code (sliding, period {f['slide']})")
+        return out
+    cyc, cf, cg, cdg = False, None, 0, 0
+    if not found:
+        ok, cf = _cyclic_scan(b, n, n_lo, n_hi, pfa)
+        if ok:
+            cdg, cg, clean = _cyclic_generator(b, n, cf)
+            if cdg > 0 and clean < _cyc_floor(cf["N"] - cf["var"]):
+                cdg = 0
+            e = _poly_order(cg, cf["N"]) if cdg > 0 and not cf["var"] else 0
+            if 0 < e < cf["N"] and cf["N"] % e == 0:
+                for L in range(e, cf["N"], e):
+                    if cf["N"] % L or L < n_lo or L < 3:
+                        continue
+                    c2 = dict(cf, N=L, offset=cf["offset"] % L)
+                    d2, g2, cl2 = _cyclic_generator(b, n, c2)
+                    if d2 > 0 and cl2 >= _cyc_floor(L):
+                        cf, cg, cdg = c2, g2, d2
+                        break
+            cyc = cdg > 0
+        if not cyc:
+            found, f = _block_search(b, n, n_lo, n_hi, pfa, seed, 2)
+            if not found:
+                return out
+    N = cf["N"] if cyc else f["N"]
+    H, robust, complete, rob_ber = [], 0, 1, float("nan")
+    if cyc:
+        H = _cyclic_checks(b, n, cf, cg, cdg)
+        f.update(N=N, offset=cf["offset"], robust=2, log10_pfa=cf["log10_pfa"], d0=len(H))
+        robust = 2
+    R = min((n - f["offset"]) // N, ID_ROWS)
+    rows = _rows(b, f["offset"], N, R, N)
+    if cyc:
+        Hr, info = gf2_robust(rows, N, seed ^ 0xC1C, pfa, N)
+        if Hr:
+            H1 = gf2_canon(H + Hr)
+            if len(H1) > len(H) and not info["complete"]:
+                complete, rob_ber = 0, info["ber"]
+            H = H1
+    else:
+        H = [] if f["robust"] else gf2_nullspace(rows, N)
+        if not f["robust"] and len(H) != f["d0"]:
+            H = []
+        robust = f["robust"]
+        if not H:
+            H, info = gf2_robust(rows, N, seed ^ 0xB10C, pfa, N)
+            robust = 1
+            complete = info["complete"]
+            rob_ber = info["ber"]
+    if H and complete:
+        for L in range(2, N):
+            if N % L or L < n_lo:
+                continue
+            d0, Hb = _block_copies(H, N, L)
+            if d0 > 0:
+                N, H = L, Hb
+                R = min((n - f["offset"]) // N, ID_ROWS)
+                rows = _rows(b, f["offset"], N, R, N)
+                break
+    d = len(H)
+    if d > 0 and not complete:
+        out.update(n=N, offset=f["offset"], deficiency=d, robust=robust, rows_used=R,
+                   log10_pfa=f["log10_pfa"], ber_est=rob_ber, name=f"no code found (n={N} too noisy)")
+        return out
+    if 0 < d < N:
+        P = _sliding_period(b, n, f["offset"], N, H)
+        if P:
+            out.update(n=N, offset=f["offset"], deficiency=d, log10_pfa=f["log10_pfa"])
+            out["name"] = ("no block code (same checks at every offset)" if P == 1
+                           else f"no block code (sliding, period {P})")
+            return out
+        if not _noise_like(rows, N, H):
+            out.update(n=N, offset=f["offset"], deficiency=d, log10_pfa=f["log10_pfa"], rows_used=R,
+                       name=f"no code found (n={N} fails unlike noise)")
+            return out
+    if not (0 < d < N):
+        return out
+    k = N - d
+    Gm = gf2_nullspace(H, N)
+    if len(Gm) != k:
+        return out
+    out.update(n=N, k=k, offset=f["offset"], deficiency=d, rows_used=R, robust=robust,
+               log10_pfa=f["log10_pfa"])
+    pe = []
+    for h in H:
+        uu = _unsat(rows, h)
+        fr = uu / R
+        wt = _pop(h)
+        pe.append(0.5 * (1.0 - (1.0 - 2.0 * fr) ** (1.0 / wt)) if fr < 0.5 else 0.5)
+    pe.sort()
+    out["ber_est"] = pe[len(pe) // 2]
+    out["valid_words"] = sum(all(not (_pop(r & h) & 1) for h in H) for r in rows) / R
+    g, bch, generic = 0, None, False
+    out["cyclic"] = int(_is_cyclic(Gm, H, N))
+    if out["cyclic"]:
+        g = _cyclic_gen(Gm, N)
+        out["name"], bch = _name_cyclic(g, N, k, 48)
+        generic = out["name"].startswith("cyclic (")
+    else:
+        gs = 0
+        for i, row in enumerate(Gm):
+            p = _word_poly(row, N)
+            gs = p if i == 0 else _pgcd(gs, p)
+        e = _poly_order(gs, 1023) if _deg(gs) == N - k else 0
+        if e > N:
+            g = gs
+            inner, bch = _name_cyclic(gs, e, e - (N - k), 40)
+            out["shortened"] = e - N
+            out["name"] = f"shortened {inner} as ({N},{k})"[:47]
+    if not out["cyclic"] and not out["shortened"]:
+        ones = (1 << N) - 1
+        if len(gf2_canon(H + [ones])) == d:
+            nm, ge = _name_extended(Gm, k, N)
+            if nm:
+                out["extended"], out["name"], g = 1, nm, ge
+        if not out["extended"]:
+            out["name"] = f"linear ({N},{k})"
+    Gb = np.array([[(row >> j) & 1 for j in range(N)] for row in Gm], np.uint8)
+    changed = decoded = 0
+    if N <= 32 and N - k <= 20:
+        try:
+            bc = BlockCode(Gb)
+        except ValueError:
+            bc = None
+        if bc is not None:
+            out["dmin"] = bc.dmin
+            for r in rows:
+                word = np.array([(r >> j) & 1 for j in range(N)], np.uint8)
+                _c, _d, cc = bc.decode(word)
+                if cc >= 0:
+                    changed += cc
+                    decoded += N
+    elif bch is not None and (out["cyclic"] or out["shortened"]):
+        t, fp, m = bch
+        bc = BCH(m, t, out["shortened"], fp)
+        for r in rows:
+            word = np.array([(r >> j) & 1 for j in range(N)], np.uint8)
+            _c, cc, _p = bc.decode(word)
+            if cc >= 0:
+                changed += cc
+                decoded += N
+    if decoded:
+        out["agreement"] = 1.0 - changed / decoded
+    if (not out["cyclic"] or generic) and not out["extended"] and not out["shortened"]:
+        for mm in range(3, 9):
+            if N % mm or (N - k) % mm or N // mm > (1 << mm) - 1 or N // mm < 3:
+                continue
+            rs = rs_code_id(b, out["offset"], mm, N // mm, pfa)
+            if not rs["found"] or rs["nroots"] * mm != N - k:
+                continue
+            L, NNr = N // mm, (1 << mm) - 1
+            rc2 = RS(mm, rs["gfpoly"], rs["fcr"], rs["prim"], rs["nroots"], NNr - L, bool(rs["dual_basis"]))
+            same = True
+            for row in Gm:
+                bits = np.array([(row >> j) & 1 for j in range(N)], np.uint8)
+                sy = _rs_syms(bits, 0, 1, L, mm, rs["lsb_first"])[0]
+                if rc2.decode(sy)[1] != 0:
+                    same = False
+                    break
+            if not same:
+                continue
+            out["name"] = f"RS({rs['n']},{rs['k']}) GF(2^{mm}) binary image"
+            if rs["agreement"] == rs["agreement"]:
+                out["agreement"] = rs["agreement"]
+            break
+    out["found"] = True
+    out["G"] = Gb
+    if out["cyclic"] or out["extended"] or out["shortened"]:
+        dg = _deg(g)
+        out["gpoly"] = np.array([(g >> (dg - i)) & 1 for i in range(dg + 1)], np.uint8)
+    return out
+
+
+# ---- convolutional codes --------------------------------------------------------
+CONV_T, CONV_XROWS = 64, 32
+CONV_CATALOG = [
+    (7, (0o171, 0o133), "NASA/CCSDS, 802.11, DVB-S"),
+    (7, (0o133, 0o171, 0o165), "LTE (36.212)"),
+    (9, (0o561, 0o753), "IS-95 / cdma2000 / 3GPP r=1/2"),
+    (9, (0o557, 0o663, 0o711), "IS-95 / 3GPP r=1/3"),
+    (5, (0o23, 0o33), "GSM"),
+    (7, (0o133, 0o171, 0o145, 0o133), "DAB / DRM mother code"),
+    (3, (0o7, 0o5), "textbook K=3"),
+]
+
+
+def _win_best(b, n, n0, L):
+    """(best deficiency or -2, hits, lower, log10_pfa) over the stretches."""
+    w = n0 * (L + 1)
+    R = w + CONV_XROWS
+    span = n0 * (R - 1) + w
+    if span > n:
+        return -2, 0, 0, 0.0
+    room = (n - span) // n0
+    T = min(CONV_T, room + 1)
+    best = hits = lower = 0
+    for j in range(T):
+        st = n0 * ((room * j) // (T - 1) if T > 1 else 0)
+        d = w - gf2_rank(_rows(b, st, w, R, n0))
+        if d > best:
+            lower += hits
+            best, hits = d, 1
+        elif d == best:
+            hits += 1
+        else:
+            lower += 1
+    return best, hits, lower, (_def_l10(best, R, w) if best > 0 else 0.0)
+
+
+def _gen_rows(b, nn, ph, K, t0, steps):
+    rows = []
+    for t in range(t0 + K - 1, t0 + K - 1 + steps):
+        for i in range(1, nn):
+            row = 0
+            for j in range(K):
+                c1 = ph + (t - j) * nn
+                if b[c1] & 1:
+                    row |= 1 << (i * K + j)
+                if b[c1 + i] & 1:
+                    row |= 1 << j
+            rows.append(row)
+    return rows
+
+
+def _conv_generators(b, n, nn, max_K, pfa):
+    thr = _m.log10(pfa)
+    ltests = _m.log10(CONV_T * nn * max_K)
+    for K in range(2, max_K + 1):
+        w = nn * K
+        ss = (w + CONV_XROWS + nn - 2) // (nn - 1)
+        for ph in range(nn):
+            avail = (n - ph) // nn
+            if avail < K + ss:
+                continue
+            room = avail - (K - 1) - ss
+            vs = min(avail - (K - 1), 4096 // (nn - 1))
+            V = vs * (nn - 1)
+            Mv = _gen_rows(b, nn, ph, K, 0, vs)
+            T = min(CONV_T, room + 1)
+            for j in range(T):
+                t0 = (room * j) // (T - 1) if T > 1 else 0
+                basis = gf2_nullspace(_gen_rows(b, nn, ph, K, t0, ss), w)
+                for h in basis[:4]:
+                    wts = [_pop((h >> (s * K)) & ((1 << K) - 1)) for s in range(nn)]
+                    if 0 in wts:
+                        continue
+                    u = _unsat(Mv, h)
+                    l10 = log10_binom_tail(V, V - u, -_LN2) + ltests
+                    if l10 > thr:
+                        continue
+                    bad = False
+                    for i in range(1, nn):
+                        sub = Mv[i - 1::nn - 1]
+                        ui, vi = _unsat(sub, h), len(sub)
+                        fmax = 0.5 * (1.0 - (1.0 - 2.0 * ROBUST_PMAX) ** (wts[0] + wts[i]))
+                        if ui > vi * fmax + 3.0 * _m.sqrt(vi * fmax * (1.0 - fmax)):
+                            bad = True
+                            break
+                    if bad:
+                        continue
+                    return K, ph, h, (u > 0 or j > 0)
+    return 0, 0, 0, False
+
+
+def conv_code_id(b, max_n: int = 8, max_K: int = 15, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """The twin of atkdsp_conv_code_id (header §18)."""
+    b = _bits(b)
+    n = b.size
+    if not (2 <= max_n <= 8 and 2 <= max_K <= 15):
+        raise ValueError("conv_code_id: max_n 2..8, max_K 2..15")
+    if not pfa > 0:
+        pfa = 1e-3
+    out = {"n": 0, "k": 0, "K": 0, "phase": 0, "polys": [], "robust": 0, "rows_used": 0,
+           "density": float("nan"), "log10_pfa": 0.0, "ber_est": float("nan"),
+           "agreement": float("nan"), "name": "no code found", "found": False}
+    u, p1, _lc = _stream_unfit(b)
+    if u == 1:
+        out["name"] = f"no code found (biased: P(1) = {p1:.2f})"
+        return out
+    if u == 2:
+        out["name"] = "no code found (linear recurrence)"
+        return out
+    thr = _m.log10(pfa)
+    Lmax = max_K + 2
+    ltests = _m.log10(CONV_T * Lmax * (max_n - 1))
+    dens, l10n, rob, Rn, unsure = {}, {}, {}, {}, {}
+    best = 0.0
+    for n0 in range(2, max_n + 1):
+        dens[n0], l10n[n0], rob[n0], Rn[n0], unsure[n0] = 0.0, 0.0, 0, 0, 0
+        L0 = d0 = h0 = lo0 = 0
+        l0 = 0.0
+        for L in range(1, Lmax + 1):
+            d, h, lo, l = _win_best(b, n, n0, L)
+            if d == -2:
+                break
+            if d > 0 and l + ltests <= thr:
+                L0, d0, h0, lo0, l0 = L, d, h, lo, l
+                break
+        if not L0:
+            continue
+        d4, h4, lo4, _l4 = _win_best(b, n, n0, L0 + 4)
+        if d4 < d0:
+            continue
+        dens[n0] = (d4 - d0) / (4.0 * n0)
+        l10n[n0] = l0 + ltests
+        Rn[n0] = n0 * (L0 + 1) + CONV_XROWS
+        rob[n0] = int(lo0 > 0 or lo4 > 0)
+        unsure[n0] = int(h0 < 2 or h4 < 2)
+        if dens[n0] > best + 1e-9:
+            best = dens[n0]
+    nn, robust, l10best = 0, 0, 0.0
+    if best > 0.0:
+        for n0 in range(2, max_n + 1):
+            if dens[n0] >= best - 0.05:
+                nn, robust, l10best, out["rows_used"] = n0, rob[n0], l10n[n0], Rn[n0]
+                break
+    if best <= 0.0 or not nn:
+        return out
+    dens_unsure = unsure[nn]
+    out.update(n=nn, density=best, robust=robust, log10_pfa=l10best)
+    k = max(1, nn - int(_m.floor(best * nn + 0.5)))
+    if k >= nn:
+        out.update(n=0, density=float("nan"), robust=0, log10_pfa=0.0, rows_used=0)
+        return out
+    out["k"] = k
+    out["found"] = True
+    bestK = bestph = gn = 0
+    sol = 0
+    for n0 in range(2, nn + 1):
+        if nn % n0 or (not dens_unsure and n0 * k != nn and n0 != nn):
+            continue
+        K, ph, h, noisy = _conv_generators(b, n, n0, max_K, pfa)
+        if K:
+            bestK, bestph, sol, gn = K, ph, h, n0
+            if noisy:
+                robust = 1
+            break
+    m = 2
+    while bestK and gn * m <= max_n:
+        n0 = gn * m
+        if dens[n0] > 0.0:
+            K2, ph2, h2, noisy = _conv_generators(b, n, n0, max_K, pfa)
+            if K2 and K2 <= bestK:
+                gn, bestK, bestph, sol = n0, K2, ph2, h2
+                out["density"], l10best = dens[n0], l10n[n0]
+                if noisy:
+                    robust = 1
+        m += 1
+    if not bestK:
+        if out["k"] > 1:
+            rate = f"{out['k'] & 7}/{nn & 15}"
+            out["name"] = (f"rate {rate} convolutional? (density unsure)" if dens_unsure
+                           else f"rate {rate} convolutional (k > 1: no generators)")
+        else:
+            out["name"] = f"convolutional, rate 1/{nn} (generators not found)"
+        return out
+    nn = gn
+    out.update(n=nn, k=1, robust=robust, log10_pfa=l10best)
+    polys = []
+    for s in range(nn):
+        p = 0
+        for j in range(bestK):
+            if (sol >> (s * bestK + j)) & 1:
+                p |= 1 << (bestK - 1 - j)
+        polys.append(p)
+    while True:
+        any_lo = any(p & 1 for p in polys)
+        any_hi = any((p >> (bestK - 1)) & 1 for p in polys)
+        if bestK <= 2 or (any_lo and any_hi):
+            break
+        if not any_lo:
+            polys = [p >> 1 for p in polys]
+        bestK -= 1
+    out.update(K=bestK, phase=bestph, polys=polys)
+    steps = min((n - bestph) // nn, 20000, (1 << 25) >> (bestK - 1))
+    llr = np.where(b[bestph:bestph + steps * nn] & 1, -1.0, 1.0).astype(np.float32)
+    v = Viterbi(bestK, polys, None, CONV_STREAM, 0)
+    dec = np.concatenate([v.decode(llr), v.flush()]).astype(np.uint8)
+    re = conv_encode(bestK, polys, dec, CONV_STREAM)
+    lo = nn * (bestK - 1)
+    if re.size > lo:
+        seg = b[bestph + lo:bestph + re.size] & 1
+        out["agreement"] = float(np.mean(re[lo:] == seg))
+        out["ber_est"] = 1.0 - out["agreement"]
+    ps = ",".join(f"{p:o}" for p in polys)
+    cat = None
+    for K, cp, name in CONV_CATALOG:
+        if K != bestK or len(cp) != nn:
+            continue
+        left = list(cp)
+        ok = True
+        for p in polys:
+            if p in left:
+                left.remove(p)
+            else:
+                ok = False
+                break
+        if ok:
+            cat = name
+            break
+    out["name"] = (f"K={bestK} r=1/{nn} ({ps}) {cat}" if cat else f"K={bestK} r=1/{nn} ({ps})")[:63]
+    return out
+
+
+# ---- Reed-Solomon -----------------------------------------------------------------
+_CCSDS_TAL = (0x8d, 0xef, 0xec, 0x86, 0xfa, 0x99, 0xaf, 0x7b)
+
+
+def _rs_syms(b, offset, R, L, mm, lsb):
+    seg = b[offset:offset + R * L * mm].reshape(R * L, mm).astype(np.int64)
+    sh = np.arange(mm) if lsb else np.arange(mm)[::-1]
+    return (seg << sh).sum(axis=1).reshape(R, L)
+
+
+def _rs_counts(sym, NN, expt, logt):
+    """cnt[e] = codewords with c(alpha^e) = 0, Horner over the symbols."""
+    R, L = sym.shape
+    e = np.arange(NN)[None, :]
+    acc = np.zeros((R, NN), np.int64)
+    for j in range(L):
+        nz = acc != 0
+        acc = np.where(nz, expt[np.where(nz, logt[acc], 0) + e], 0) ^ sym[:, j][:, None]
+    return (acc == 0).sum(axis=0)
+
+
+def rs_code_id(b, offset: int = 0, m: int = 0, nsym: int = 0, pfa: float = 1e-3) -> dict:
+    """The twin of atkdsp_rs_code_id (header §18)."""
+    b = _bits(b)
+    n = b.size
+    if m < 0 or m > 8 or (m and m < 3) or nsym < 0:
+        raise ValueError("rs_code_id: m 3..8 or 0")
+    if not pfa > 0:
+        pfa = 1e-3
+    out = {"m": 0, "n": 0, "k": 0, "nroots": 0, "fcr": 0, "prim": 0, "gfpoly": 0, "dual_basis": 0,
+           "lsb_first": 0, "rows_used": 0, "log10_pfa": 0.0, "valid_words": float("nan"),
+           "agreement": float("nan"), "name": "no code found", "found": False}
+    if offset >= n:
+        return out
+    u, p1, _lc = _stream_unfit(b[offset:])
+    if u == 1:
+        out["name"] = f"no code found (biased: P(1) = {p1:.2f})"
+        return out
+    if u == 2:
+        out["name"] = "no code found (linear recurrence)"
+        return out
+    thr = _m.log10(pfa)
+    ms = [m] if m else list(range(3, 9))
+    nrep = 0.0
+    for mm in ms:
+        nrep += 2.0 * sum(_is_primitive(f, mm) for f in range((1 << mm) | 1, 2 << mm, 2))
+        if mm == 8:
+            nrep += 2.0
+    tal = [0] * 256
+    for x in range(256):
+        v = 0
+        for j in range(8):
+            if (x >> j) & 1:
+                v ^= _CCSDS_TAL[7 - j]
+        tal[x] = v
+    tal1 = np.zeros(256, np.int64)
+    for x in range(256):
+        tal1[tal[x]] = x
+    best_score, bm, bf, bdual, blsb = 0.0, 0, 0, 0, 0
+    ntests = 0.0
+    stab = {}
+    twin_f, twin_score = 0, 0.0
+    cand = []
+    for ps in range(3):
+        if ps == 1:
+            twin_f = 0
+            if not bdual:
+                twin_f = sum(((bf >> i) & 1) << (bm - i) for i in range(bm + 1))
+                twin_score = stab.get((1 - blsb, twin_f & 511), 0.0)
+        for mm in ms:
+            if ps and mm != bm:
+                continue
+            if ps == 2 and (not twin_f or twin_score < 0.5 * best_score):
+                continue
+            NN = (1 << mm) - 1
+            L = nsym if nsym else NN
+            if L > NN or L < 3:
+                continue
+            fit = (n - offset) // (L * mm)
+            R = min(fit, 1024 if ps else 64)
+            if R < 4:
+                continue
+            for f in range((1 << mm) | 1, 2 << mm, 2):
+                if (ps == 1 and f != bf) or (ps == 2 and f != twin_f):
+                    continue
+                if not _is_primitive(f, mm):
+                    continue
+                expt = np.zeros(2 * NN, np.int64)
+                logt = np.zeros(1 << mm, np.int64)
+                x = 1
+                for i in range(NN):
+                    expt[i] = x
+                    logt[x] = i
+                    x <<= 1
+                    if x >> mm:
+                        x ^= f
+                expt[NN:] = expt[:NN]
+                for dual in range(2 if (mm == 8 and f == 0x187) else 1):
+                    for lsb in (0, 1):
+                        if ps == 1 and (dual != bdual or lsb != blsb):
+                            continue
+                        if ps == 2 and (dual or lsb == blsb):
+                            continue
+                        sym = _rs_syms(b, offset, R, L, mm, lsb)
+                        if dual:
+                            sym = tal1[sym]
+                        cnt = _rs_counts(sym, NN, expt, logt)
+                        if not ps:
+                            sc = 0.0
+                            for e in range(NN):
+                                if cnt[e] < 2:
+                                    continue
+                                lv = log10_binom_tail(R, int(cnt[e]), -mm * _LN2)
+                                if lv < -2.0:
+                                    sc -= lv
+                            ntests += NN
+                            if not dual:
+                                stab[(lsb, f & 511)] = sc
+                            if sc > best_score * (1.0 + 1e-9) + 1e-12:
+                                best_score, bm, bf, bdual, blsb = sc, mm, f, dual, lsb
+                            continue
+                        ltr = _m.log10(NN * nrep)
+                        roots, weakest = [], -_m.inf
+                        for e in range(NN):
+                            lv = log10_binom_tail(R, int(cnt[e]), -mm * _LN2) + ltr
+                            if lv <= thr:
+                                roots.append(e)
+                                weakest = max(weakest, lv)
+                        nr = len(roots)
+                        if nr < 2 or nr >= L:
+                            continue
+                        prim, fcr = 0, -1
+                        for pp in range(1, NN):
+                            if prim:
+                                break
+                            if _m.gcd(pp, NN) != 1:
+                                continue
+                            pinv = 1
+                            while (pinv * pp) % NN != 1:
+                                pinv += 1
+                            mark = [0] * NN
+                            for r_ in roots:
+                                mark[(r_ * pinv) % NN] = 1
+                            for s0 in range(NN):
+                                if not mark[s0] or mark[(s0 + NN - 1) % NN]:
+                                    continue
+                                ln_ = 0
+                                while ln_ < nr and mark[(s0 + ln_) % NN]:
+                                    ln_ += 1
+                                if ln_ == nr:
+                                    prim, fcr = pp, s0
+                                break
+                        if not prim:
+                            continue
+                        cand.append({"m": mm, "n": L, "nroots": nr, "k": L - nr, "fcr": fcr,
+                                     "prim": prim, "gfpoly": f, "dual_basis": dual,
+                                     "lsb_first": lsb, "log10_pfa": weakest})
+        if not ps and best_score + thr - _m.log10(ntests if ntests > 1.0 else 1.0) < 0.0:
+            return out
+    c0, c1 = (cand + [None, None])[:2]
+    if c1 is not None and (c1["nroots"] > c0["nroots"]
+                           or (c1["nroots"] == c0["nroots"] and c1["fcr"] < c0["fcr"])
+                           or (c1["nroots"] == c0["nroots"] and c1["fcr"] == c0["fcr"]
+                               and c1["lsb_first"] < c0["lsb_first"])):
+        c0 = c1
+    if c0 is None:
+        return out
+    mm, L = c0["m"], c0["n"]
+    NN = (1 << mm) - 1
+    # half a codeword along, a code's roots vanish; structure that keeps them
+    # is not codeword-aligned
+    off2 = offset + (L // 2) * mm
+    fit2 = (n - off2) // (L * mm) if off2 < n else 0
+    R2 = min(fit2, 1024)
+    kept = 0
+    if R2 >= 4:
+        f = c0["gfpoly"]
+        expt = np.zeros(2 * NN, np.int64)
+        logt = np.zeros(1 << mm, np.int64)
+        x = 1
+        for i in range(NN):
+            expt[i] = x
+            logt[x] = i
+            x <<= 1
+            if x >> mm:
+                x ^= f
+        expt[NN:] = expt[:NN]
+        sym = _rs_syms(b, off2, R2, L, mm, c0["lsb_first"])
+        if c0["dual_basis"]:
+            sym = tal1[sym]
+        cnt = _rs_counts(sym, NN, expt, logt)
+        ltr = _m.log10(NN * nrep)
+        for i in range(c0["nroots"]):
+            e = (c0["prim"] * (c0["fcr"] + i)) % NN
+            if log10_binom_tail(R2, int(cnt[e]), -mm * _LN2) + ltr <= thr:
+                kept += 1
+    if kept:
+        out["name"] = "no code found (not codeword-aligned)"
+        return out
+    out.update(c0)
+    rs = RS(mm, out["gfpoly"], out["fcr"], out["prim"], out["nroots"], NN - L, bool(out["dual_basis"]))
+    R = min((n - offset) // (L * mm), ID_ROWS)
+    sym = _rs_syms(b, offset, R, L, mm, out["lsb_first"])
+    ok = corr = 0
+    for r in range(R):
+        fixed, c, _p = rs.decode(sym[r])
+        if c >= 0:
+            ok += 1
+            corr += int(np.sum(np.asarray(fixed, np.int64) != sym[r]))
+    out["rows_used"] = R
+    out["valid_words"] = ok / R if R else float("nan")
+    if ok:
+        out["agreement"] = 1.0 - corr / (ok * L)
+    if (mm == 8 and out["gfpoly"] == 0x187 and out["fcr"] == 112 and out["prim"] == 11
+            and out["nroots"] == 32 and out["dual_basis"]):
+        out["name"] = f"CCSDS RS({L},{out['k']}) dual basis"
+    else:
+        out["name"] = (f"RS({L},{out['k']}) GF(2^{mm}) 0x{out['gfpoly']:X} fcr {out['fcr']} "
+                       f"prim {out['prim']}{' dual basis' if out['dual_basis'] else ''}")[:47]
+    out["found"] = True
+    return out
+
+
+# ---- block interleavers -------------------------------------------------------------
+def _ilv_blocks(N, wmax, robust):
+    need = (wmax + 2 + 256 + 1) * wmax if robust else (wmax + 34) * wmax
+    return max(64, (need + N - 1) // N + 1)
+
+
+def _inner_width(y, wmax, wstop, robust, seed, pfa):
+    """(smallest width with a significant deficiency, its deficiency), or (0, 0)."""
+    thr = _m.log10(pfa)
+    ny = y.size
+    w = 2
+    while w <= wmax and w < wstop:
+        fit = ny // w
+        d, l = 0, 0.0
+        if not robust:
+            R = w + 32
+            if R + 1 > fit:
+                R = fit - 1
+            if R < w + 16:
+                break
+            for k4 in range(4):
+                if d > 0 and l <= thr:
+                    break
+                o = (k4 * w) // 4
+                if k4 and o == ((k4 - 1) * w) // 4:
+                    continue
+                d = w - gf2_rank(_rows(y, o, w, R, w))
+                l = _def_l10(d, R, w) + _m.log10(4.0 * wmax) if d > 0 else 0.0
+        else:
+            Rr = min(fit, w + 2 + 1024)
+            if Rr < w + 2 + ROBUST_VMIN:
+                break
+            basis, info = gf2_robust(_rows(y, 0, w, Rr, w), w, (seed + w) & _M64, pfa, w, 6)
+            d = len(basis)
+            l = info["log10_pfa"] + _m.log10(wmax) if d > 0 else 0.0
+        if d > 0 and l <= thr:
+            return w, d
+        w += 1
+    return 0, 0
+
+
+def _deinterleave(b, st, cap, N, r):
+    c = N // r
+    blk = b[st:st + cap * N].reshape(cap, c, r)      # src index col*r + row
+    return (blk.transpose(0, 2, 1).reshape(-1) & 1).astype(np.uint8)   # dst row*c + col
+
+
+def interleaver_id(b, n_lo: int = 8, n_hi: int = 512, pfa: float = 1e-3, seed: int = 0) -> dict:
+    """The twin of atkdsp_interleaver_id (header §18)."""
+    b = _bits(b)
+    n = b.size
+    if not (4 <= n_lo <= n_hi <= 1024):
+        raise ValueError("interleaver_id: 4 <= n_lo <= n_hi <= 1024")
+    if not pfa > 0:
+        pfa = 1e-3
+    out = {"period": 0, "offset": 0, "rows": 0, "cols": 0, "inner_width": 0,
+           "inner_deficiency": 0, "log10_pfa": 0.0, "found": False}
+    if _stream_unfit(b)[0]:
+        return out
+    found, f = _block_search(b, n, n_lo, n_hi, pfa, seed, 3)
+    if not found or f["slide"]:
+        return out
+    P, rob = f["N"], f["robust"]
+    out.update(period=P, offset=f["offset"], log10_pfa=f["log10_pfa"])
+    # the raw stream's own inner width: the de-interleaved code must be
+    # at least twice as local
+    w_raw = 0
+    wmax = min(P, 128)
+    blocks = (n - f["offset"]) // P
+    cap = min(_ilv_blocks(P, wmax, rob), blocks)
+    if cap >= 2:
+        w_raw, _d = _inner_width(b[f["offset"]:f["offset"] + cap * P], wmax, wmax + 1, rob,
+                                 seed ^ 0x1D, pfa)
+    wlimit = w_raw // 2 + 1 if w_raw else 1 << 20
+    best_w = best_d = 0
+    for ps in (1, 0):
+        Ns = (range(P, min(n_hi, 4 * P) + 1, P) if ps
+              else [N for N in range(4, P) if P % N == 0 and N >= n_lo])
+        ties = f["ties"] or [f["offset"]]
+        for N in Ns:
+            m = N // P
+            nst = len(ties) * m if ps else (len(ties) if rob else N)
+            for j in range(nst):
+                st = ties[j // m] + (j % m) * P if ps else (ties[j] if rob else j)
+                wmax = min(max(N, P), 128)
+                blocks = (n - st) // N if st < n else 0
+                cap = min(_ilv_blocks(N, wmax, rob), blocks)
+                if cap < 2:
+                    break
+                for r in range(2, N // 2 + 1):
+                    if N % r or N // r < 2:
+                        continue
+                    y = _deinterleave(b, st, cap, N, r)
+                    stop = min(best_w + 1, wlimit) if best_w else wlimit
+                    w, dd = _inner_width(y, wmax, stop, rob, (seed + r * 4096) & _M64, pfa)
+                    if w > 0 and (not best_w or w < best_w or dd > best_d):
+                        best_w, best_d = w, dd
+                        out.update(rows=r, cols=N // r, period=N, offset=st % N)
+    out["inner_width"], out["inner_deficiency"] = best_w, best_d
+    if not best_w:
+        out["rows"] = out["cols"] = 0
+        return out
+    out["found"] = True
+    return out

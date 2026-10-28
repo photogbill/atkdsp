@@ -82,7 +82,83 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.14.0 (ABI 15)
+## What is in v0.15.0 (ABI 16)
+
+**Naming the code** — phase 1b of `docs/ATKDSP_PLAN.md` §D4: given only the
+bits, say which code made them. Header §18, twins in `reference.py` §18 (the
+same searches in the same order, the same random draws, so C == twin field for
+field), 180 tests in `tests/test_coderec.py`, a smoke line per recogniser.
+Every answer carries its evidence (Bill, 2026-10-04): the structure found, a
+`log10_pfa` with every test counted, and decode → re-encode agreement through
+the phase 1a decoders. Beyond the method's reach the answer is "no code
+found", with the estimated BER when there is structure to estimate it from.
+
+| | what | how |
+|---|---|---|
+| **rank scan** | `gf2_rank_scan` | the deficiency heat map, width × offset, exact elimination on packed words, OpenMP across widths |
+| **block codes** | `block_code_id` | exact elimination at widths up to 2n (a whole codeword sits at the same place in every 2n-bit row) then the divisors' offsets; in noise the **cyclic-root count** (each irreducible factor of g divides every clean codeword; one comparison per window and factor via x^−t·P_t mod q), then the **robust null space** (random row subsets, each candidate check verified on the other rows, refused if it holds in a row-index pattern — the signature of a wrong width). Named by generator polynomial: Hamming, Golay, BCH (every primitive polynomial), extended, shortened ("shortened BCH(255,239) t=2 as (200,184)"), an RS code's binary image, cyclic / linear (n,k); canonical G, gpoly, dmin; evidence from the §16d table, §16c BCH or §16b RS decoder |
+| | — not a block code | a deficiency that repeats under a shift smaller than n: "no block code (linear recurrence)" for an LFSR, a constant or periodic stream, "(sliding, period 2)" for a convolutional stream (or a block code of length P below `n_lo`, which the bits cannot tell apart) |
+| | — not a code at all | before anything is named: checks found at m copies of a shorter length are reduced to it; checks that hold as well a few bits along are a recurrence or a convolutional stream; and the failing codewords must fail the way noise makes them — at random rows (no pattern by row index, G-test over periods 2..64) and mostly with single-error syndromes — else "no code found (n=N fails unlike noise)". The cyclic count must imply a clean share of at least (1 − 0.08)^n and 10 % |
+| **every recogniser** | stream check | the statistics assume uniform, memoryless bits, so a bias (\|P(1) − ½\| > 0.1) or a short linear recurrence (Berlekamp–Massey over the first 8192 bits) is refused first: "no code found (biased: P(1) = 0.10)", "… (linear recurrence)" |
+| **convolutional** | `conv_code_id` | rate from the redundancy density (deficiency growth per window step); generators from c₁·gᵢ = cᵢ·g₁, smallest K over the n alignments; both over **short contiguous stretches** (sliding windows share bits, so a short stretch is clean far more often than random rows, and noise only lowers an exact deficiency); every generator nonzero and each output's equations verified on the whole stream; a multiple of n wins only with a K no larger (a repeated output is not a longer code); catalogue names (NASA/CCSDS, LTE, IS-95, GSM, DAB); hard-decision Viterbi re-encode as evidence; punctured codes reported as their rate |
+| **Reed–Solomon** | `rs_code_id` | on aligned codewords: every primitive field polynomial, both bit orders, the CCSDS dual basis; the representation by summed root significance over 64 codewords, then the roots over 1024; consecutive under some α^prim → fcr, prim, k; half a codeword along the roots must vanish ("not codeword-aligned" otherwise: periodic structure); the §16b decoder as evidence; a reversed-bit / reciprocal twin is the same code: more roots, then the smaller fcr, then MSB first |
+| **interleavers** | `interleaver_id` | the interleaved block is itself a linear code, so its period comes from the block search; each factorisation of the period, its multiples and its divisors (a block that is not a multiple of the codeword) is undone at each candidate block start, and the one whose inner code shows at the smallest width gives rows × cols; a plain code is not an interleaver (the inner width must be at most half the raw stream's); the smallest equivalent interleaver is reported (3×14 over Hamming(7,4) is 3×7) |
+
+Measured (Linux, gcc, `tests/test_coderec.py` and the header):
+
+| code | named at BER | notes |
+|---|---|---|
+| Hamming (7,4), extended (8,4), Golay (23,12) (24,12) | 0 … **5e-2** | 5–6 of 6 trials at 5e-2 from 3000 codewords; BER estimate within 25 % |
+| Hamming (15,11), extended (16,11) / Hamming (31,26) | 0 … **2e-2** | at 3e-2: 5 of 6 / 1 of 6 |
+| BCH(63,45) / BCH(127,99) / BCH(255,239) | 0 … **1e-2 / 5e-3 / 3e-3** | 6 of 6 trials each; the limit is the count of clean codewords among 24 |
+| shortened BCH(63,51)→(50,38), (255,239)→(200,184), Hamming(15,11)→(13,9) | 0 … 1e-3 (tested) | §16c decoder with shortening as evidence |
+| random linear (12,6) (20,10) (40,20) | 0 … 1e-2 | robust null space; (24,16) at 1.5e-2 says "too noisy" with BER 0.015 |
+| K=3…15 rate 1/2, 1/3, 1/4 (catalogue + K=13, 15) | 0 … **1e-2** from 3000 data bits | K=7 r=1/2 at 2e-2 / 3e-2 |
+| RS(15,11), RS(63,55) | 0 … 3e-3 | |
+| CCSDS RS(255,223) dual basis, DVB RS(204,188), RS(255,239) | 0 … 1e-3 | needs a few hundred codewords at 1e-3 (13 % of 2040-bit words are clean) |
+| interleaved Hamming(7,4) 16×7 and 7×16, Golay(24,12) 8×24, Hamming(15,11) 12×15, Golay(23,12) 10×23 | 0 … 1e-3 | ≈ (2N + 34)·2N bits (a codeword is spread over its block, so from an unknown start it shows at 2N); 2–4 s at N ≈ 200 |
+| blocks not a multiple of the codeword: Hamming(7,4) 4×5 and 6×10, Golay(24,12) 6×10, Hamming(8,4) 5×7, BCH(63,51) 5×7 | 0 … 1e-3 (BCH: 0) | period = their common multiple; 10–30 s in noise at periods 280–420. Out of reach: 63-bit codewords at periods ≥ 252 in noise |
+| random bits | — | nothing named, 2 k – 2 M bits; 40 short streams, no false alarm. Cost: 200 k bits 0.6 s; 2 M bits 0.9 s at n_hi = 256, 5 s at 512 (the robust search's N^4) |
+
+**What the bits cannot say, and how it is said.** A rate-1/4 code also fits
+a longer rate-1/2 description (its streams paired, K about doubled); so a
+multiple of n wins when its generators are found with a K no larger — and a
+code with a repeated output, (23,23), is the same set of sequences as (1,1),
+its shortest form. A block code shorter than `n_lo` seen at a multiple of its
+length repeats its checks a codeword along, exactly as a convolutional stream
+does: both are "no block code (sliding, period P)". A
+bit-reversed RS symbol under the reciprocal polynomial is the same code. A
+non-cyclic subcode of a cyclic code shows the cyclic structure first; the
+robust search on the aligned codewords then adds the extra checks it can
+verify. Partial checks of a wrong width hold only on the rows of one phase of
+the alignment cycle — the periodicity test exists for exactly that, and
+`tests/test_coderec.py` plants the cases (the shortened Golay (20,8), whose
+10-bit rows alternate between a codeword's two halves; a random (40,20)
+searched from width 30).
+
+**Checked twice.** An independent review of the first build found defects
+in all four recognisers — among them a buffer overrun naming an 8-output code, an integer
+overflow in `gf2_rank_scan`, multiples of a length named as codes, BCH named by
+too small a t, parity-first extended codes called "linear", plain codes taken
+for interleavers, structured and biased streams "recognised", and an RS tie
+broken by rounding noise; each is fixed and held by a test (the last section
+of `tests/test_coderec.py`). Stress sweeps with a truth oracle followed — a
+named code must hold on the noise-free stream, a named interleaver must give
+whole codewords back: 2880 block runs, 396 convolutional, 172 interleaver. They
+found three more: Golay(24,12) searched outside its length named as (46,35) or
+(47,36) — 27 false descriptions in 2880 runs, now none (the 10 % clean floor
+and the row-pattern test); a noisy interleaver block that is not a multiple of
+the codeword started one bit early (every tied alignment is now a start, and
+at equal width the larger deficiency wins); and a codeword longer than the
+interleaver block never scanned. 0 false descriptions remain in the sweeps;
+the misses are the stated data and noise limits.
+
+**Not yet:** soft-decision recognition (everything here is hard bits); RS
+alignment search (`rs_code_id` wants the codeword start — from a sync word, or
+from `block_code_id` for codes up to 512 bits); generators for punctured
+(k > 1) codes; the bench in ATK (plan §D6) is 1c.
+
+## What was in v0.14.0 (ABI 15)
 
 **The bitstream engine** — phase 1a of `docs/ATKDSP_PLAN.md` §D, the part Bill
 called "extremely important to me as a signals analyst". Header §14–17, twins
@@ -158,10 +234,9 @@ truncated. The whole bitstream suite passes under the sanitizers.
 marked DO NOT USE in the header (six known physical-layer faults; ATK uses its
 own `lte_sib1_rx.py`). A comment only — no ABI change.
 
-**Not yet:** naming the code (block / convolutional / RS / interleaver
-recognition, plan §D4) is phase 1b; the bench in ATK (plan §D6,
-`BIT_BENCH_PLAN.md`) is 1c. The Windows build of this release has not been
-run from here — `build.bat` picks the new files up by its `src\*.c` glob, and
+**Not yet (then):** naming the code (plan §D4) was phase 1b — v0.15.0 above;
+the bench in ATK (plan §D6, `BIT_BENCH_PLAN.md`) is 1c. The Windows build of
+this release has not been run from here — `build.bat` picks the new files up by its `src\*.c` glob, and
 the OpenMP loops follow the MSVC 2.0 rule the FFT already learned.
 
 ## What was in v0.13.0 (ABI 14)

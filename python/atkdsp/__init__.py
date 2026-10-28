@@ -46,7 +46,8 @@ __all__ = [
 #: 12 adds the FSK front end: symdump (integrate-and-dump) + sync_search (§12).
 #: 13 adds dc_track + agc (adaptive DC removal + AGC) for off-centre RF (§12).
 #: 14 adds the DMR / P25 sync correlator, DmrSync (§13).
-ABI_VERSION = 14
+#: 15 adds the bitstream engine (§14-17): bit primitives, scramblers, FEC, CRC.
+ABI_VERSION = 15
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -1513,3 +1514,623 @@ class DmrSync:
 __all__ += ["SYNC_DMR", "SYNC_P25", "SYNC_INVERT", "SYNC_SYMBOLS", "SYNC_RATE",
             "SYNC_CONFIRM_ERRORS", "DmrSync", "dmr_sync_patterns", "dmr_sync_pattern",
             "dmr_sync_pattern_name"]
+
+
+# ============================================================================
+# THE BITSTREAM ENGINE (§14-17): bit primitives, scramblers, FEC, CRC.
+# ----------------------------------------------------------------------------
+# Same names, arguments and return shapes as the twins in reference.py §14-17,
+# so `atkdsp.X` and `atkdsp.reference.X` are interchangeable and ATK can fall
+# back to the twin when the DLL is absent. Logging (Bill's rule, 2026-10-10):
+# every stateful decoder logs describe() at INFO when made and its counters at
+# DEBUG every 1000 calls; every error code is logged at WARNING with the call.
+# ============================================================================
+_bit_log = _logging.getLogger("atkdsp.bitstream")
+
+BITS_INVERTED = 1
+BITS_REVERSED = 2
+SYNC_MAXBITS = 128
+SYNC_REPETITIVE = 1
+SCRAM_ADD = 0
+SCRAM_MULT = 1
+CONV_TERM = 0
+CONV_TAILBITE = 1
+CONV_STREAM = 2
+RS_DUAL_BASIS = 1
+CRC_END = 0
+CRC_SEARCH = 1
+E_DECODE = -5
+_ERRORS[-5] = "uncorrectable"
+
+bm_mask = _ref.bm_mask
+crc_spec = _ref.crc_spec
+ascii_bits = _ref.ascii_bits
+cyclic_generator_matrix = _ref.cyclic_generator_matrix
+extend_with_parity = _ref.extend_with_parity
+SMALL_CODES = _ref.SMALL_CODES
+
+
+def _chk(rc, what, **args):
+    """_check, logging the call's arguments at WARNING first."""
+    if rc < 0:
+        _bit_log.warning("%s returned %d (%s); args %s", what, rc,
+                         _ERRORS.get(rc, "error"), args)
+    return _check(rc, what)
+
+
+def _u8(a, name="bits") -> np.ndarray:
+    a = np.ascontiguousarray(a, dtype=np.uint8)
+    if a.ndim != 1:
+        raise AtkDspError(f"{name} must be one-dimensional")
+    return a
+
+
+def _u8p(a):
+    return a.ctypes.data_as(C.POINTER(C.c_uint8))
+
+
+class _BitHit(C.Structure):
+    _fields_ = [("pos", C.c_longlong), ("errors", C.c_int), ("variant", C.c_int)]
+
+
+class _SyncCand(C.Structure):
+    _fields_ = [("first", C.c_longlong), ("period", C.c_int), ("length", C.c_int),
+                ("count", C.c_int), ("flags", C.c_int), ("expected", C.c_double),
+                ("log10_pfa", C.c_double), ("pattern", C.c_uint8 * SYNC_MAXBITS)]
+
+
+class _BitStats(C.Structure):
+    _fields_ = [("n", C.c_uint64), ("ones", C.c_uint64), ("density", C.c_double),
+                ("run0", C.c_uint64 * 33), ("run1", C.c_uint64 * 33),
+                ("ngram", (C.c_uint64 * 256) * 8),
+                ("chi2", C.c_double), ("chi2_p", C.c_double), ("maurer", C.c_double),
+                ("maurer_p", C.c_double), ("apen", C.c_double), ("apen_p", C.c_double),
+                ("block_entropy", C.c_double * 16), ("chi2_bits", C.c_int),
+                ("maurer_L", C.c_int), ("apen_m", C.c_int), ("reserved", C.c_int)]
+
+
+class _ScramCand(C.Structure):
+    _fields_ = [("poly", C.c_uint64), ("seed", C.c_uint64), ("g", C.c_double),
+                ("log10_pfa", C.c_double), ("g_data", C.c_double), ("degree", C.c_int),
+                ("terms", C.c_int), ("seeded", C.c_int), ("block_bits", C.c_int)]
+
+
+class _FecStats(C.Structure):
+    _fields_ = [("calls", C.c_uint64), ("in_", C.c_uint64), ("out", C.c_uint64),
+                ("corrected", C.c_uint64), ("failures", C.c_uint64), ("resets", C.c_uint64)]
+
+
+class _CrcSpec(C.Structure):
+    _fields_ = [("poly", C.c_uint64), ("init", C.c_uint64), ("xorout", C.c_uint64),
+                ("check", C.c_uint64), ("width", C.c_int), ("refin", C.c_int),
+                ("refout", C.c_int), ("reserved", C.c_int)]
+
+
+class _CrcCand(C.Structure):
+    _fields_ = [("spec", _CrcSpec), ("layout", C.c_int), ("header_bits", C.c_int),
+                ("trailer_bits", C.c_int), ("init_known", C.c_int), ("frames_ok", C.c_int),
+                ("catalog", C.c_int), ("log10_pfa", C.c_double), ("alternatives", C.c_int),
+                ("reserved", C.c_int)]
+
+
+def _bind_bitstream(lib) -> None:
+    P = C.POINTER
+    u8 = P(C.c_uint8)
+    fp = P(C.c_float)
+    sz = C.c_size_t
+    ss = C.c_ssize_t
+    vp = C.c_void_p
+    cp = C.c_char_p
+    sig = {
+        "atkdsp_bits_autocorr": (C.c_int, [u8, sz, sz, fp]),
+        "atkdsp_bits_xcorr": (C.c_int, [u8, sz, u8, sz, fp]),
+        "atkdsp_bits_search": (ss, [u8, sz, u8, sz, C.c_int, C.c_uint, P(_BitHit), sz]),
+        "atkdsp_bits_columns": (ss, [u8, sz, sz, sz, P(C.c_uint32), P(C.c_uint32), u8, u8]),
+        "atkdsp_bits_width_scan": (C.c_int, [u8, sz, sz, sz, fp, fp]),
+        "atkdsp_bits_sync_discover": (ss, [u8, sz, C.c_int, C.c_int, C.c_double,
+                                           P(_SyncCand), sz]),
+        "atkdsp_bits_stats": (C.c_int, [u8, sz, P(_BitStats)]),
+        "atkdsp_bits_wht": (ss, [u8, sz, sz, P(C.c_uint32), C.c_int, P(C.c_int32)]),
+        "atkdsp_bits_walsh": (ss, [u8, sz, sz, C.c_int, fp, fp]),
+        "atkdsp_bits_cyclic": (ss, [u8, sz, sz, C.c_int, fp, fp]),
+        "atkdsp_bm": (ss, [u8, sz, u8, sz]),
+        "atkdsp_bm_profile": (ss, [u8, sz, P(C.c_int32)]),
+        "atkdsp_descramble_add": (C.c_int, [u8, sz, C.c_uint64, P(C.c_uint64), u8]),
+        "atkdsp_descramble_mult": (C.c_int, [u8, sz, C.c_uint64, P(C.c_uint64), u8]),
+        "atkdsp_scramble_mult": (C.c_int, [u8, sz, C.c_uint64, P(C.c_uint64), u8]),
+        "atkdsp_scrambler_search": (ss, [u8, sz, C.c_int, C.c_int, C.c_int, C.c_double,
+                                         P(C.c_double), P(_ScramCand), sz]),
+        "atkdsp_viterbi_create": (vp, [C.c_int, C.c_int, P(C.c_uint32), u8, C.c_int, C.c_int,
+                                       C.c_int, sz]),
+        "atkdsp_viterbi_destroy": (None, [vp]),
+        "atkdsp_viterbi_reset": (None, [vp]),
+        "atkdsp_viterbi_out_max": (sz, [vp, sz]),
+        "atkdsp_viterbi_decode": (ss, [vp, fp, sz, u8, sz, fp]),
+        "atkdsp_viterbi_flush": (ss, [vp, u8, sz]),
+        "atkdsp_viterbi_describe": (C.c_int, [vp, cp, sz]),
+        "atkdsp_viterbi_stats": (C.c_int, [vp, P(_FecStats)]),
+        "atkdsp_conv_encode": (ss, [C.c_int, C.c_int, P(C.c_uint32), u8, C.c_int, C.c_int,
+                                    u8, sz, u8, sz]),
+        "atkdsp_rs_create": (vp, [C.c_int, C.c_uint32, C.c_int, C.c_int, C.c_int, C.c_int,
+                                  C.c_int]),
+        "atkdsp_rs_destroy": (None, [vp]),
+        "atkdsp_rs_params": (C.c_int, [vp, P(C.c_int), P(C.c_int)]),
+        "atkdsp_rs_encode": (C.c_int, [vp, P(C.c_uint16), P(C.c_uint16)]),
+        "atkdsp_rs_decode": (C.c_int, [vp, P(C.c_uint16), P(C.c_int), C.c_int, P(C.c_int)]),
+        "atkdsp_rs_describe": (C.c_int, [vp, cp, sz]),
+        "atkdsp_rs_stats": (C.c_int, [vp, P(_FecStats)]),
+        "atkdsp_bch_create": (vp, [C.c_int, C.c_int, C.c_int, C.c_uint32]),
+        "atkdsp_bch_destroy": (None, [vp]),
+        "atkdsp_bch_params": (C.c_int, [vp, P(C.c_int), P(C.c_int), P(C.c_int)]),
+        "atkdsp_bch_generator": (C.c_int, [vp, u8, sz]),
+        "atkdsp_bch_encode": (C.c_int, [vp, u8, u8]),
+        "atkdsp_bch_decode": (C.c_int, [vp, u8, P(C.c_int)]),
+        "atkdsp_bch_describe": (C.c_int, [vp, cp, sz]),
+        "atkdsp_bch_stats": (C.c_int, [vp, P(_FecStats)]),
+        "atkdsp_blk_create": (vp, [C.c_int, C.c_int, u8]),
+        "atkdsp_blk_destroy": (None, [vp]),
+        "atkdsp_blk_params": (C.c_int, [vp, P(C.c_int), P(C.c_int), P(C.c_int)]),
+        "atkdsp_blk_encode": (C.c_int, [vp, u8, u8]),
+        "atkdsp_blk_decode": (C.c_int, [vp, u8, u8]),
+        "atkdsp_blk_describe": (C.c_int, [vp, cp, sz]),
+        "atkdsp_blk_stats": (C.c_int, [vp, P(_FecStats)]),
+        "atkdsp_crc": (C.c_int, [u8, sz, P(_CrcSpec), P(C.c_uint64)]),
+        "atkdsp_crc_catalog_count": (C.c_int, []),
+        "atkdsp_crc_catalog": (C.c_int, [C.c_int, P(_CrcSpec)]),
+        "atkdsp_crc_catalog_name": (cp, [C.c_int]),
+        "atkdsp_crc_recover": (ss, [u8, P(C.c_size_t), C.c_int, C.c_int, C.c_int, C.c_int,
+                                    C.c_double, P(_CrcCand), sz]),
+    }
+    for name, (res, args) in sig.items():
+        f = getattr(lib, name)
+        f.restype = res
+        f.argtypes = args
+
+
+_BIND_EXTRA.append(_bind_bitstream)
+
+
+# ---- §14 bit primitives -----------------------------------------------------------
+def bits_autocorr(b, max_lag: int) -> np.ndarray:
+    b = _u8(b)
+    out = np.empty(int(max_lag) + 1, np.float32)
+    _chk(load().atkdsp_bits_autocorr(_u8p(b), b.size, int(max_lag), _fp(out)),
+         "bits_autocorr", n=b.size, max_lag=max_lag)
+    return out
+
+
+def bits_xcorr(a, p) -> np.ndarray:
+    a, p = _u8(a, "a"), _u8(p, "p")
+    if p.size < 1 or p.size > a.size:
+        raise AtkDspError("bits_xcorr needs 1 <= len(p) <= len(a)")
+    out = np.empty(a.size - p.size + 1, np.float32)
+    _chk(load().atkdsp_bits_xcorr(_u8p(a), a.size, _u8p(p), p.size, _fp(out)),
+         "bits_xcorr", na=a.size, nb=p.size)
+    return out
+
+
+def bits_search(b, pat, max_err: int = 0, flags: int = 0) -> list:
+    """[(pos, errors, variant)] — see atkdsp.h §14."""
+    lib = load()
+    b, pat = _u8(b), _u8(pat, "pat")
+    cap = 4096
+    while True:
+        buf = (_BitHit * cap)()
+        n = lib.atkdsp_bits_search(_u8p(b), b.size, _u8p(pat), pat.size, int(max_err),
+                                   int(flags), buf, cap)
+        if n == -3:
+            cap = int(lib.atkdsp_bits_search(_u8p(b), b.size, _u8p(pat), pat.size,
+                                             int(max_err), int(flags), None, 0))
+            continue
+        _chk(n, "bits_search", n=b.size, plen=pat.size, max_err=max_err, flags=flags)
+        return [(int(buf[i].pos), int(buf[i].errors), int(buf[i].variant)) for i in range(n)]
+
+
+def bits_columns(b, width: int, offset: int = 0):
+    b = _u8(b)
+    rows = (b.size - offset) // width if offset < b.size else 0
+    col = np.zeros(width, np.uint32)
+    row = np.zeros(max(rows, 1), np.uint32)
+    cpar = np.zeros(width, np.uint8)
+    rpar = np.zeros(max(rows, 1), np.uint8)
+    r = _chk(load().atkdsp_bits_columns(_u8p(b), b.size, int(width), int(offset),
+                                        col.ctypes.data_as(C.POINTER(C.c_uint32)),
+                                        row.ctypes.data_as(C.POINTER(C.c_uint32)),
+                                        _u8p(cpar), _u8p(rpar)),
+             "bits_columns", n=b.size, width=width, offset=offset)
+    return col, row[:r], cpar, rpar[:r]
+
+
+def bits_width_scan(b, w_lo: int, w_hi: int):
+    b = _u8(b)
+    z = np.empty(w_hi - w_lo + 1, np.float32)
+    raw = np.empty_like(z)
+    _chk(load().atkdsp_bits_width_scan(_u8p(b), b.size, int(w_lo), int(w_hi), _fp(z), _fp(raw)),
+         "bits_width_scan", n=b.size, w_lo=w_lo, w_hi=w_hi)
+    return z, raw
+
+
+def bits_sync_discover(b, word_len: int = 16, min_count: int = 3, pfa: float = 1e-3,
+                       cap: int = 64) -> list:
+    b = _u8(b)
+    buf = (_SyncCand * max(int(cap), 1))()
+    n = _chk(load().atkdsp_bits_sync_discover(_u8p(b), b.size, int(word_len), int(min_count),
+                                              float(pfa), buf, int(cap)),
+             "bits_sync_discover", n=b.size, word_len=word_len, min_count=min_count)
+    out = []
+    for i in range(n):
+        c = buf[i]
+        out.append({"first": int(c.first), "period": int(c.period), "length": int(c.length),
+                    "count": int(c.count), "flags": int(c.flags),
+                    "expected": float(c.expected), "log10_pfa": float(c.log10_pfa),
+                    "pattern": np.array(c.pattern[:c.length], np.uint8)})
+    return out
+
+
+def bits_stats(b) -> dict:
+    b = _u8(b)
+    s = _BitStats()
+    _chk(load().atkdsp_bits_stats(_u8p(b), b.size, C.byref(s)), "bits_stats", n=b.size)
+    return {"n": int(s.n), "ones": int(s.ones), "density": float(s.density),
+            "run0": np.ctypeslib.as_array(s.run0).copy(),
+            "run1": np.ctypeslib.as_array(s.run1).copy(),
+            "ngram": np.ctypeslib.as_array(s.ngram).copy(),
+            "chi2": float(s.chi2), "chi2_p": float(s.chi2_p), "chi2_bits": int(s.chi2_bits),
+            "maurer": float(s.maurer), "maurer_p": float(s.maurer_p),
+            "maurer_L": int(s.maurer_L), "apen": float(s.apen), "apen_p": float(s.apen_p),
+            "apen_m": int(s.apen_m),
+            "block_entropy": np.ctypeslib.as_array(s.block_entropy).copy()}
+
+
+def bits_wht(b, width: int, cols):
+    b = _u8(b)
+    cols = np.ascontiguousarray(cols, np.uint32)
+    spec = np.empty(1 << cols.size, np.int32)
+    rows = _chk(load().atkdsp_bits_wht(_u8p(b), b.size, int(width),
+                                       cols.ctypes.data_as(C.POINTER(C.c_uint32)), cols.size,
+                                       spec.ctypes.data_as(C.POINTER(C.c_int32))),
+                "bits_wht", n=b.size, width=width, ncols=cols.size)
+    return spec, rows
+
+
+def bits_walsh(b, size: int, navg: int = 0):
+    b = _u8(b)
+    seq = np.empty(size, np.float32)
+    dy = np.empty(size, np.float32)
+    k = _chk(load().atkdsp_bits_walsh(_u8p(b), b.size, int(size), int(navg), _fp(seq), _fp(dy)),
+             "bits_walsh", n=b.size, size=size, navg=navg)
+    return seq, dy, k
+
+
+def bits_cyclic(b, size: int, navg: int = 0):
+    b = _u8(b)
+    tm = np.empty(size, np.float32)
+    fq = np.empty(size // 2 + 1, np.float32)
+    k = _chk(load().atkdsp_bits_cyclic(_u8p(b), b.size, int(size), int(navg), _fp(tm), _fp(fq)),
+             "bits_cyclic", n=b.size, size=size, navg=navg)
+    return tm, fq, k
+
+
+# ---- §15 scramblers and linear complexity ----------------------------------------------
+def bm(b) -> tuple:
+    b = _u8(b)
+    poly = np.zeros(b.size + 2, np.uint8)
+    L = _chk(load().atkdsp_bm(_u8p(b), b.size, _u8p(poly), poly.size), "bm", n=b.size)
+    return L, poly[:L + 1].copy()
+
+
+def bm_profile(b) -> np.ndarray:
+    b = _u8(b)
+    out = np.zeros(b.size, np.int32)
+    _chk(load().atkdsp_bm_profile(_u8p(b), b.size, out.ctypes.data_as(C.POINTER(C.c_int32))),
+         "bm_profile", n=b.size)
+    return out
+
+
+def _scr(fn, what, b, poly, state):
+    b = _u8(b)
+    out = np.empty_like(b)
+    st = C.c_uint64(int(state[0]))
+    _chk(getattr(load(), fn)(_u8p(b), b.size, C.c_uint64(int(poly)), C.byref(st), _u8p(out)),
+         what, n=b.size, poly=hex(int(poly)), state=hex(int(state[0])))
+    state[0] = st.value
+    return out
+
+
+def descramble_add(b, poly, state) -> np.ndarray:
+    return _scr("atkdsp_descramble_add", "descramble_add", b, poly, state)
+
+
+def descramble_mult(b, poly, state) -> np.ndarray:
+    return _scr("atkdsp_descramble_mult", "descramble_mult", b, poly, state)
+
+
+def scramble_mult(b, poly, state) -> np.ndarray:
+    return _scr("atkdsp_scramble_mult", "scramble_mult", b, poly, state)
+
+
+def scrambler_search(b, kind: int = SCRAM_MULT, max_degree: int = 24, max_terms: int = 5,
+                     pfa: float = 1e-3, cap: int = 16):
+    b = _u8(b)
+    buf = (_ScramCand * max(int(cap), 1))()
+    gid = C.c_double()
+    n = _chk(load().atkdsp_scrambler_search(_u8p(b), b.size, int(kind), int(max_degree),
+                                            int(max_terms), float(pfa), C.byref(gid), buf,
+                                            int(cap)),
+             "scrambler_search", n=b.size, kind=kind, max_degree=max_degree,
+             max_terms=max_terms)
+    out = [{"poly": int(c.poly), "seed": int(c.seed), "g": float(c.g),
+            "log10_pfa": float(c.log10_pfa), "g_data": float(c.g_data),
+            "degree": int(c.degree), "terms": int(c.terms), "seeded": int(c.seeded),
+            "block_bits": int(c.block_bits)} for c in buf[:n]]
+    return out, float(gid.value)
+
+
+# ---- §16 FEC -----------------------------------------------------------------------------
+def _stats_dict(s) -> dict:
+    return {"calls": s.calls, "in": s.in_, "out": s.out, "corrected": s.corrected,
+            "failures": s.failures, "resets": s.resets}
+
+
+def _punc_arg(n, puncture):
+    if puncture is None:
+        return None, 0
+    p = (np.asarray(puncture, np.uint8).reshape(n, -1) != 0).astype(np.uint8)
+    return np.ascontiguousarray(p), p.shape[1]
+
+
+def conv_encode(K: int, polys, bits, mode: int = CONV_TERM, puncture=None) -> np.ndarray:
+    polys_a = np.ascontiguousarray(polys, np.uint32)
+    n = polys_a.size
+    bits = _u8(bits)
+    p, plen = _punc_arg(n, puncture)
+    cap = n * (bits.size + K) + 8
+    out = np.empty(cap, np.uint8)
+    m = _chk(load().atkdsp_conv_encode(int(K), n, polys_a.ctypes.data_as(C.POINTER(C.c_uint32)),
+                                       _u8p(p) if p is not None else None, plen, int(mode),
+                                       _u8p(bits), bits.size, _u8p(out), cap),
+             "conv_encode", K=K, n=n, mode=mode, nbits=bits.size)
+    return out[:m].copy()
+
+
+class _Handle:
+    _kind = ""
+
+    def _log_made(self):
+        _bit_log.info("%s created: %s", self._kind, self.describe())
+        self._ncalls = 0
+
+    def _tick(self):
+        self._ncalls += 1
+        if self._ncalls % 1000 == 0:
+            _bit_log.debug("%s stats: %s", self._kind, self.stats())
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(1024)
+        getattr(self._lib, f"atkdsp_{self._kind}_describe")(self._h, buf, 1024)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _FecStats()
+        getattr(self._lib, f"atkdsp_{self._kind}_stats")(self._h, C.byref(s))
+        return _stats_dict(s)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            getattr(self._lib, f"atkdsp_{self._kind}_destroy")(h)
+
+
+class Viterbi(_Handle):
+    """General Viterbi decoder (atkdsp.h §16a); the twin is reference.Viterbi."""
+    _kind = "viterbi"
+
+    def __init__(self, K: int, polys, puncture=None, mode: int = CONV_TERM, depth: int = 0,
+                 max_bits: int = 4096):
+        self._lib = load()
+        self.K = int(K)
+        self.polys = [int(x) for x in polys]
+        self.n = len(self.polys)
+        self.mode = int(mode)
+        pa = np.ascontiguousarray(self.polys, np.uint32)
+        p, plen = _punc_arg(self.n, puncture)
+        self._h = self._lib.atkdsp_viterbi_create(
+            self.K, self.n, pa.ctypes.data_as(C.POINTER(C.c_uint32)),
+            _u8p(p) if p is not None else None, plen, self.mode, int(depth), int(max_bits))
+        if not self._h:
+            raise AtkDspError(f"viterbi_create(K={K}, polys={[oct(x) for x in self.polys]}, "
+                              f"mode={mode}, depth={depth}, max_bits={max_bits}) refused — "
+                              "K 2..15, n 1..8, generators below 2^K, every puncture column "
+                              "sending something, max_bits >= 1 for blocks")
+        self.metric = float("nan")
+        self.depth = int(depth) or ((12 if puncture is not None else 6) * self.K
+                                    if self.mode == CONV_STREAM else 0)
+        self._log_made()
+
+    def reset(self) -> None:
+        self._lib.atkdsp_viterbi_reset(self._h)
+
+    def decode(self, llr) -> np.ndarray:
+        llr = _f32(llr, "llr")
+        cap = int(self._lib.atkdsp_viterbi_out_max(self._h, llr.size))
+        out = np.empty(max(cap, 1), np.uint8)
+        met = C.c_float()
+        m = _chk(self._lib.atkdsp_viterbi_decode(self._h, _fp(llr), llr.size, _u8p(out), cap,
+                                                 C.byref(met)),
+                 "viterbi_decode", nllr=llr.size, describe=self.describe())
+        self.metric = float(met.value)
+        self._tick()
+        return out[:m].copy()
+
+    def flush(self) -> np.ndarray:
+        out = np.empty(2 * self.depth + 16, np.uint8)
+        m = _chk(self._lib.atkdsp_viterbi_flush(self._h, _u8p(out), out.size), "viterbi_flush")
+        return out[:m].copy()
+
+
+class RS(_Handle):
+    """Reed-Solomon over GF(2^m) (atkdsp.h §16b); the twin is reference.RS."""
+    _kind = "rs"
+
+    def __init__(self, m, gfpoly, fcr, prim, nroots, pad=0, dual_basis=False):
+        self._lib = load()
+        self._h = self._lib.atkdsp_rs_create(int(m), int(gfpoly), int(fcr), int(prim),
+                                             int(nroots), int(pad),
+                                             RS_DUAL_BASIS if dual_basis else 0)
+        if not self._h:
+            raise AtkDspError(f"rs_create(m={m}, gfpoly={gfpoly:#x}, fcr={fcr}, prim={prim}, "
+                              f"nroots={nroots}, pad={pad}, dual={dual_basis}) refused")
+        n, k = C.c_int(), C.c_int()
+        self._lib.atkdsp_rs_params(self._h, C.byref(n), C.byref(k))
+        self.n, self.k, self.nroots = n.value, k.value, int(nroots)
+        self._log_made()
+
+    def encode(self, data) -> np.ndarray:
+        d = np.ascontiguousarray(data, np.uint16)
+        par = np.empty(self.nroots, np.uint16)
+        _chk(self._lib.atkdsp_rs_encode(self._h, d.ctypes.data_as(C.POINTER(C.c_uint16)),
+                                        par.ctypes.data_as(C.POINTER(C.c_uint16))), "rs_encode")
+        return par
+
+    def decode(self, sym, erasures=()):
+        s = np.array(sym, np.uint16)
+        er = np.ascontiguousarray(list(erasures), np.int32)
+        pos = np.zeros(self.nroots + 1, np.int32)
+        rc = self._lib.atkdsp_rs_decode(self._h, s.ctypes.data_as(C.POINTER(C.c_uint16)),
+                                        er.ctypes.data_as(C.POINTER(C.c_int)) if er.size else None,
+                                        er.size, pos.ctypes.data_as(C.POINTER(C.c_int)))
+        self._tick()
+        if rc == E_DECODE:
+            return np.array(sym, np.uint16), E_DECODE, []
+        _chk(rc, "rs_decode", n=s.size, erasures=list(er))
+        return s, rc, [int(p) for p in pos[:rc]]
+
+
+class BCH(_Handle):
+    """Binary BCH (atkdsp.h §16c); the twin is reference.BCH."""
+    _kind = "bch"
+
+    def __init__(self, m, t, shorten=0, gfpoly=0):
+        self._lib = load()
+        self._h = self._lib.atkdsp_bch_create(int(m), int(t), int(shorten), int(gfpoly))
+        if not self._h:
+            raise AtkDspError(f"bch_create(m={m}, t={t}, shorten={shorten}, "
+                              f"gfpoly={gfpoly:#x}) refused")
+        n, k, tt = C.c_int(), C.c_int(), C.c_int()
+        self._lib.atkdsp_bch_params(self._h, C.byref(n), C.byref(k), C.byref(tt))
+        self.n, self.k, self.t = n.value, k.value, tt.value
+        self._log_made()
+
+    def generator(self) -> np.ndarray:
+        g = np.empty(self.n - self.k + 1, np.uint8)
+        self._lib.atkdsp_bch_generator(self._h, _u8p(g), g.size)
+        return g
+
+    def encode(self, data) -> np.ndarray:
+        d = _u8(data, "data")
+        out = np.empty(self.n, np.uint8)
+        _chk(self._lib.atkdsp_bch_encode(self._h, _u8p(d), _u8p(out)), "bch_encode")
+        return out
+
+    def decode(self, code):
+        c = np.array(code, np.uint8)
+        pos = np.zeros(self.t + 1, np.int32)
+        rc = self._lib.atkdsp_bch_decode(self._h, _u8p(c), pos.ctypes.data_as(C.POINTER(C.c_int)))
+        self._tick()
+        if rc == E_DECODE:
+            return np.array(code, np.uint8), E_DECODE, []
+        _chk(rc, "bch_decode", n=c.size)
+        return c, rc, [int(p) for p in pos[:rc]]
+
+
+class BlockCode(_Handle):
+    """Any small linear code by syndrome table (atkdsp.h §16d); twin reference.BlockCode."""
+    _kind = "blk"
+
+    def __init__(self, G):
+        self._lib = load()
+        G = np.ascontiguousarray(np.asarray(G, np.uint8) & 1)
+        k, n = G.shape
+        self._h = self._lib.atkdsp_blk_create(int(n), int(k), _u8p(G.ravel()))
+        if not self._h:
+            raise AtkDspError(f"blk_create({n}, {k}) refused — n <= 32, n - k <= 20, rank k")
+        nn, kk, dm = C.c_int(), C.c_int(), C.c_int()
+        self._lib.atkdsp_blk_params(self._h, C.byref(nn), C.byref(kk), C.byref(dm))
+        self.n, self.k, self.dmin = nn.value, kk.value, dm.value
+        self._log_made()
+
+    def encode(self, data) -> np.ndarray:
+        d = _u8(data, "data")
+        out = np.empty(self.n, np.uint8)
+        _chk(self._lib.atkdsp_blk_encode(self._h, _u8p(d), _u8p(out)), "blk_encode")
+        return out
+
+    def decode(self, code):
+        c = np.array(code, np.uint8)
+        d = np.zeros(self.k, np.uint8)
+        rc = self._lib.atkdsp_blk_decode(self._h, _u8p(c), _u8p(d))
+        self._tick()
+        if rc == E_DECODE:
+            return np.array(code, np.uint8), None, E_DECODE
+        _chk(rc, "blk_decode", n=c.size)
+        return c, d, rc
+
+
+# ---- §17 CRC ---------------------------------------------------------------------------
+def _spec_c(spec) -> _CrcSpec:
+    s = _CrcSpec()
+    s.width, s.poly, s.init = int(spec["width"]), int(spec["poly"]), int(spec["init"])
+    s.refin, s.refout, s.xorout = int(spec["refin"]), int(spec["refout"]), int(spec["xorout"])
+    s.check = int(spec.get("check", 0))
+    return s
+
+
+def _spec_dict(s) -> dict:
+    return {"width": s.width, "poly": s.poly, "init": s.init, "refin": s.refin,
+            "refout": s.refout, "xorout": s.xorout, "check": s.check}
+
+
+def crc(bits, spec) -> int:
+    b = _u8(bits)
+    v = C.c_uint64()
+    _chk(load().atkdsp_crc(_u8p(b), b.size, C.byref(_spec_c(spec)), C.byref(v)), "crc",
+         spec=spec)
+    return int(v.value)
+
+
+def crc_catalog() -> list:
+    """[(name, spec dict)] as the library holds them."""
+    lib = load()
+    out = []
+    for i in range(lib.atkdsp_crc_catalog_count()):
+        s = _CrcSpec()
+        lib.atkdsp_crc_catalog(i, C.byref(s))
+        out.append((lib.atkdsp_crc_catalog_name(i).decode(), _spec_dict(s)))
+    return out
+
+
+def crc_recover(frames, width: int = 0, pos: int = CRC_END, max_header: int = 0,
+                pfa: float = 1e-3, cap: int = 8) -> list:
+    frames = [_u8(f, "frame") for f in frames]
+    bits = np.ascontiguousarray(np.concatenate(frames) if frames else np.zeros(0, np.uint8))
+    lens = np.ascontiguousarray([f.size for f in frames], np.uintp)
+    buf = (_CrcCand * max(int(cap), 1))()
+    n = _chk(load().atkdsp_crc_recover(_u8p(bits), lens.ctypes.data_as(C.POINTER(C.c_size_t)),
+                                       len(frames), int(width), int(pos), int(max_header),
+                                       float(pfa), buf, int(cap)),
+             "crc_recover", nframes=len(frames), width=width, pos=pos, max_header=max_header)
+    return [{"spec": _spec_dict(c.spec), "layout": c.layout, "header_bits": c.header_bits,
+             "trailer_bits": c.trailer_bits, "init_known": c.init_known,
+             "frames_ok": c.frames_ok, "catalog": c.catalog, "log10_pfa": c.log10_pfa,
+             "alternatives": c.alternatives}
+            for c in buf[:n]]
+
+
+__all__ += ["BITS_INVERTED", "BITS_REVERSED", "SYNC_MAXBITS", "SYNC_REPETITIVE", "SCRAM_ADD",
+            "SCRAM_MULT", "CONV_TERM", "CONV_TAILBITE", "CONV_STREAM", "RS_DUAL_BASIS",
+            "CRC_END", "CRC_SEARCH", "E_DECODE", "bits_autocorr", "bits_xcorr", "bits_search",
+            "bits_columns", "bits_width_scan", "bits_sync_discover", "bits_stats", "bits_wht",
+            "bits_walsh", "bits_cyclic", "bm", "bm_profile", "bm_mask", "descramble_add",
+            "descramble_mult", "scramble_mult", "scrambler_search", "conv_encode", "Viterbi",
+            "RS", "BCH", "BlockCode", "SMALL_CODES", "cyclic_generator_matrix",
+            "extend_with_parity", "crc", "crc_catalog", "crc_spec", "crc_recover", "ascii_bits"]

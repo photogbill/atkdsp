@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 14
-#define ATKDSP_VERSION_STRING "0.13.0"
+#define ATKDSP_ABI_VERSION 15
+#define ATKDSP_VERSION_STRING "0.14.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -89,6 +89,10 @@ extern "C" {
 /* 13 -> 14: atkdsp_dmr_sync — the DMR / P25 sync correlator (§13,
  * src/dmr_sync.c): pilot-aided steering vectors and burst timing for the
  * KrakenSDR DF engine (ATK KRAKEN_DF_PLAN §6.5, §7.1). */
+/* 14 -> 15: the bitstream engine (§14-17; docs/ATKDSP_PLAN.md §D phase 1a) —
+ * bit primitives, sync discovery and bit statistics; Berlekamp-Massey and the
+ * scramblers; Viterbi, Reed-Solomon, BCH and small block codes; the CRC engine,
+ * its catalogue and CRC recovery. ATKDSP_E_DECODE (-5) is new. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -96,6 +100,7 @@ extern "C" {
 #define ATKDSP_E_NOMEM      -2   /* a *_create could not allocate            */
 #define ATKDSP_E_CAP        -3   /* caller's output buffer too small         */
 #define ATKDSP_E_FFT        -4   /* the FFT backend reported failure         */
+#define ATKDSP_E_DECODE     -5   /* a decoder found the word uncorrectable   */
 
 /* ---- types ------------------------------------------------------------- */
 typedef struct { float re, im; } atkdsp_cf32;
@@ -617,6 +622,9 @@ ATKDSP_API int atkdsp_lte_sib1_parse(const signed char *bits, int nbits,
                                      atkdsp_lte_sib1 *out);
 
 /* ---- 11f. SIB1 physical layer: subframe -> tower identity --------------
+ * DO NOT USE (2026-10-27, docs/ATKDSP_PLAN.md §0): this chain still carries
+ * six known physical-layer faults, and ATK decodes SIB1 with its own
+ * lte_sib1_rx.py instead. Kept for the ABI only; a comment, not a change.
  * The whole downlink receive chain for a SIB1: OFDM demod at the cell
  * numerology (n_rb in {6,15,25,50,75,100}), a port-0 CRS channel estimate and
  * single-tap equalisation (equalize != 0), PCFICH, a blind SI-RNTI PDCCH
@@ -634,6 +642,9 @@ ATKDSP_API int atkdsp_lte_sib1_decode(const atkdsp_cf32 *samples, size_t n,
                                       int equalize, atkdsp_lte_sib1 *out);
 
 /* ---- 11g. SystemInformation: the SIB2-5 network fingerprint ------------
+ * atkdsp_lte_si_decode: DO NOT USE (2026-10-27) -- it rides on the SIB1
+ * physical layer above and inherits its faults. atkdsp_lte_si_parse (the
+ * ASN.1 on bits) is unaffected.
  * The SIB2+ messages (carried in BCCH-DL-SCH SystemInformation, scheduled by
  * SIB1's schedulingInfoList) that make a cell's fingerprint: SIB2 (access
  * barring, PRACH config, uplink carrier freq/bandwidth, reference-signal
@@ -851,6 +862,446 @@ ATKDSP_API int       atkdsp_dmr_sync_reference(const atkdsp_dmr_sync *s, int pat
  * Hz in 21 bins of 100 Hz, threshold 0.30, guard 660, RRC a=0.20, 5 channels" */
 ATKDSP_API int       atkdsp_dmr_sync_describe(const atkdsp_dmr_sync *s, char *buf,
                                     size_t cap);
+
+/* ==== THE BITSTREAM ENGINE (v0.14.0, ABI 15) ==============================
+ * docs/ATKDSP_PLAN.md §D. Sections 14-17 below: bit primitives, scramblers
+ * and linear complexity, FEC decoders, the CRC engine and CRC recovery.
+ *
+ * Conventions for every function in 14-17:
+ *   - Bits are passed ONE PER BYTE (uint8; only bit 0 of each byte is read),
+ *     the numpy form ATK's siga already uses. Bit 0 of the array is the first
+ *     bit received. Kernels pack to 64-bit words inside.
+ *   - Patterns, words and register values written as integers are MSB-FIRST:
+ *     the first bit in time is the most significant.
+ *   - The one-shot ANALYSIS calls (bits_*, bm*, scrambler_search, crc_recover)
+ *     are not the real-time path. They may allocate scratch for the length of
+ *     the call and return ATKDSP_E_NOMEM when they cannot. The decoders'
+ *     *_decode calls on a created handle do not allocate (rule 2); a handle
+ *     carries counters (*_stats) and so is used by one thread at a time.
+ *   - Every detector or search reports log10_pfa: the base-10 log of the
+ *     chance that random bits would produce the result, multiplied by the
+ *     number of candidates the search tried (Bonferroni). -3 means "one in a
+ *     thousand, searching this widely". The formula sits beside each one.
+ *   - Recognise, never attack: these tools find structure. Encrypted or
+ *     compressed data has none, and they say so; nothing here recovers keys.
+ */
+
+/* ---- 14. bit primitives -------------------------------------------------- */
+
+/* out[k] = (agreements - disagreements) / (n - k) between b[i] and b[i+k],
+ * k = 0..max_lag (max_lag + 1 values; NaN where k >= n). +1 = the stream
+ * repeats at lag k, -1 = it repeats inverted, ~0 = unrelated (random bits
+ * give a standard deviation of 1/sqrt(n - k)). */
+ATKDSP_API int atkdsp_bits_autocorr(const uint8_t *b, size_t n, size_t max_lag, float *out);
+
+/* out[k] = (agreements - disagreements) / nb between the pattern p and
+ * a[k .. k+nb), for k = 0..na-nb (na - nb + 1 values). Needs 1 <= nb <= na. */
+ATKDSP_API int atkdsp_bits_xcorr(const uint8_t *a, size_t na, const uint8_t *p, size_t nb,
+                                 float *out);
+
+/* Pattern search with allowed errors. Reports every position whose Hamming
+ * distance to the pattern (or, per `flags`, to its complement and/or its
+ * reversal) is <= max_err. One hit per position: the variant with the fewest
+ * errors (ties: lowest variant number). pos is the index of the FIRST bit of
+ * the match (atkdsp_sync_search reports the bit after it). plen 1..4096.
+ * hits == NULL with cap == 0 counts the hits and returns the count; otherwise
+ * more than cap hits is ATKDSP_E_CAP. */
+#define ATKDSP_BITS_INVERTED 1u    /* flags / variant: the complement        */
+#define ATKDSP_BITS_REVERSED 2u    /* flags / variant: the pattern backwards */
+typedef struct {
+    long long pos;       /* first bit of the match                         */
+    int       errors;    /* bit mismatches in the winning variant           */
+    int       variant;   /* 0 = as given, |1 inverted, |2 reversed           */
+} atkdsp_bithit;         /* 16 bytes */
+ATKDSP_API ptrdiff_t atkdsp_bits_search(const uint8_t *b, size_t n, const uint8_t *pat,
+                                        size_t plen, int max_err, unsigned flags,
+                                        atkdsp_bithit *hits, size_t cap);
+
+/* The raster's column and row sums. Rows are `width` bits starting at
+ * `offset`; only whole rows count (rows = (n - offset) / width). col_ones has
+ * `width` entries, row_ones `rows`; the parities are the sums mod 2. Any
+ * output may be NULL. Returns rows. */
+ATKDSP_API ptrdiff_t atkdsp_bits_columns(const uint8_t *b, size_t n, size_t width,
+                                         size_t offset, uint32_t *col_ones,
+                                         uint32_t *row_ones, uint8_t *col_parity,
+                                         uint8_t *row_parity);
+
+/* Width scan: the raster width that makes the columns most consistent,
+ * found numerically. For each width w in w_lo..w_hi (w >= 2) the stream is
+ * cut into R = n / w whole rows from bit 0, and
+ *   raw[w - w_lo] = mean over the w columns of |2 p_c - 1|   (p_c = ones fraction)
+ *   z[w - w_lo]   = (raw - mu_R) / (sigma_R / sqrt(w))
+ * where mu_R = E|2K/R - 1| and sigma_R^2 = 1/R - mu_R^2 for K ~ Binomial(R, 1/2)
+ * — random bits give z ~ N(0, 1) at every width, so widths compare directly
+ * and a threshold is a normal quantile: z > Phi^-1(1 - pfa / widths scanned).
+ * A frame of length F peaks at F and at its multiples (the harmonic rule:
+ * take the smallest width that reaches the peak). R < 2 gives NaN. raw may be
+ * NULL. */
+ATKDSP_API int atkdsp_bits_width_scan(const uint8_t *b, size_t n, size_t w_lo, size_t w_hi,
+                                      float *z, float *raw);
+
+/* Sync discovery: recurring words nobody put in a table.
+ * Every word_len-bit window (8..32) is hashed; for each word seen at least
+ * min_count times (after thinning occurrences closer than word_len; n < 2^31), the most
+ * common gap between occurrences is its period P and the most populated
+ * residue mod P its phase. Windows at consecutive phases of one period that
+ * overlap consistently and whose counts agree (the smaller above
+ * mx/2 + 1.5 sqrt(mx): 3 sigma above what one random extra bit would leave)
+ * are merged into one longer pattern (up to 128 bits), counted exactly on its
+ * grid, and trimmed from either end while that lowers log10_pfa (a field
+ * that never changes stays in, a counter's slowly changing bit drops out).
+ *   expected  = grid slots * 2^-length  (matches random bits would put there)
+ *   log10_pfa = log10 P(Binomial(slots, 2^-length) >= count)
+ *               + log10(2^word_len * (n / word_len) * P)   (words x periods x phases)
+ * Reported when log10_pfa <= log10(pfa) (pfa <= 0 means 1e-3), best first;
+ * returns the best `cap`. flags bit 0: the pattern is itself periodic in at
+ * most half its length (idle fill or a preamble, not a sync word). */
+#define ATKDSP_SYNC_MAXBITS 128
+#define ATKDSP_SYNC_REPETITIVE 1
+typedef struct {
+    long long first;         /* position of the first on-grid match         */
+    int       period;        /* bits from one occurrence to the next        */
+    int       length;        /* pattern bits (word_len..128)                */
+    int       count;         /* exact matches on the grid                   */
+    int       flags;         /* ATKDSP_SYNC_REPETITIVE                      */
+    double    expected;      /* matches random bits would give on the grid  */
+    double    log10_pfa;     /* see above                                   */
+    uint8_t   pattern[ATKDSP_SYNC_MAXBITS];   /* one bit per byte          */
+} atkdsp_synccand;           /* 168 bytes */
+ATKDSP_API ptrdiff_t atkdsp_bits_sync_discover(const uint8_t *b, size_t n, int word_len,
+                                               int min_count, double pfa,
+                                               atkdsp_synccand *out, size_t cap);
+
+/* Bit statistics in one pass. NIST SP 800-22 rev 1a where named.
+ *   run0 / run1   run-length histograms; [k] = runs of exactly k (1..31),
+ *                 [32] = runs of 32 or more; the first and last runs count
+ *   ngram[k-1][v] overlapping k-bit windows with value v (MSB first), k = 1..8
+ *   chi2          non-overlapping chi2_bits-bit words against uniform; chi2_bits
+ *                 is the widest (<= 8) with at least 5 expected per cell;
+ *                 chi2_p = Q(dof/2, chi2/2)
+ *   maurer        Maurer's universal statistic fn (§2.9) at the largest block L
+ *                 with n >= 1010 * L * 2^L (NIST's own table); maurer_L = 0 and
+ *                 NaN when n < 2020
+ *   apen          approximate entropy ApEn(m) (§2.12), m = min(10, floor(log2 n) - 6);
+ *                 apen_m = 0 and NaN when n < 128
+ *   block_entropy non-overlapping w-bit words, bits per BIT (1.0 = maximal),
+ *                 w = 1..16 at [w-1]; NaN while there are fewer words than 2^w
+ *                 (a plug-in estimate below that cannot reach its maximum) */
+typedef struct {
+    uint64_t n, ones;
+    double   density;
+    uint64_t run0[33], run1[33];
+    uint64_t ngram[8][256];
+    double   chi2, chi2_p, maurer, maurer_p, apen, apen_p;
+    double   block_entropy[16];
+    int      chi2_bits, maurer_L, apen_m, reserved;
+} atkdsp_bitstats;
+ATKDSP_API int atkdsp_bits_stats(const uint8_t *b, size_t n, atkdsp_bitstats *out);
+
+/* Walsh-Hadamard parity relations between columns. Rows of `width` bits from
+ * bit 0 (rows = n / width); for each row the chosen columns form a value
+ * v = sum_j b[row*width + cols[j]] << j (ncols 1..24), and
+ *   spectrum[u] = sum over rows of (-1)^(parity of the columns selected by u)
+ * for u = 0..2^ncols - 1. spectrum[0] = rows. A linear relation — a parity or
+ * checksum bit, an XOR of fields — gives |spectrum[u]| = rows; random columns
+ * give about sqrt(rows). Returns rows (at most 2^31 - 1, else ATKDSP_E_ARG). */
+ATKDSP_API ptrdiff_t atkdsp_bits_wht(const uint8_t *b, size_t n, size_t width,
+                                     const uint32_t *cols, int ncols, int32_t *spectrum);
+
+/* The analyzer-strip transforms, over blocks of `size` bits (a power of two,
+ * 4..65536), averaged over navg consecutive blocks (navg <= 0: every whole
+ * block). x = 1 - 2b (+-1). Returns the blocks used; 0 (outputs NaN) when
+ * n < size. Either output may be NULL.
+ *  walsh:  sequency_power[s] = X[h(s)]^2 / size, X = Walsh-Hadamard transform
+ *          of x, listed in SEQUENCY order (s = number of sign changes of the
+ *          Walsh function; h(s) = bit-reverse(s ^ (s >> 1))), size entries;
+ *          dyadic_acf[t] = (1/size) sum_i x[i] x[i XOR t], natural order.
+ *  cyclic: cyclic_time[t] = (1/size) sum_i x[i] x[(i + t) mod size], size
+ *          entries; cyclic_freq[k] = |DFT(x)[k]|^2 / size, k = 0..size/2. */
+ATKDSP_API ptrdiff_t atkdsp_bits_walsh(const uint8_t *b, size_t n, size_t size, int navg,
+                                       float *sequency_power, float *dyadic_acf);
+ATKDSP_API ptrdiff_t atkdsp_bits_cyclic(const uint8_t *b, size_t n, size_t size, int navg,
+                                        float *cyclic_time, float *cyclic_freq);
+
+/* ---- 15. scramblers and linear complexity ------------------------------- */
+
+/* Berlekamp-Massey over GF(2): the shortest LFSR that generates b[0..n).
+ * poly receives the connection polynomial c_0..c_L (c_0 = 1) with
+ *   b[k] = XOR_{j=1..L} c_j b[k-j]      for every k >= L.
+ * Returns L (the linear complexity), ATKDSP_E_CAP when cap < L + 1.
+ * An L-stage register needs only 2L bits to be found. */
+ATKDSP_API ptrdiff_t atkdsp_bm(const uint8_t *b, size_t n, uint8_t *poly, size_t cap);
+/* The linear complexity profile: L_of_n[i] = linear complexity of b[0..i].
+ * An LFSR plateaus at its length; random bits track (i + 1) / 2. Returns the
+ * final L. */
+ATKDSP_API ptrdiff_t atkdsp_bm_profile(const uint8_t *b, size_t n, int32_t *L_of_n);
+
+/* Scrambler registers. `poly` is the polynomial as a bitmask in ATK siga.bits'
+ * convention (siga.bits.lfsr_sequence): degree D = highest set bit (2..63),
+ * bit 0 must be set, and the register obeys
+ *   r[t + D] = XOR over i < D with bit i set of r[t + i].
+ * `*state` is the register, carried across calls (bit i = the i-th oldest of
+ * the D bits it holds), so a stream may be fed in any blocks.
+ *  descramble_add: additive (synchronous). out = b XOR the register output;
+ *     state is the LFSR (seed it with the scrambler's start state, nonzero).
+ *     Scrambling and descrambling are the same operation.
+ *  descramble_mult / scramble_mult: multiplicative (self-synchronising):
+ *     out[t] = b[t] XOR (XOR over i < D, bit i set, of s[t - D + i]) where s is
+ *     the SCRAMBLED stream; state holds its last D bits. The descrambler
+ *     locks after D bits from any start state; one channel error comes out as
+ *     one error per term of the polynomial.
+ * The same mask in both means the same register: a multiplicative scrambler
+ * fed zeros emits the additive one's sequence. Returns 0, or ATKDSP_E_ARG for
+ * a mask without bit 0 (a register that only ever emits zeros) or a zero seed. */
+ATKDSP_API int atkdsp_descramble_add(const uint8_t *b, size_t n, uint64_t poly,
+                                     uint64_t *state, uint8_t *out);
+ATKDSP_API int atkdsp_descramble_mult(const uint8_t *b, size_t n, uint64_t poly,
+                                      uint64_t *state, uint8_t *out);
+ATKDSP_API int atkdsp_scramble_mult(const uint8_t *b, size_t n, uint64_t poly,
+                                    uint64_t *state, uint8_t *out);
+
+/* Scrambler search: which register, ranked by the structure it leaves.
+ * Candidates are every trinomial (max_terms 3) or trinomial and pentanomial
+ * (max_terms 5) of degree 2..max_degree (<= 32) — odd weight, as every
+ * primitive polynomial has — in a fixed order: degree, then middle taps
+ * lexicographic. Each is applied as the feed-forward filter
+ *   y[t] = b[t] XOR (XOR over i < D, bit i set, of b[t - D + i])
+ * which IS the multiplicative descrambler, and which also removes an additive
+ * scrambler whatever its seed (the register sequence satisfies its own
+ * recurrence), leaving the data smeared by the polynomial. The structure of y
+ * over bits max_degree..n is the G statistic of its non-overlapping w-bit words
+ * against uniform (w = widest <= 8 with 5 expected per cell; dof = 2^w - 1):
+ *   G = 2 sum O ln(O / E) ~ chi2(dof) for random bits,
+ *   log10_pfa = log10 Q(dof/2, G/2) + log10(candidates + 1).
+ * *g_identity (may be NULL) is the same statistic on b itself — doing nothing.
+ * A candidate is reported when log10_pfa <= log10(pfa) (pfa <= 0: 1e-3) AND
+ * G - G_identity > z * sqrt(4 dof), z = Phi^-1(1 - pfa / (candidates + 1)):
+ * a stream that already had its structure was not scrambled. Best G first
+ * (near-ties: lower degree, fewer taps). ADD also recovers the seed when y
+ * holds a constant run of 2D bits or more (the data was constant there, so
+ * the register is b XOR that constant), steps the register back to bit 0, and
+ * reports g_data, the statistic of the stream descrambled with that seed.
+ * Returns the number reported (the best `cap`). */
+#define ATKDSP_SCRAM_ADD  0
+#define ATKDSP_SCRAM_MULT 1
+typedef struct {
+    uint64_t poly;        /* siga.bits mask                                    */
+    uint64_t seed;        /* ADD, seeded: the register at bit 0                */
+    double   g;           /* G statistic of the filtered stream y              */
+    double   log10_pfa;
+    double   g_data;      /* ADD, seeded: G of the seeded descramble; else NaN */
+    int      degree;
+    int      terms;       /* nonzero terms: 3 or 5                             */
+    int      seeded;
+    int      block_bits;  /* w                                                 */
+} atkdsp_scramcand;       /* 56 bytes */
+ATKDSP_API ptrdiff_t atkdsp_scrambler_search(const uint8_t *b, size_t n, int kind,
+                                             int max_degree, int max_terms, double pfa,
+                                             double *g_identity,
+                                             atkdsp_scramcand *out, size_t cap);
+
+/* ---- 16. FEC decoders ------------------------------------------------------
+ * Soft input is a log-likelihood ratio per coded bit, LLR = ln P(0)/P(1):
+ * positive means 0. Hard bits go in as +1 (bit 0) / -1 (bit 1); 0 is an
+ * erasure. The decoders count what they do: */
+typedef struct {
+    uint64_t calls;       /* decode calls                                      */
+    uint64_t in;          /* LLRs (Viterbi) or codewords (block codes) taken   */
+    uint64_t out;         /* bits decided (Viterbi) or codewords returned      */
+    uint64_t corrected;   /* bits / symbols changed by the block decoders      */
+    uint64_t failures;    /* words found uncorrectable                         */
+    uint64_t resets;
+} atkdsp_fec_stats;       /* 48 bytes */
+
+/* 16a. Convolutional codes. Rate 1/n (n 1..8), constraint length K (2..15),
+ * generators in the usual octal form: the MOST significant of the K bits
+ * multiplies the CURRENT input bit (K=7 NASA: 0171, 0133; LTE: 0133, 0171,
+ * 0165). Optional puncturing: an n x punc_len matrix, row-major (row i =
+ * output i, column j = input bit t with t mod punc_len = j), 1 = sent; the
+ * coded stream interleaves the kept outputs of each input bit in order i.
+ *   TERM      the encoder starts at zero and K-1 zero tail bits follow the
+ *             data (they are coded and sent; decode returns the data only).
+ *   TAILBITE  the encoder starts in the state its last K-1 data bits leave
+ *             (LTE PBCH/PDCCH). Decoded wrap-around: the block is extended by
+ *             `depth` steps of itself on both sides (0 = the whole block,
+ *             i.e. three laps) and traced back from the best end state.
+ *   STREAM    continuous; decisions are released `depth` steps late (0 =
+ *             6K, 12K punctured), at fixed step indices, so the output is
+ *             identical however the LLRs are chunked; _flush releases the rest.
+ * max_bits bounds the data bits of one TERM or TAILBITE block (<= 2^28) — the
+ * decision memory and every scratch buffer are allocated once, here.
+ * Metrics are float32; each step subtracts the best metric so they never grow. */
+#define ATKDSP_CONV_TERM     0
+#define ATKDSP_CONV_TAILBITE 1
+#define ATKDSP_CONV_STREAM   2
+typedef struct atkdsp_viterbi atkdsp_viterbi;
+ATKDSP_API atkdsp_viterbi *atkdsp_viterbi_create(int K, int n, const uint32_t *polys,
+                                                 const uint8_t *puncture, int punc_len,
+                                                 int mode, int depth, size_t max_bits);
+ATKDSP_API void      atkdsp_viterbi_destroy(atkdsp_viterbi *v);
+ATKDSP_API void      atkdsp_viterbi_reset(atkdsp_viterbi *v);
+/* Most bits one decode of nllr LLRs can return. */
+ATKDSP_API size_t    atkdsp_viterbi_out_max(const atkdsp_viterbi *v, size_t nllr);
+/* TERM / TAILBITE: llr is exactly one block (its length fixes the step count;
+ * a length no step count produces is ATKDSP_E_ARG). Returns the data bits.
+ * *metric (may be NULL) = the decoded path's correlation with the input,
+ * sum (1 - 2c) llr / sum |llr|: 1.0 when every received bit agrees with the
+ * decoded codeword, ~0 for noise. STREAM: any number of LLRs; returns the bits
+ * released by this call; *metric is NaN. */
+ATKDSP_API ptrdiff_t atkdsp_viterbi_decode(atkdsp_viterbi *v, const float *llr, size_t nllr,
+                                           uint8_t *bits, size_t cap, float *metric);
+/* STREAM: trace back from the best state and release every undecided bit
+ * (a partial step's LLRs are dropped). Other modes: 0. */
+ATKDSP_API ptrdiff_t atkdsp_viterbi_flush(atkdsp_viterbi *v, uint8_t *bits, size_t cap);
+/* "Viterbi K=7 r=1/2 (0171, 0133), punctured 3/4 [110 101], streaming, depth 84" */
+ATKDSP_API int       atkdsp_viterbi_describe(const atkdsp_viterbi *v, char *buf, size_t cap);
+ATKDSP_API int       atkdsp_viterbi_stats(const atkdsp_viterbi *v, atkdsp_fec_stats *st);
+/* The encoder for every case above (TERM appends the tail; STREAM starts at
+ * zero and adds none). Returns coded bits written. */
+ATKDSP_API ptrdiff_t atkdsp_conv_encode(int K, int n, const uint32_t *polys,
+                                        const uint8_t *puncture, int punc_len, int mode,
+                                        const uint8_t *bits, size_t nbits,
+                                        uint8_t *out, size_t cap);
+
+/* 16b. Reed-Solomon over GF(2^m), m = 3..16, in the usual parameters:
+ * gfpoly the field polynomial (bit m set), fcr the first consecutive root
+ * (index form), prim the root spacing (the generator's roots are
+ * alpha^(prim*(fcr + i)), i < nroots), pad the shortening (leading zero
+ * symbols not sent). n = 2^m - 1 - pad, k = n - nroots. Codewords are
+ * systematic: k data symbols then nroots parity. Decoding is Berlekamp-Massey
+ * + Chien + Forney with erasures (2 errors + erasures <= nroots).
+ * ATKDSP_RS_DUAL_BASIS: symbols on the wire are in Berlekamp's dual basis, the
+ * CCSDS 131.0-B convention (m = 8 with gfpoly 0x187 only). CCSDS RS(255,223):
+ * (8, 0x187, 112, 11, 32, 0, ATKDSP_RS_DUAL_BASIS). decode corrects sym in
+ * place and returns the symbols corrected (err_pos, may be NULL, receives
+ * their positions; nroots entries suffice), or ATKDSP_E_DECODE. */
+#define ATKDSP_RS_DUAL_BASIS 1
+typedef struct atkdsp_rs atkdsp_rs;
+ATKDSP_API atkdsp_rs *atkdsp_rs_create(int m, uint32_t gfpoly, int fcr, int prim,
+                                       int nroots, int pad, int flags);
+ATKDSP_API void       atkdsp_rs_destroy(atkdsp_rs *r);
+ATKDSP_API int        atkdsp_rs_params(const atkdsp_rs *r, int *n, int *k);
+ATKDSP_API int        atkdsp_rs_encode(atkdsp_rs *r, const uint16_t *data, uint16_t *parity);
+ATKDSP_API int        atkdsp_rs_decode(atkdsp_rs *r, uint16_t *sym, const int *erasures,
+                                       int nerase, int *err_pos);
+ATKDSP_API int        atkdsp_rs_describe(const atkdsp_rs *r, char *buf, size_t cap);
+ATKDSP_API int        atkdsp_rs_stats(const atkdsp_rs *r, atkdsp_fec_stats *st);
+
+/* 16c. Binary BCH, narrow sense: n = 2^m - 1 - shorten (m 3..16), designed
+ * to correct t errors; the generator is the product of the distinct minimal
+ * polynomials of alpha^1..alpha^2t over the field gfpoly (0 = the default
+ * primitive polynomial for m). Codewords are data (k bits) then parity, the
+ * first bit the highest-degree coefficient — POCSAG's BCH(31,21) is
+ * (5, 2, 0, 0). decode corrects in place: returns bits corrected (err_pos,
+ * may be NULL, gets their indices; t entries suffice) or ATKDSP_E_DECODE. */
+typedef struct atkdsp_bch atkdsp_bch;
+ATKDSP_API atkdsp_bch *atkdsp_bch_create(int m, int t, int shorten, uint32_t gfpoly);
+ATKDSP_API void        atkdsp_bch_destroy(atkdsp_bch *b);
+ATKDSP_API int         atkdsp_bch_params(const atkdsp_bch *b, int *n, int *k, int *t);
+/* The generator, n - k + 1 coefficients, highest degree first. Returns n - k. */
+ATKDSP_API int         atkdsp_bch_generator(const atkdsp_bch *b, uint8_t *g, size_t cap);
+ATKDSP_API int         atkdsp_bch_encode(atkdsp_bch *b, const uint8_t *data, uint8_t *code);
+ATKDSP_API int         atkdsp_bch_decode(atkdsp_bch *b, uint8_t *code, int *err_pos);
+ATKDSP_API int         atkdsp_bch_describe(const atkdsp_bch *b, char *buf, size_t cap);
+ATKDSP_API int         atkdsp_bch_stats(const atkdsp_bch *b, atkdsp_fec_stats *st);
+
+/* 16d. Any small binary linear code from its generator matrix (k x n,
+ * row-major 0/1, rank k; n <= 32, n - k <= 20), decoded by syndrome table:
+ * the received word is moved to the nearest codeword (the minimum-weight
+ * coset leader). When two error patterns of that weight share the syndrome
+ * the word is equidistant from two codewords, and decode says so
+ * (ATKDSP_E_DECODE) rather than pick one. dmin is found while the table is
+ * built. The build is bounded: a weight level that would take it past 2^25
+ * error patterns is not started, so a degenerate code (dmin 1, e.g. [I | 0])
+ * builds in seconds and the syndromes it never reached decode as
+ * uncorrectable (for k > 20 an unfound dmin is reported 0). data (k, may be
+ * NULL) receives the information bits of the corrected codeword. Returns bits
+ * corrected. */
+typedef struct atkdsp_blk atkdsp_blk;
+ATKDSP_API atkdsp_blk *atkdsp_blk_create(int n, int k, const uint8_t *G);
+ATKDSP_API void        atkdsp_blk_destroy(atkdsp_blk *c);
+ATKDSP_API int         atkdsp_blk_params(const atkdsp_blk *c, int *n, int *k, int *dmin);
+ATKDSP_API int         atkdsp_blk_encode(const atkdsp_blk *c, const uint8_t *data, uint8_t *code);
+ATKDSP_API int         atkdsp_blk_decode(atkdsp_blk *c, uint8_t *code, uint8_t *data);
+ATKDSP_API int         atkdsp_blk_describe(const atkdsp_blk *c, char *buf, size_t cap);
+ATKDSP_API int         atkdsp_blk_stats(const atkdsp_blk *c, atkdsp_fec_stats *st);
+
+/* ---- 17. the CRC engine and CRC recovery --------------------------------
+ * Parameters in the Rocksoft model (width 1..64; poly without its x^width
+ * term; init the register preset; refin reflects each input BYTE; refout
+ * reflects the register before xorout). Messages are bits and need not be
+ * whole bytes. The register runs MSB-first over the bits in the order given,
+ * so the check value over "123456789" is the CRC of its ASCII bytes written
+ * out MSB-first. For an air stream sent LSB-first, the air order already IS
+ * the reflected order: pass it with refin = 0. refin with a partial last byte
+ * reflects the whole bytes only. */
+typedef struct {
+    uint64_t poly, init, xorout;
+    uint64_t check;       /* catalogue: the CRC of "123456789"                 */
+    int      width, refin, refout, reserved;
+} atkdsp_crcspec;         /* 48 bytes */
+ATKDSP_API int atkdsp_crc(const uint8_t *bits, size_t nbits, const atkdsp_crcspec *s,
+                          uint64_t *out);
+/* The catalogue of named parameter sets (facts, re-typed from the published
+ * catalogues; each one's check value is tested). */
+ATKDSP_API int         atkdsp_crc_catalog_count(void);
+ATKDSP_API int         atkdsp_crc_catalog(int idx, atkdsp_crcspec *out);
+ATKDSP_API const char *atkdsp_crc_catalog_name(int idx);
+
+/* CRC recovery: an unknown CRC worked out from frames that carry it.
+ * Frames are back to back in `bits`, frame i nbits[i] long (each <= 2^24). A CRC is affine:
+ * with the coverage of frame i read as a polynomial p_i (message M_i, field
+ * un-reflected / un-swapped to the register value),
+ *   p_i = M_i x^w + field_i  ==  init x^(len M_i) + xorout'   (mod g)
+ * so the XOR of two frames of one length is a multiple of g (init and xorout
+ * cancel), and three frames of different lengths combine into one that is
+ * too. The GCD of those polynomials is g (spurious (1+x) powers from the
+ * length differences removed); init and xorout then come from a 2-unknown
+ * linear solve, and every candidate must reproduce EVERY frame.
+ * Searched: width (0 = 3..64), reflection (refin/refout) and field layout
+ * (MSB first, or little-endian bytes for byte widths), a header the CRC does
+ * not cover (0..max_header bits; ATKDSP_CRC_END), or bits after the field
+ * (ATKDSP_CRC_SEARCH: the field need not end the frame).
+ *   log10_pfa = log10(trials) - w * (equations beyond the unknowns) * log10 2
+ * (each frame is w bits of equations; g, init and xorout cost w each). Needs
+ * at least three frames (two of one length, or three lengths with four or
+ * more frames when init is unknown). Reported when log10_pfa <= log10(pfa)
+ * (pfa <= 0: 1e-3). Width unknown: offsets beyond 0 are scanned for the plain
+ * form only (refin = refout = 0, MSB-first field).
+ * What frames cannot decide, and how it is reported:
+ *  - a bit constant across all frames (a header before the coverage, a
+ *    trailer after the field) is absorbed into init or xorout by an equally
+ *    valid set at another offset;
+ *  - a polynomial that factors is also exactly a CRC of each factor's width,
+ *    and with few frames a spurious factor can stand in for one of g's own;
+ *  - for g with an (x+1) factor, h = g/(x+1) gives h x^L == h (mod g) for
+ *    every L, so (init ^ h, xorout ^ h) is the same CRC: init_known = 0.
+ * So every offset is scanned and every set that reproduces every frame is
+ * returned, `alternatives` counting the others of its width, ranked: a
+ * catalogue set first, then simple sets (init and xorout each 0 or all ones),
+ * then log10_pfa, then a byte-aligned offset (a prior, not a deduction), then
+ * the smaller offset. More frames remove the spurious alternatives; what the
+ * protocol is known to be removes the rest. init_known = 0 when every frame has the
+ * same length: init and xorout cannot be separated and init is reported 0
+ * with xorout absorbing it — exact for that length (a catalogue set that
+ * reproduces the frames is substituted and named). */
+#define ATKDSP_CRC_END    0
+#define ATKDSP_CRC_SEARCH 1
+typedef struct {
+    atkdsp_crcspec spec;   /* .check = the recovered set's CRC of "123456789" */
+    int    layout;         /* 0 = field MSB first, 1 = little-endian bytes     */
+    int    header_bits;    /* leading bits outside the coverage                */
+    int    trailer_bits;   /* bits after the field                             */
+    int    init_known;     /* see above                                        */
+    int    frames_ok;      /* frames the set reproduces (= nframes)            */
+    int    catalog;        /* index of the identical catalogue set, or -1      */
+    double log10_pfa;
+    int    alternatives;   /* other reported sets of this width that also fit  */
+    int    reserved;
+} atkdsp_crccand;          /* 88 bytes */
+ATKDSP_API ptrdiff_t atkdsp_crc_recover(const uint8_t *bits, const size_t *nbits, int nframes,
+                                        int width, int pos, int max_header, double pfa,
+                                        atkdsp_crccand *out, size_t cap);
 
 #ifdef __cplusplus
 }

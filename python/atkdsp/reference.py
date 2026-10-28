@@ -3288,3 +3288,2002 @@ def _sync_describe(s) -> str:
             f"of {s.cfo_step:.0f} Hz, threshold {s.threshold:.2f}, guard {s.guard}, {pulse}, "
             f"{s.n_channels} channel{'s' if s.n_channels != 1 else ''}"
             f"{', inverted' if s.invert else ''}")
+
+
+# ============================================================================
+# THE BITSTREAM ENGINE (§14-17) — the twins of src/bits.c, src/scramble.c,
+# src/fec_conv.c, src/fec_rs.c, src/fec_blk.c, src/crc.c, src/crc_recover.c.
+# ----------------------------------------------------------------------------
+# Bits are one per uint8 (only bit 0 read), first bit first; integer words are
+# MSB-first. Every function here computes what the C computes, in the same
+# order where order matters (the scrambler search's G statistic, the Viterbi
+# metrics in float32, the CRC recovery's search), so the cross-check can ask
+# for equality — and so ATK's fallback, when the DLL is absent, is slower but
+# never different.
+# ============================================================================
+import math as _m
+
+_LN2 = _m.log(2.0)
+_LN10 = _m.log(10.0)
+
+
+def _bits(b) -> np.ndarray:
+    return (np.ascontiguousarray(b, dtype=np.uint8).ravel() & 1).astype(np.uint8)
+
+
+# ---- §14 helpers: the statistics src/stat.c shares ---------------------------
+def _gamma_p_series(a, x):
+    ap, dl = a, 1.0 / a
+    s = dl
+    for _ in range(1000):
+        ap += 1.0
+        dl *= x / ap
+        s += dl
+        if abs(dl) < abs(s) * 1e-16:
+            break
+    return s * _m.exp(-x + a * _m.log(x) - _m.lgamma(a))
+
+
+def _gamma_q_cf_log(a, x):
+    tiny = 1e-300
+    b = x + 1.0 - a
+    c = 1.0 / tiny
+    d = 1.0 / b
+    h = d
+    for i in range(1, 1000):
+        an = -float(i) * (float(i) - a)
+        b += 2.0
+        d = an * d + b
+        if abs(d) < tiny:
+            d = tiny
+        c = b + an / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        dl = d * c
+        h *= dl
+        if abs(dl - 1.0) < 1e-16:
+            break
+    return _m.log(h)
+
+
+def log_igamc(a, x) -> float:
+    """ln Q(a, x), the regularised upper incomplete gamma, finite in the tail."""
+    if not a > 0.0 or not x > 0.0:
+        return 0.0
+    if x < a + 1.0:
+        p = _gamma_p_series(a, x)
+        return -_m.inf if p >= 1.0 else _m.log1p(-p)
+    return -x + a * _m.log(x) - _m.lgamma(a) + _gamma_q_cf_log(a, x)
+
+
+def igamc(a, x) -> float:
+    return _m.exp(log_igamc(a, x))
+
+
+def log10_binom_tail(n, c, ln_q) -> float:
+    """log10 P(Binomial(n, q) >= c), 0 at or below the mean."""
+    if c <= 0.0:
+        return 0.0
+    if c > n:
+        return -_m.inf
+    q = _m.exp(ln_q)
+    if c <= n * q:
+        return 0.0
+    ln_1mq = _m.log1p(-q)
+
+    def term(k):
+        return (_m.lgamma(n + 1.0) - _m.lgamma(k + 1.0) - _m.lgamma(n - k + 1.0)
+                + k * ln_q + (n - k) * ln_1mq)
+    t0 = term(c)
+    s = 1.0
+    k = c + 1.0
+    while k <= n:
+        d = term(k) - t0
+        if d < -40.0:
+            break
+        s += _m.exp(d)
+        k += 1.0
+    r = (t0 + _m.log(s)) / _LN10
+    return 0.0 if r > 0.0 else r
+
+
+_ACK_A = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+          1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+_ACK_B = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+          6.680131188771972e+01, -1.328068155288572e+01)
+_ACK_C = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+          -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+_ACK_D = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+          3.754408661907416e+00)
+
+
+def _norm_ppf(q):
+    a, b, c, d = _ACK_A, _ACK_B, _ACK_C, _ACK_D
+    plow = 0.02425
+    if q <= 0.0:
+        return -_m.inf
+    if q >= 1.0:
+        return _m.inf
+    if q < plow:
+        t = _m.sqrt(-2.0 * _m.log(q))
+        x = ((((((c[0] * t + c[1]) * t + c[2]) * t + c[3]) * t + c[4]) * t + c[5])
+             / ((((d[0] * t + d[1]) * t + d[2]) * t + d[3]) * t + 1.0))
+    elif q <= 1.0 - plow:
+        r = q - 0.5
+        s = r * r
+        x = ((((((a[0] * s + a[1]) * s + a[2]) * s + a[3]) * s + a[4]) * s + a[5]) * r
+             / (((((b[0] * s + b[1]) * s + b[2]) * s + b[3]) * s + b[4]) * s + 1.0))
+    else:
+        t = _m.sqrt(-2.0 * _m.log(1.0 - q))
+        x = -((((((c[0] * t + c[1]) * t + c[2]) * t + c[3]) * t + c[4]) * t + c[5])
+              / ((((d[0] * t + d[1]) * t + d[2]) * t + d[3]) * t + 1.0))
+    e = 0.5 * _m.erfc(-x / _m.sqrt(2.0)) - q
+    u = e * _m.sqrt(2.0 * _m.pi) * _m.exp(x * x / 2.0)
+    return x - u / (1.0 + x * u / 2.0)
+
+
+def norm_isf(p) -> float:
+    """z with P(N(0,1) > z) = p (Acklam + one Halley step)."""
+    return -_norm_ppf(p)
+
+
+def chi_width(nbits) -> int:
+    for w in range(8, 0, -1):
+        if nbits // w >= 5 << w:
+            return w
+    return 0
+
+
+def _words(b, w):
+    """Non-overlapping w-bit words from bit 0, MSB-first."""
+    nw = b.size // w
+    if nw == 0:
+        return np.zeros(0, np.int64)
+    blk = b[:nw * w].reshape(nw, w).astype(np.int64)
+    return blk @ (1 << np.arange(w - 1, -1, -1, dtype=np.int64))
+
+
+def gstat(b, w) -> float:
+    """G = 2 sum O ln(O/E) of w-bit words against uniform (cells ascending)."""
+    words = _words(_bits(b), w)
+    cells = 1 << w
+    if words.size == 0:
+        return float("nan")
+    cnt = np.bincount(words, minlength=cells)
+    e = words.size / cells
+    g = 0.0
+    for v in range(cells):
+        o = int(cnt[v])
+        if o:
+            g += o * _m.log(o / e)
+    return 2.0 * g
+
+
+# ---- §14 bit primitives --------------------------------------------------------
+BITS_INVERTED = 1
+BITS_REVERSED = 2
+SYNC_MAXBITS = 128
+SYNC_REPETITIVE = 1
+
+
+def bits_autocorr(b, max_lag: int) -> np.ndarray:
+    b = _bits(b)
+    n = b.size
+    out = np.full(max_lag + 1, np.nan, np.float32)
+    for k in range(min(max_lag, n - 1) + 1):
+        m = n - k
+        d = int(np.count_nonzero(b[:m] != b[k:k + m]))
+        out[k] = np.float32((m - 2.0 * d) / m)
+    return out
+
+
+def bits_xcorr(a, p) -> np.ndarray:
+    a = _bits(a)
+    p = _bits(p)
+    nb = p.size
+    if nb < 1 or nb > a.size:
+        raise ValueError("bits_xcorr needs 1 <= len(p) <= len(a)")
+    win = np.lib.stride_tricks.sliding_window_view(a, nb)
+    d = np.count_nonzero(win != p[None, :], axis=1)
+    return ((nb - 2.0 * d) / nb).astype(np.float32)
+
+
+def bits_search(b, pat, max_err: int = 0, flags: int = 0) -> list:
+    """[(pos, errors, variant)] — see atkdsp.h §14."""
+    b = _bits(b)
+    pat = _bits(pat)
+    plen = pat.size
+    if plen < 1 or plen > 4096 or max_err < 0:
+        raise ValueError("bits_search: plen 1..4096, max_err >= 0")
+    if plen > b.size:
+        return []
+    win = np.lib.stride_tricks.sliding_window_view(b, plen)
+    d0 = np.count_nonzero(win != pat[None, :], axis=1).astype(np.int64)
+    cand = [d0]
+    names = [0]
+    if flags & BITS_INVERTED:
+        cand.append(plen - d0); names.append(1)
+    if flags & BITS_REVERSED:
+        d2 = np.count_nonzero(win != pat[::-1][None, :], axis=1).astype(np.int64)
+        cand.append(d2); names.append(2)
+        if flags & BITS_INVERTED:
+            cand.append(plen - d2); names.append(3)
+    stack = np.stack(cand)
+    best_i = np.argmin(stack, axis=0)                 # first minimum = lowest variant
+    best = stack[best_i, np.arange(stack.shape[1])]
+    idx = np.nonzero(best <= max_err)[0]
+    return [(int(p), int(best[p]), int(names[best_i[p]])) for p in idx]
+
+
+def bits_columns(b, width: int, offset: int = 0):
+    """(col_ones uint32[width], row_ones uint32[rows], col_parity, row_parity)."""
+    b = _bits(b)
+    rows = (b.size - offset) // width if offset < b.size else 0
+    r = b[offset:offset + rows * width].reshape(rows, width).astype(np.uint32)
+    col = r.sum(axis=0, dtype=np.uint32) if rows else np.zeros(width, np.uint32)
+    row = r.sum(axis=1, dtype=np.uint32)
+    return col, row, (col & 1).astype(np.uint8), (row & 1).astype(np.uint8)
+
+
+def _width_mu(R):
+    h = float(R // 2)
+    if h < 1.0:
+        return 1.0
+    return _m.exp(_m.lgamma(2.0 * h + 1.0) - 2.0 * _m.lgamma(h + 1.0) - 2.0 * h * _LN2)
+
+
+def bits_width_scan(b, w_lo: int, w_hi: int):
+    """(z, raw) float32 for widths w_lo..w_hi — see atkdsp.h §14."""
+    b = _bits(b)
+    n = b.size
+    z = np.full(w_hi - w_lo + 1, np.nan, np.float32)
+    raw = np.full(w_hi - w_lo + 1, np.nan, np.float32)
+    for i, w in enumerate(range(w_lo, w_hi + 1)):
+        R = n // w
+        if R < 2:
+            continue
+        cnt = b[:R * w].reshape(R, w).sum(axis=0, dtype=np.int64)
+        S = int(np.abs(2 * cnt - R).sum())
+        rv = S / (float(w) * float(R))
+        mu = _width_mu(R)
+        var = 1.0 / R - mu * mu
+        raw[i] = np.float32(rv)
+        if var > 0.0:
+            z[i] = np.float32((rv - mu) * _m.sqrt(float(w)) / _m.sqrt(var))
+    return z, raw
+
+
+def bits_sync_discover(b, word_len: int = 16, min_count: int = 3, pfa: float = 1e-3,
+                       cap: int = 64) -> list:
+    """Recurring words nobody listed — see atkdsp.h §14. Returns dicts, best first."""
+    b = _bits(b)
+    n = b.size
+    L = int(word_len)
+    if L < 8 or L > 32:
+        raise ValueError("word_len 8..32")
+    if min_count < 2:
+        min_count = 3
+    if not pfa > 0.0:
+        pfa = 1e-3
+    if n < 2 * L:
+        return []
+    log10_thr = _m.log10(pfa)
+    keys = _words_sliding(b, L)
+    pos = np.arange(keys.size, dtype=np.uint64)
+    comp = np.sort((keys.astype(np.uint64) << np.uint64(32)) | pos)
+    ks = (comp >> np.uint64(32)).astype(np.int64)
+    ps = (comp & np.uint64(0xffffffff)).astype(np.int64)
+    bounds = np.flatnonzero(np.diff(ks)) + 1
+    starts = np.concatenate([[0], bounds])
+    ends = np.concatenate([bounds, [ks.size]])
+    nodes = []
+    for g0, g1 in zip(starts, ends):
+        if g1 - g0 < min_count:
+            continue
+        kept = []
+        for p in ps[g0:g1]:
+            if not kept or p - kept[-1] >= L:
+                kept.append(int(p))
+        if len(kept) < min_count:
+            continue
+        diffs = sorted(kept[i + 1] - kept[i] for i in range(len(kept) - 1))
+        P, best = diffs[0], 0
+        i = 0
+        while i < len(diffs):
+            j = i
+            while j < len(diffs) and diffs[j] == diffs[i]:
+                j += 1
+            if j - i > best:
+                best, P = j - i, diffs[i]
+            i = j
+        res = sorted(k % P for k in kept)
+        bestph, bestc = 0, 0
+        i = 0
+        while i < len(res):
+            j = i
+            while j < len(res) and res[j] == res[i]:
+                j += 1
+            if j - i > bestc:
+                bestc, bestph = j - i, res[i]
+            i = j
+        if bestc < min_count:
+            continue
+        first = next(k for k in kept if k % P == bestph)
+        nodes.append({"key": int(ks[g0]), "period": P, "phase": bestph, "count": bestc,
+                      "first": first, "succ": -1, "pred": -1, "used": False})
+    if not nodes:
+        return []
+    nodes.sort(key=lambda d: (d["period"], d["phase"], d["key"]))
+    lowmask = (1 << (L - 1)) - 1
+    index = {}
+    for i, d in enumerate(nodes):
+        index.setdefault((d["period"], d["phase"]), []).append(i)
+    for i, d in enumerate(nodes):
+        P = d["period"]
+        ph = (d["phase"] + 1) % P
+        want = d["key"] & lowmask
+        best = -1
+        for j in index.get((P, ph), []):
+            if j == i or (nodes[j]["key"] >> 1) != want:
+                continue
+            a, c = d["count"], nodes[j]["count"]
+            mn, mx = min(a, c), max(a, c)
+            if mn != mx and not (float(mn) > float(mx) / 2.0 + 1.5 * _m.sqrt(float(mx))):
+                continue
+            if best < 0 or nodes[j]["count"] > nodes[best]["count"]:
+                best = j
+        d["succ"] = best
+    for i, d in enumerate(nodes):
+        s = d["succ"]
+        if s < 0:
+            continue
+        p = nodes[s]["pred"]
+        if p < 0:
+            nodes[s]["pred"] = i
+        elif d["count"] > nodes[p]["count"]:
+            nodes[p]["succ"] = -1
+            nodes[s]["pred"] = i
+        else:
+            d["succ"] = -1
+    log10_T = L * _m.log10(2.0) + _m.log10(n / L)
+    out = []
+    for pass_ in range(2):
+        for s, d in enumerate(nodes):
+            if d["used"] or (pass_ == 0 and d["pred"] >= 0):
+                continue
+            chain = [(d["key"] >> (L - 1 - j)) & 1 for j in range(L)]
+            d["used"] = True
+            cur = d["succ"]
+            while cur >= 0 and not nodes[cur]["used"] and len(chain) < SYNC_MAXBITS:
+                chain.append(nodes[cur]["key"] & 1)
+                nodes[cur]["used"] = True
+                cur = nodes[cur]["succ"]
+            P, ph = d["period"], d["phase"]
+            chain = np.array(chain, np.uint8)
+            lo, hi = 0, chain.size
+            sc = _sync_score(b, chain[lo:hi], (ph + lo) % P, P, log10_T)
+            while hi - lo > L:
+                a = _sync_score(b, chain[lo + 1:hi], (ph + lo + 1) % P, P, log10_T)
+                z = _sync_score(b, chain[lo:hi - 1], (ph + lo) % P, P, log10_T)
+                if z[3] <= a[3] and z[3] < sc[3]:
+                    hi -= 1
+                    sc = z
+                elif a[3] < sc[3]:
+                    lo += 1
+                    sc = a
+                else:
+                    break
+            first, count, expected, l10 = sc
+            if count < min_count or l10 > log10_thr:
+                continue
+            pa = chain[lo:hi].copy()
+            ln = pa.size
+            flags = 0
+            for p0 in range(1, ln // 2 + 1):
+                if np.array_equal(pa[:ln - p0], pa[p0:]):
+                    flags |= SYNC_REPETITIVE
+                    break
+            out.append({"first": first, "period": P, "length": ln, "count": count,
+                        "flags": flags, "expected": expected,
+                        "log10_pfa": l10, "pattern": pa})
+    out.sort(key=lambda c: (c["log10_pfa"], -c["count"], c["first"], c["period"]))
+    return out[:cap]
+
+
+def _sync_score(b, pat, ph, P, log10_T):
+    """(first, count, expected, log10_pfa) of pat's exact matches at ph + kP."""
+    ln = pat.size
+    n = b.size
+    first, count, slots = -1, 0, 0.0
+    pos = ph
+    while pos + ln <= n:
+        slots += 1.0
+        if np.array_equal(b[pos:pos + ln], pat):
+            if first < 0:
+                first = pos
+            count += 1
+        pos += P
+    ln_q = -ln * _LN2
+    return (first, count, slots * _m.exp(ln_q),
+            log10_binom_tail(slots, float(count), ln_q) + log10_T + _m.log10(float(P)))
+
+
+def _words_sliding(b, L):
+    """Every L-bit window's value, MSB-first."""
+    win = np.lib.stride_tricks.sliding_window_view(b.astype(np.int64), L)
+    return win @ (1 << np.arange(L - 1, -1, -1, dtype=np.int64))
+
+
+_MAURER_E = (0, 0.7326495, 1.5374383, 2.4016068, 3.3112247, 4.2534266, 5.2177052,
+             6.1962507, 7.1836656, 8.1764248, 9.1723243, 10.170032, 11.168765,
+             12.168070, 13.167693, 14.167488, 15.167379)
+_MAURER_V = (0, 0.690, 1.338, 1.901, 2.358, 2.705, 2.954, 3.125, 3.238, 3.311, 3.356,
+             3.384, 3.401, 3.410, 3.416, 3.419, 3.421)
+
+
+def _apen_phi(b, m):
+    n = b.size
+    ext = np.concatenate([b, b[:m - 1]]).astype(np.int64)
+    v = np.lib.stride_tricks.sliding_window_view(ext, m)[:n] @ (1 << np.arange(m - 1, -1, -1))
+    cnt = np.bincount(v, minlength=1 << m)
+    phi = 0.0
+    for c in cnt:
+        if c:
+            p = c / n
+            phi += p * _m.log(p)
+    return phi
+
+
+def bits_stats(b) -> dict:
+    """The twin of atkdsp_bits_stats (atkdsp.h §14)."""
+    b = _bits(b)
+    n = b.size
+    o = {"n": n, "ones": int(b.sum())}
+    o["density"] = o["ones"] / n if n else float("nan")
+    run0 = np.zeros(33, np.uint64)
+    run1 = np.zeros(33, np.uint64)
+    if n:
+        edges = np.flatnonzero(np.diff(b)) + 1
+        st = np.concatenate([[0], edges])
+        en = np.concatenate([edges, [n]])
+        for s, e in zip(st, en):
+            k = min(32, int(e - s))
+            (run1 if b[s] else run0)[k] += 1
+    o["run0"], o["run1"] = run0, run1
+    ng = np.zeros((8, 256), np.uint64)
+    for k in range(1, 9):
+        if n < k:
+            break
+        v = _words_sliding(b, k)
+        ng[k - 1, :1 << k] = np.bincount(v, minlength=1 << k)
+    o["ngram"] = ng
+    w = chi_width(n)
+    o["chi2_bits"] = w
+    if w:
+        words = _words(b, w)
+        cells = 1 << w
+        cnt = np.bincount(words, minlength=cells)
+        e = words.size / cells
+        x2 = 0.0
+        for c in cnt:
+            d = float(c) - e
+            x2 += d * d / e
+        o["chi2"] = x2
+        o["chi2_p"] = igamc((cells - 1) / 2.0, x2 / 2.0)
+    else:
+        o["chi2"] = o["chi2_p"] = float("nan")
+    L = 0
+    for l in range(16, 0, -1):
+        if n >= 1010.0 * l * (1 << l):
+            L = l
+            break
+    o["maurer_L"] = L
+    if L:
+        Q = 10 << L
+        K = n // L - Q
+        vals = _words(b, L)[:Q + K]
+        T = np.zeros(1 << L, np.int64)
+        s = 0.0
+        for i in range(1, Q + K + 1):
+            v = int(vals[i - 1])
+            if i > Q:
+                s += _m.log(float(i - T[v])) / _LN2
+            T[v] = i
+        fn = s / K
+        c = 0.7 - 0.8 / L + (4.0 + 32.0 / L) * _m.pow(float(K), -3.0 / L) / 15.0
+        sigma = c * _m.sqrt(_MAURER_V[L] / K)
+        o["maurer"] = fn
+        o["maurer_p"] = _m.erfc(abs(fn - _MAURER_E[L]) / (_m.sqrt(2.0) * sigma))
+    else:
+        o["maurer"] = o["maurer_p"] = float("nan")
+    if n >= 128:
+        lg = n.bit_length() - 1
+        mm = min(10, lg - 6)
+        o["apen_m"] = mm
+        ap = _apen_phi(b, mm) - _apen_phi(b, mm + 1)
+        o["apen"] = ap
+        o["apen_p"] = igamc(float(1 << (mm - 1)), 2.0 * n * (_LN2 - ap) / 2.0)
+    else:
+        o["apen_m"] = 0
+        o["apen"] = o["apen_p"] = float("nan")
+    be = np.full(16, np.nan)
+    for w in range(1, 17):
+        cells = 1 << w
+        nw = n // w
+        if nw < cells:
+            continue
+        cnt = np.bincount(_words(b, w), minlength=cells)
+        h = 0.0
+        for c in cnt:
+            if c:
+                p = c / nw
+                h -= p * _m.log(p)
+        be[w - 1] = h / _LN2 / w
+    o["block_entropy"] = be
+    return o
+
+
+def _fwht_int(x):
+    x = np.array(x, dtype=np.int64)
+    h = 1
+    while h < x.size:
+        y = x.reshape(-1, 2 * h)
+        a = y[:, :h].copy()
+        bb = y[:, h:].copy()
+        y[:, :h] = a + bb
+        y[:, h:] = a - bb
+        x = y.reshape(-1)
+        h *= 2
+    return x
+
+
+def bits_wht(b, width: int, cols) -> tuple:
+    """(spectrum int32[2^ncols], rows) — see atkdsp.h §14."""
+    b = _bits(b)
+    cols = list(cols)
+    rows = b.size // width
+    r = b[:rows * width].reshape(rows, width).astype(np.int64)
+    v = np.zeros(rows, np.int64)
+    for j, c in enumerate(cols):
+        v |= r[:, c] << j
+    h = np.bincount(v, minlength=1 << len(cols))
+    return _fwht_int(h).astype(np.int32), rows
+
+
+def _sequency_index(size):
+    lg = size.bit_length() - 1
+    out = np.empty(size, np.int64)
+    for s in range(size):
+        g = s ^ (s >> 1)
+        h = 0
+        for k in range(lg):
+            h |= ((g >> k) & 1) << (lg - 1 - k)
+        out[s] = h
+    return out
+
+
+def bits_walsh(b, size: int, navg: int = 0):
+    """(sequency_power, dyadic_acf, blocks) — see atkdsp.h §14."""
+    b = _bits(b)
+    blocks = b.size // size
+    if navg > 0:
+        blocks = min(blocks, navg)
+    lim = 4.0e18 / (float(size) ** 3)
+    if blocks > lim:
+        blocks = int(lim)
+    if blocks == 0:
+        nanv = np.full(size, np.nan, np.float32)
+        return nanv, nanv.copy(), 0
+    P = np.zeros(size, np.int64)
+    for k in range(blocks):
+        x = 1 - 2 * b[k * size:(k + 1) * size].astype(np.int64)
+        X = _fwht_int(x)
+        P += X * X
+    norm = float(size) * blocks
+    seq = (P[_sequency_index(size)] / norm).astype(np.float32)
+    R = _fwht_int(P)
+    dy = (R / (float(size) * float(size) * blocks)).astype(np.float32)
+    return seq, dy, blocks
+
+
+def bits_cyclic(b, size: int, navg: int = 0):
+    """(cyclic_time, cyclic_freq, blocks) — see atkdsp.h §14."""
+    b = _bits(b)
+    blocks = b.size // size
+    if navg > 0:
+        blocks = min(blocks, navg)
+    nf = size // 2 + 1
+    if blocks == 0:
+        return np.full(size, np.nan, np.float32), np.full(nf, np.nan, np.float32), 0
+    psum = np.zeros(nf)
+    rsum = np.zeros(size, np.int64)
+    for k in range(blocks):
+        x = 1.0 - 2.0 * b[k * size:(k + 1) * size]
+        X = np.fft.rfft(x)
+        pw = X.real ** 2 + X.imag ** 2
+        psum += pw
+        rsum += np.rint(np.fft.irfft(pw, n=size)).astype(np.int64)
+    norm = float(size) * blocks
+    return (rsum / norm).astype(np.float32), (psum / norm).astype(np.float32), blocks
+
+
+# ---- §15 scramblers and linear complexity -------------------------------------
+SCRAM_ADD = 0
+SCRAM_MULT = 1
+
+
+def bm(b) -> tuple:
+    """(L, poly uint8[L+1]) — the shortest LFSR (Berlekamp-Massey over GF(2))."""
+    L, C, _ = _bm_run(_bits(b))
+    return L, np.array([(C >> i) & 1 for i in range(L + 1)], np.uint8)
+
+
+def bm_profile(b) -> np.ndarray:
+    return _bm_run(_bits(b))[2]
+
+
+def _bm_run(s):
+    n = s.size
+    C, B, L, m = 1, 1, 0, 1
+    prof = np.zeros(n, np.int32)
+    # the stream as an int, bit i = s[i]
+    S = int.from_bytes(np.packbits(s[::-1]).tobytes(), "big") >> ((-n) % 8) if n else 0
+    for N in range(n):
+        # d = XOR_{i=0..L} c_i s[N-i]
+        lo = N - L
+        win = (S >> lo) & ((1 << (L + 1)) - 1)          # bits s[N-L..N]
+        rev = int(format(win, f"0{L + 1}b")[::-1], 2)   # bit i = s[N-i]
+        d = bin(C & rev).count("1") & 1
+        if d:
+            if 2 * L <= N:
+                T = C
+                C ^= B << m
+                L = N + 1 - L
+                B = T
+                m = 1
+            else:
+                C ^= B << m
+                m += 1
+        else:
+            m += 1
+        prof[N] = L
+    return L, C, prof
+
+
+def bm_mask(poly) -> int:
+    """A Berlekamp-Massey connection polynomial c_0..c_L -> the siga.bits mask
+    (bit i = c_{L-i}): the register r[t+L] = XOR_{i<L, bit i} r[t+i]."""
+    poly = list(np.asarray(poly, np.uint8))
+    L = len(poly) - 1
+    return sum(int(poly[j]) << (L - j) for j in range(L + 1))
+
+
+def _mask_parts(poly):
+    poly = int(poly)
+    D = poly.bit_length() - 1
+    if D < 2 or D > 63 or not poly & 1:
+        raise ValueError("scrambler mask: degree 2..63 with bit 0 set")
+    return D, poly & ((1 << D) - 1)
+
+
+def _par(x):
+    return bin(x).count("1") & 1
+
+
+def descramble_add(b, poly, state) -> np.ndarray:
+    """Additive descramble; `state` (a 1-element uint64 array) is the register,
+    updated in place. See atkdsp.h §15."""
+    b = _bits(b)
+    D, low = _mask_parts(poly)
+    s = int(state[0]) & ((1 << D) - 1)
+    if not s:
+        raise ValueError("descramble_add: zero register")
+    out = np.empty_like(b)
+    for t in range(b.size):
+        out[t] = b[t] ^ (s & 1)
+        s = (s >> 1) | (_par(s & low) << (D - 1))
+    state[0] = s
+    return out
+
+
+def descramble_mult(b, poly, state) -> np.ndarray:
+    b = _bits(b)
+    D, low = _mask_parts(poly)
+    s = int(state[0]) & ((1 << D) - 1)
+    out = np.empty_like(b)
+    for t in range(b.size):
+        x = int(b[t])
+        out[t] = x ^ _par(s & low)
+        s = (s >> 1) | (x << (D - 1))
+    state[0] = s
+    return out
+
+
+def scramble_mult(b, poly, state) -> np.ndarray:
+    b = _bits(b)
+    D, low = _mask_parts(poly)
+    s = int(state[0]) & ((1 << D) - 1)
+    out = np.empty_like(b)
+    for t in range(b.size):
+        x = int(b[t]) ^ _par(s & low)
+        out[t] = x
+        s = (s >> 1) | (x << (D - 1))
+    state[0] = s
+    return out
+
+
+def _enum_masks(maxD, max_terms):
+    out = []
+    for D in range(2, maxD + 1):
+        ends = (1 << D) | 1
+        for a in range(1, D):
+            out.append((ends | (1 << a), D, 3))
+        if max_terms >= 5:
+            for a in range(1, D):
+                for bb in range(a + 1, D):
+                    for cc in range(bb + 1, D):
+                        out.append((ends | (1 << a) | (1 << bb) | (1 << cc), D, 5))
+    return out
+
+
+def scrambler_search(b, kind: int = SCRAM_MULT, max_degree: int = 24, max_terms: int = 5,
+                     pfa: float = 1e-3, cap: int = 16):
+    """(candidates, g_identity) — see atkdsp.h §15."""
+    b = _bits(b)
+    n = b.size
+    if kind not in (SCRAM_ADD, SCRAM_MULT) or not 2 <= max_degree <= 32 or max_terms not in (3, 5):
+        raise ValueError("scrambler_search: kind ADD/MULT, max_degree 2..32, max_terms 3 or 5")
+    if not pfa > 0.0:
+        pfa = 1e-3
+    t0 = max_degree
+    if n <= t0:
+        return [], float("nan")
+    m = n - t0
+    w = chi_width(m)
+    if not w:
+        return [], float("nan")
+    g_id = gstat(b[t0:], w)
+    cands = []
+    for poly, D, terms in _enum_masks(max_degree, max_terms):
+        low = poly & ((1 << D) - 1)
+        y = b[t0:].copy()
+        for i in range(D):
+            if (low >> i) & 1:
+                dly = D - i
+                y ^= b[t0 - dly:n - dly]
+        cands.append((gstat(y, w), D, terms, poly))
+    cands.sort(key=lambda c: (-c[0], c[1], c[2], c[3]))
+    dof = float((1 << w) - 1)
+    trials = len(cands) + 1.0
+    log10_thr = _m.log10(pfa)
+    margin = norm_isf(pfa / trials) * _m.sqrt(4.0 * dof)
+    out = []
+    for g, D, terms, poly in cands:
+        if len(out) >= cap:
+            break
+        l10 = log_igamc(dof / 2.0, g / 2.0) / _LN10 + _m.log10(trials)
+        if l10 > log10_thr or not (g - g_id > margin):
+            break
+        c = {"poly": poly, "seed": 0, "g": g, "log10_pfa": l10, "g_data": float("nan"),
+             "degree": D, "terms": terms, "seeded": 0, "block_bits": w}
+        out.append(c)
+        if kind != SCRAM_ADD:
+            continue
+        low = poly & ((1 << D) - 1)
+        y = b[D:].copy()
+        for i in range(D):
+            if (low >> i) & 1:
+                y ^= b[i:n - D + i]
+        # longest constant run of y (first longest), as positions in b
+        best_start, best_len, best_val = 0, 0, 0
+        run_val, run_start, run_len = -1, D, 0
+        for idx in range(y.size):
+            yv = int(y[idx])
+            if yv == run_val:
+                run_len += 1
+            else:
+                run_val, run_start, run_len = yv, D + idx, 1
+            if run_len > best_len:
+                best_len, best_start, best_val = run_len, run_start, yv
+        if best_len < 2 * D:
+            continue
+        ts = best_start - D
+        s = 0
+        for k in range(D):
+            s |= (int(b[ts + k]) ^ best_val) << k
+        smask = (1 << D) - 1
+        lowsh = low >> 1
+        for _t in range(ts, 0, -1):
+            prev = ((s >> (D - 1)) & 1) ^ _par(s & lowsh)
+            s = ((s << 1) | prev) & smask
+        if not s:
+            continue
+        st = np.array([s], np.uint64)
+        d = descramble_add(b, poly, st)
+        c["seed"], c["seeded"], c["g_data"] = s, 1, gstat(d[t0:], w)
+    return out, g_id
+
+
+# ---- §16a convolutional codes ---------------------------------------------------
+CONV_TERM = 0
+CONV_TAILBITE = 1
+CONV_STREAM = 2
+
+
+def _punc(n, puncture):
+    if puncture is None:
+        return np.ones((n, 1), np.uint8)
+    p = np.asarray(puncture, np.uint8)
+    return (p.reshape(n, -1) != 0).astype(np.uint8)
+
+
+def conv_encode(K: int, polys, bits, mode: int = CONV_TERM, puncture=None) -> np.ndarray:
+    """The encoder of atkdsp.h §16a (MSB of each generator = the current bit)."""
+    polys = [int(p) for p in polys]
+    n = len(polys)
+    bits = _bits(bits)
+    N = bits.size
+    keep = _punc(n, puncture)
+    P = keep.shape[1]
+    s = 0
+    if mode == CONV_TAILBITE:
+        for j in range(K - 1):
+            idx = (N - (K - 1) + j) % N
+            s = (int(bits[idx]) << (K - 2)) | (s >> 1)
+    steps = N + (K - 1 if mode == CONV_TERM else 0)
+    out = []
+    for t in range(steps):
+        u = int(bits[t]) if t < N else 0
+        reg = (u << (K - 1)) | s
+        for i in range(n):
+            if keep[i, t % P]:
+                out.append(_par(reg & polys[i]))
+        s = reg >> 1
+    return np.array(out, np.uint8)
+
+
+class Viterbi:
+    """The twin of atkdsp_viterbi (atkdsp.h §16a), float32 metrics, the same
+    decisions bit for bit."""
+
+    def __init__(self, K: int, polys, puncture=None, mode: int = CONV_TERM, depth: int = 0,
+                 max_bits: int = 4096):
+        self.K = int(K)
+        self.polys = [int(p) for p in polys]
+        self.n = len(self.polys)
+        self.S = 1 << (self.K - 1)
+        self.mode = int(mode)
+        self.keep = _punc(self.n, puncture)
+        self.P = self.keep.shape[1]
+        self.kp = self.keep.sum(axis=0).astype(int)
+        if (self.kp == 0).any():
+            raise ValueError("every input bit must send something")
+        self.punctured = puncture is not None and not self.keep.all()
+        if depth == 0 and self.mode == CONV_STREAM:
+            depth = (12 if puncture is not None else 6) * self.K
+        self.depth = int(depth)
+        self.max_bits = int(max_bits)
+        ow = np.zeros(2 * self.S, np.int64)
+        for p in range(self.S):
+            for u in range(2):
+                reg = (u << (self.K - 1)) | p
+                ow[2 * p + u] = sum(_par(reg & self.polys[i]) << i for i in range(self.n))
+        self.ow = ow
+        half = self.S // 2
+        j = np.arange(half)
+        self._p0 = 2 * j
+        self._p1 = 2 * j + 1
+        self.reset()
+
+    def reset(self):
+        self.pm = np.zeros(self.S, np.float32)
+        self.steps_done = 0
+        self.released = 0
+        self.pend = []
+        self.dec = []
+
+    def _acs(self, x):
+        ncw = 1 << self.n
+        met = np.zeros(ncw, np.float32)
+        for cw in range(ncw):
+            mm = np.float32(0.0)
+            for i in range(self.n):
+                mm = (mm - x[i]) if (cw >> i) & 1 else (mm + x[i])
+            met[cw] = mm
+        half = self.S // 2
+        pm = self.pm
+        nm = np.empty(self.S, np.float32)
+        d = np.zeros(self.S, np.uint8)
+        for u in (0, 1):
+            m0 = pm[self._p0] + met[self.ow[2 * self._p0 + u]]
+            m1 = pm[self._p1] + met[self.ow[2 * self._p1 + u]]
+            take0 = m0 >= m1
+            nm[u * half:(u + 1) * half] = np.where(take0, m0, m1)
+            d[u * half:(u + 1) * half] = (~take0).astype(np.uint8)
+        nm = (nm - nm.max()).astype(np.float32)
+        self.pm = nm
+        return d
+
+    def _trace(self, decs, s):
+        top = self.K - 2
+        out = np.empty(len(decs), np.uint8)
+        for t in range(len(decs) - 1, -1, -1):
+            out[t] = (s >> top) & 1
+            s = ((s << 1) & (self.S - 1)) | int(decs[t][s])
+        return out
+
+    def _steps(self, nllr):
+        full = nllr // int(self.kp.sum())
+        steps = full * self.P
+        rem = nllr - full * int(self.kp.sum())
+        while rem > 0:
+            k = int(self.kp[steps % self.P])
+            if k > rem:
+                return -1
+            rem -= k
+            steps += 1
+        return steps
+
+    def decode(self, llr):
+        llr = np.ascontiguousarray(llr, np.float32)
+        if self.mode == CONV_STREAM:
+            self.metric = float("nan")
+            return self._stream(llr)
+        steps = self._steps(llr.size)
+        if steps < 0:
+            raise ValueError("no step count produces that many LLRs")
+        term = self.mode == CONV_TERM
+        nbits = steps - (self.K - 1) if term else steps
+        if nbits < 1 or nbits > self.max_bits:
+            raise ValueError("block size out of range")
+        off = np.concatenate([[0], np.cumsum([self.kp[t % self.P] for t in range(steps)])])
+
+        def gather(t):
+            j = t % self.P
+            o = int(off[t])
+            x = np.zeros(self.n, np.float32)
+            for i in range(self.n):
+                if self.keep[i, j]:
+                    x[i] = llr[o]
+                    o += 1
+            return x
+        if term:
+            self.pm = np.full(self.S, -np.inf, np.float32)
+            self.pm[0] = 0.0
+            decs = [self._acs(gather(t)) for t in range(steps)]
+            bits = self._trace(decs, 0)[:nbits]
+        else:
+            W = self.depth if (self.depth and self.depth < steps) else steps
+            self.pm = np.zeros(self.S, np.float32)
+            decs = [self._acs(gather((e + steps - W) % steps)) for e in range(W + steps + W)]
+            bits = self._trace(decs, int(np.argmax(self.pm)))[W:W + nbits]
+        code = conv_encode(self.K, self.polys, bits, self.mode,
+                           self.keep if self.punctured else None)
+        num = float(np.sum(np.where(code == 1, -llr.astype(np.float64), llr.astype(np.float64))))
+        den = float(np.sum(np.abs(llr.astype(np.float64))))
+        self.metric = float(np.float32(num / den)) if den > 0 else float("nan")
+        self.pm = np.zeros(self.S, np.float32)
+        return bits
+
+    def _stream(self, llr):
+        out = []
+        k = 0
+        D = self.depth
+        while True:
+            j = self.steps_done % self.P
+            while len(self.pend) < self.n:
+                i = len(self.pend)
+                if self.keep[i, j]:
+                    if k >= llr.size:
+                        break
+                    self.pend.append(np.float32(llr[k]))
+                    k += 1
+                else:
+                    self.pend.append(np.float32(0.0))
+            if len(self.pend) < self.n:
+                break
+            self.dec.append(self._acs(np.array(self.pend, np.float32)))
+            self.steps_done += 1
+            self.pend = []
+            if self.steps_done >= self.released + 2 * D:
+                bits = self._trace(self.dec[self.released:self.steps_done], int(np.argmax(self.pm)))
+                out.extend(bits[:D])
+                self.released += D
+        return np.array(out, np.uint8)
+
+    def flush(self):
+        if self.mode != CONV_STREAM:
+            return np.zeros(0, np.uint8)
+        left = self.steps_done - self.released
+        self.pend = []
+        if not left:
+            return np.zeros(0, np.uint8)
+        bits = self._trace(self.dec[self.released:self.steps_done], int(np.argmax(self.pm)))
+        self.released = self.steps_done
+        return bits
+
+
+# ---- §16b/c Reed-Solomon and BCH over GF(2^m) -------------------------------------
+GF_DEFAULT = {3: 0xB, 4: 0x13, 5: 0x25, 6: 0x43, 7: 0x89, 8: 0x11D, 9: 0x211, 10: 0x409,
+              11: 0x805, 12: 0x1053, 13: 0x201B, 14: 0x4443, 15: 0x8003, 16: 0x1100B}
+CCSDS_TAL = (0x8d, 0xef, 0xec, 0x86, 0xfa, 0x99, 0xaf, 0x7b)
+E_DECODE = -5
+
+
+class _GF:
+    def __init__(self, m, poly):
+        if not 3 <= m <= 16 or (poly >> m) != 1:
+            raise ValueError("field: m 3..16, polynomial of degree m")
+        self.m, self.nn, self.poly = m, (1 << m) - 1, poly
+        exp = [0] * (2 * self.nn)
+        log = [-1] * (self.nn + 1)
+        x = 1
+        for i in range(self.nn):
+            if log[x] != -1:
+                raise ValueError("polynomial not primitive")
+            exp[i] = x
+            log[x] = i
+            x <<= 1
+            if x >> m:
+                x ^= poly
+        if x != 1:
+            raise ValueError("polynomial not primitive")
+        for i in range(self.nn, 2 * self.nn):
+            exp[i] = exp[i - self.nn]
+        self.exp, self.log = exp, log
+
+    def mul(self, a, b):
+        return 0 if not a or not b else self.exp[self.log[a] + self.log[b]]
+
+    def inv(self, a):
+        return self.exp[(self.nn - self.log[a]) % self.nn]
+
+    def pw(self, e):
+        return self.exp[e % self.nn]
+
+    def eval_pos(self, sym, beta):
+        acc = 0
+        for v in sym:
+            acc = self.mul(acc, beta) ^ int(v)
+        return acc
+
+    def bm(self, S, lam, L0):
+        nsyn = len(S)
+        cap = nsyn + 1
+        B = list(lam)
+        L, msh, bd = L0, 1, 1
+        for r in range(L0, nsyn):
+            d = 0
+            for i in range(0, min(L, r) + 1):
+                d ^= self.mul(lam[i], S[r - i])
+            if not d:
+                msh += 1
+                continue
+            coef = self.mul(d, self.inv(bd))
+            if 2 * L <= r + L0:
+                T = list(lam)
+                for i in range(cap - msh):
+                    lam[i + msh] ^= self.mul(coef, B[i])
+                L = r + 1 + L0 - L
+                B = T
+                bd, msh = d, 1
+            else:
+                for i in range(cap - msh):
+                    lam[i + msh] ^= self.mul(coef, B[i])
+                msh += 1
+        deg = max([i for i in range(cap) if lam[i]] or [0])
+        return L if deg == L else -1
+
+
+class RS:
+    """The twin of atkdsp_rs (atkdsp.h §16b)."""
+
+    def __init__(self, m, gfpoly, fcr, prim, nroots, pad=0, dual_basis=False):
+        self.gf = _GF(m, gfpoly)
+        nn = self.gf.nn
+        if nroots < 1 or pad < 0 or nroots >= nn - pad or not 0 <= fcr < nn or not 1 <= prim < nn:
+            raise ValueError("RS parameters out of range")
+        if _m.gcd(prim, nn) != 1:
+            raise ValueError("prim must be coprime to 2^m - 1")
+        if dual_basis and not (m == 8 and gfpoly == 0x187):
+            raise ValueError("dual basis is CCSDS: m = 8, gfpoly 0x187")
+        self.m, self.fcr, self.prim, self.nroots, self.pad = m, fcr, prim, nroots, pad
+        self.n = nn - pad
+        self.k = self.n - nroots
+        self.dual = bool(dual_basis)
+        g = [1] + [0] * nroots
+        for i in range(nroots):
+            root = self.gf.pw(prim * (fcr + i))
+            for d in range(i + 1, 0, -1):
+                g[d] = g[d - 1] ^ self.gf.mul(g[d], root)
+            g[0] = self.gf.mul(g[0], root)
+        self.gen = g
+        if self.dual:
+            tal = [0] * 256
+            for x in range(256):
+                v = 0
+                for j in range(8):
+                    if (x >> j) & 1:
+                        v ^= CCSDS_TAL[7 - j]
+                tal[x] = v
+            tal1 = [0] * 256
+            for x in range(256):
+                tal1[tal[x]] = x
+            self.tal, self.tal1 = tal, tal1
+
+    def _enc(self, data):
+        nr = self.nroots
+        reg = [0] * nr
+        for d in data:
+            fb = int(d) ^ reg[0]
+            for i in range(nr - 1):
+                reg[i] = reg[i + 1] ^ self.gf.mul(fb, self.gen[nr - 1 - i])
+            reg[nr - 1] = self.gf.mul(fb, self.gen[0])
+        return reg
+
+    def encode(self, data) -> np.ndarray:
+        data = [int(v) for v in data]
+        if self.dual:
+            par = self._enc([self.tal1[v] for v in data])
+            par = [self.tal[v] for v in par]
+        else:
+            par = self._enc(data)
+        return np.array(par, np.uint16)
+
+    def decode(self, sym, erasures=()):
+        """(corrected uint16 array, count, positions); count = E_DECODE on failure."""
+        gf = self.gf
+        n, nr = self.n, self.nroots
+        sym = [int(v) for v in sym]
+        erasures = [int(e) for e in erasures]
+        if len(erasures) > nr:
+            return np.array(sym, np.uint16), E_DECODE, []
+        w = [self.tal1[v] for v in sym] if self.dual else list(sym)
+        S = [gf.eval_pos(w, gf.pw(self.prim * (self.fcr + i))) for i in range(nr)]
+        if not any(S) and not erasures:
+            return np.array(sym, np.uint16), 0, []
+        lam = [1] + [0] * nr
+        for e_i, e in enumerate(erasures):
+            X = gf.pw(self.prim * (n - 1 - e))
+            for d in range(e_i + 1, 0, -1):
+                lam[d] ^= gf.mul(lam[d - 1], X)
+        L = gf.bm(S, lam, len(erasures))
+        fail = (np.array(sym, np.uint16), E_DECODE, [])
+        if L < 0 or 2 * L - len(erasures) > nr:
+            return fail
+        loc = []
+        for j in range(n):
+            deg = n - 1 - j
+            v = 0
+            for i in range(L + 1):
+                if lam[i]:
+                    v ^= gf.mul(lam[i], gf.pw(-self.prim * deg * i))
+            if not v:
+                if len(loc) >= nr:
+                    return fail
+                loc.append(j)
+        if len(loc) != L:
+            return fail
+        om = []
+        for i in range(nr):
+            a = 0
+            for k in range(0, min(i, L) + 1):
+                a ^= gf.mul(lam[k], S[i - k])
+            om.append(a)
+        for j in loc:
+            xi = self.prim * (n - 1 - j)
+            num = 0
+            for i in range(nr):
+                if om[i]:
+                    num ^= gf.mul(om[i], gf.pw(-xi * i))
+            den = 0
+            for i in range(1, L + 1, 2):
+                if lam[i]:
+                    den ^= gf.mul(lam[i], gf.pw(-xi * (i - 1)))
+            if not den:
+                return fail
+            y = gf.mul(gf.mul(num, gf.inv(den)), gf.pw(xi * (1 - self.fcr)))
+            w[j] ^= y
+        for i in range(nr):
+            if gf.eval_pos(w, gf.pw(self.prim * (self.fcr + i))):
+                return fail
+        outv = list(sym)
+        for j in loc:
+            outv[j] = self.tal[w[j]] if self.dual else w[j]
+        return np.array(outv, np.uint16), len(loc), loc
+
+
+class BCH:
+    """The twin of atkdsp_bch (atkdsp.h §16c)."""
+
+    def __init__(self, m, t, shorten=0, gfpoly=0):
+        if not gfpoly:
+            gfpoly = GF_DEFAULT[m]
+        self.gf = _GF(m, gfpoly)
+        nn = self.gf.nn
+        if t < 1 or 2 * t >= nn or not 0 <= shorten < nn:
+            raise ValueError("BCH parameters out of range")
+        used = [False] * nn
+        g = [1]
+        for i in range(1, 2 * t + 1):
+            if used[i % nn]:
+                continue
+            mp = [1]
+            e = i % nn
+            while True:
+                used[e] = True
+                root = self.gf.exp[e]
+                mp = [0] + mp
+                for d in range(len(mp) - 1):
+                    mp[d] ^= self.gf.mul(mp[d + 1], root)
+                e = (e * 2) % nn
+                if e == i % nn or len(mp) - 1 > m:
+                    break
+            if any(c > 1 for c in mp):
+                raise ValueError("minimal polynomial not binary")
+            prod = [0] * (len(g) + len(mp) - 1)
+            for a, ca in enumerate(mp):
+                if ca:
+                    for bi, cb in enumerate(g):
+                        prod[a + bi] ^= cb
+            g = prod
+        self.m, self.t, self.shorten = m, t, shorten
+        self.n = nn - shorten
+        self.k = self.n - (len(g) - 1)
+        if self.k < 1:
+            raise ValueError("BCH: no data bits left")
+        self.gen = g                        # gen[d] = coefficient of x^d
+
+    def generator(self) -> np.ndarray:
+        return np.array(self.gen[::-1], np.uint8)
+
+    def encode(self, data) -> np.ndarray:
+        r = self.n - self.k
+        reg = [0] * r
+        data = _bits(data)
+        for d in data:
+            fb = int(d) ^ reg[0]
+            for i in range(r - 1):
+                reg[i] = reg[i + 1] ^ (fb & self.gen[r - 1 - i])
+            reg[r - 1] = fb & self.gen[0]
+        return np.concatenate([data, np.array(reg, np.uint8)])
+
+    def decode(self, code):
+        """(corrected uint8 array, count, positions); count = E_DECODE on failure."""
+        gf = self.gf
+        code = list(_bits(code))
+        n, ns = self.n, 2 * self.t
+
+        def syn():
+            S = []
+            for i in range(ns):
+                beta = gf.exp[(i + 1) % gf.nn]
+                acc = 0
+                for v in code:
+                    acc = gf.mul(acc, beta) ^ int(v)
+                S.append(acc)
+            return S
+        S = syn()
+        if not any(S):
+            return np.array(code, np.uint8), 0, []
+        lam = [1] + [0] * ns
+        L = gf.bm(S, lam, 0)
+        orig = np.array(code, np.uint8)
+        if L < 1 or L > self.t:
+            return orig, E_DECODE, []
+        loc = []
+        for j in range(n):
+            deg = n - 1 - j
+            v = 0
+            for i in range(L + 1):
+                if lam[i]:
+                    v ^= gf.mul(lam[i], gf.pw(-deg * i))
+            if not v:
+                if len(loc) >= L:
+                    return orig, E_DECODE, []
+                loc.append(j)
+        if len(loc) != L:
+            return orig, E_DECODE, []
+        for j in loc:
+            code[j] ^= 1
+        if any(syn()):
+            return orig, E_DECODE, []
+        return np.array(code, np.uint8), L, loc
+
+
+# ---- §16d small block codes ----------------------------------------------------------
+class BlockCode:
+    """The twin of atkdsp_blk (atkdsp.h §16d): syndrome-table decoding."""
+
+    def __init__(self, G):
+        G = (np.asarray(G, np.uint8) & 1)
+        k, n = G.shape
+        if not (2 <= n <= 32 and 1 <= k < n and n - k <= 20):
+            raise ValueError("block code: n <= 32, n - k <= 20")
+        self.n, self.k, self.r = n, k, n - k
+        rows = [sum(int(G[i, j]) << j for j in range(n)) for i in range(k)]
+        self.G = list(rows)
+        R = list(rows)
+        M = [1 << i for i in range(k)]
+        piv = []
+        rank = 0
+        for col in range(n):
+            if rank >= k:
+                break
+            p = next((i for i in range(rank, k) if (R[i] >> col) & 1), -1)
+            if p < 0:
+                continue
+            R[p], R[rank] = R[rank], R[p]
+            M[p], M[rank] = M[rank], M[p]
+            for i in range(k):
+                if i != rank and (R[i] >> col) & 1:
+                    R[i] ^= R[rank]
+                    M[i] ^= M[rank]
+            piv.append(col)
+            rank += 1
+        if rank < k:
+            raise ValueError("generator rank < k")
+        self.R, self.M, self.piv = R, M, piv
+        H = []
+        for col in range(n):
+            if col in piv:
+                continue
+            h = 1 << col
+            for i in range(k):
+                if (R[i] >> col) & 1:
+                    h |= 1 << piv[i]
+            H.append(h)
+        self.H = H
+        ns = 1 << self.r
+        leader = [0] * ns
+        wt = [255] * ns
+        wt[0] = 0
+        filled = 1
+        dmin = 0
+        if k <= 20:
+            cw, best = 0, n + 1
+            for i in range(1, 1 << k):
+                bit = (i & -i).bit_length() - 1
+                cw ^= rows[bit]
+                best = min(best, bin(cw).count("1"))
+            dmin = best
+        from itertools import combinations
+        w = 1
+        done, ncomb = 0.0, 1.0
+        while w <= n and (filled < ns or dmin == 0):
+            ncomb = ncomb * float(n - w + 1) / float(w)
+            if done + ncomb > float(1 << 25):           # the C's work bound
+                break
+            done += ncomb
+            for comb in combinations(range(n), w):
+                x = 0
+                for j in comb:
+                    x |= 1 << j
+                s = self._syn(x)
+                if s == 0:
+                    if not dmin:
+                        dmin = w
+                elif wt[s] == 255:
+                    wt[s], leader[s] = w, x
+                    filled += 1
+                elif wt[s] == w and leader[s] != x:
+                    leader[s] = -1
+            w += 1
+        self.leader, self.wt, self.dmin = leader, wt, dmin
+
+    def _syn(self, v):
+        s = 0
+        for i, h in enumerate(self.H):
+            s |= (bin(v & h).count("1") & 1) << i
+        return s
+
+    def encode(self, data) -> np.ndarray:
+        v = 0
+        for i, d in enumerate(_bits(data)):
+            if d:
+                v ^= self.G[i]
+        return np.array([(v >> j) & 1 for j in range(self.n)], np.uint8)
+
+    def decode(self, code):
+        """(corrected code, data, count); count = E_DECODE when ambiguous."""
+        code = _bits(code)
+        v = sum(int(code[j]) << j for j in range(self.n))
+        s = self._syn(v)
+        if self.wt[s] == 255 or self.leader[s] == -1:
+            return code.copy(), None, E_DECODE
+        e = self.leader[s]
+        v ^= e
+        d = 0
+        for i in range(self.k):
+            if (v >> self.piv[i]) & 1:
+                d ^= self.M[i]
+        return (np.array([(v >> j) & 1 for j in range(self.n)], np.uint8),
+                np.array([(d >> i) & 1 for i in range(self.k)], np.uint8), bin(e).count("1"))
+
+
+def cyclic_generator_matrix(n: int, gpoly: int) -> np.ndarray:
+    """k x n generator of the cyclic code with generator polynomial gpoly (bit d =
+    coefficient of x^d): row i = x^i g(x), position j = coefficient of x^(n-1-j)."""
+    r = gpoly.bit_length() - 1
+    k = n - r
+    G = np.zeros((k, n), np.uint8)
+    for i in range(k):
+        poly = gpoly << i
+        for d in range(n):
+            G[i, n - 1 - d] = (poly >> d) & 1
+    return G
+
+
+def extend_with_parity(G) -> np.ndarray:
+    """Append an overall even-parity column (Hamming(8,4), (16,11), Golay(24,12))."""
+    G = np.asarray(G, np.uint8)
+    return np.concatenate([G, (G.sum(axis=1) & 1)[:, None].astype(np.uint8)], axis=1)
+
+
+#: Small codes derived from their cyclic generator polynomials (facts that
+#: rederive: Hamming from a primitive polynomial, Golay(23,12) from x^11 + x^10 +
+#: x^6 + x^5 + x^4 + x^2 + 1). Protocol-specific matrices (DMR's (13,9), (16,11)
+#: as ETSI writes them) belong with their decoders in ATK, checked against ETSI.
+SMALL_CODES = {
+    "hamming(7,4)": lambda: cyclic_generator_matrix(7, 0b1011),
+    "hamming(15,11)": lambda: cyclic_generator_matrix(15, 0b10011),
+    "hamming(31,26)": lambda: cyclic_generator_matrix(31, 0b100101),
+    "hamming(8,4)": lambda: extend_with_parity(cyclic_generator_matrix(7, 0b1011)),
+    "hamming(16,11)": lambda: extend_with_parity(cyclic_generator_matrix(15, 0b10011)),
+    "golay(23,12)": lambda: cyclic_generator_matrix(23, 0xC75),
+    "golay(24,12)": lambda: extend_with_parity(cyclic_generator_matrix(23, 0xC75)),
+}
+
+
+# ---- §17 the CRC engine and CRC recovery -------------------------------------------------
+#: The catalogue, re-typed independently of src/crc.c from the reveng catalogue:
+#: (name, width, poly, init, refin, refout, xorout, check). The tests hold the
+#: two copies and every check value to each other.
+CRC_CATALOG = [
+    ("CRC-3/GSM", 3, 0x3, 0x0, 0, 0, 0x7, 0x4),
+    ("CRC-3/ROHC", 3, 0x3, 0x7, 1, 1, 0x0, 0x6),
+    ("CRC-4/G-704", 4, 0x3, 0x0, 1, 1, 0x0, 0x7),
+    ("CRC-4/INTERLAKEN", 4, 0x3, 0xf, 0, 0, 0xf, 0xb),
+    ("CRC-5/EPC-C1G2", 5, 0x09, 0x09, 0, 0, 0x00, 0x00),
+    ("CRC-5/G-704", 5, 0x15, 0x00, 1, 1, 0x00, 0x07),
+    ("CRC-5/USB", 5, 0x05, 0x1f, 1, 1, 0x1f, 0x19),
+    ("CRC-6/CDMA2000-A", 6, 0x27, 0x3f, 0, 0, 0x00, 0x0d),
+    ("CRC-6/CDMA2000-B", 6, 0x07, 0x3f, 0, 0, 0x00, 0x3b),
+    ("CRC-6/DARC", 6, 0x19, 0x00, 1, 1, 0x00, 0x26),
+    ("CRC-6/G-704", 6, 0x03, 0x00, 1, 1, 0x00, 0x06),
+    ("CRC-6/GSM", 6, 0x2f, 0x00, 0, 0, 0x3f, 0x13),
+    ("CRC-7/MMC", 7, 0x09, 0x00, 0, 0, 0x00, 0x75),
+    ("CRC-7/ROHC", 7, 0x4f, 0x7f, 1, 1, 0x00, 0x53),
+    ("CRC-7/UMTS", 7, 0x45, 0x00, 0, 0, 0x00, 0x61),
+    ("CRC-8/AUTOSAR", 8, 0x2f, 0xff, 0, 0, 0xff, 0xdf),
+    ("CRC-8/BLUETOOTH", 8, 0xa7, 0x00, 1, 1, 0x00, 0x26),
+    ("CRC-8/CDMA2000", 8, 0x9b, 0xff, 0, 0, 0x00, 0xda),
+    ("CRC-8/DARC", 8, 0x39, 0x00, 1, 1, 0x00, 0x15),
+    ("CRC-8/DVB-S2", 8, 0xd5, 0x00, 0, 0, 0x00, 0xbc),
+    ("CRC-8/GSM-A", 8, 0x1d, 0x00, 0, 0, 0x00, 0x37),
+    ("CRC-8/GSM-B", 8, 0x49, 0x00, 0, 0, 0xff, 0x94),
+    ("CRC-8/HITAG", 8, 0x1d, 0xff, 0, 0, 0x00, 0xb4),
+    ("CRC-8/I-432-1", 8, 0x07, 0x00, 0, 0, 0x55, 0xa1),
+    ("CRC-8/I-CODE", 8, 0x1d, 0xfd, 0, 0, 0x00, 0x7e),
+    ("CRC-8/LTE", 8, 0x9b, 0x00, 0, 0, 0x00, 0xea),
+    ("CRC-8/MAXIM-DOW", 8, 0x31, 0x00, 1, 1, 0x00, 0xa1),
+    ("CRC-8/MIFARE-MAD", 8, 0x1d, 0xc7, 0, 0, 0x00, 0x99),
+    ("CRC-8/NRSC-5", 8, 0x31, 0xff, 0, 0, 0x00, 0xf7),
+    ("CRC-8/OPENSAFETY", 8, 0x2f, 0x00, 0, 0, 0x00, 0x3e),
+    ("CRC-8/ROHC", 8, 0x07, 0xff, 1, 1, 0x00, 0xd0),
+    ("CRC-8/SAE-J1850", 8, 0x1d, 0xff, 0, 0, 0xff, 0x4b),
+    ("CRC-8/SMBUS", 8, 0x07, 0x00, 0, 0, 0x00, 0xf4),
+    ("CRC-8/TECH-3250", 8, 0x1d, 0xff, 1, 1, 0x00, 0x97),
+    ("CRC-8/WCDMA", 8, 0x9b, 0x00, 1, 1, 0x00, 0x25),
+    ("CRC-10/ATM", 10, 0x233, 0x000, 0, 0, 0x000, 0x199),
+    ("CRC-10/CDMA2000", 10, 0x3d9, 0x3ff, 0, 0, 0x000, 0x233),
+    ("CRC-10/GSM", 10, 0x175, 0x000, 0, 0, 0x3ff, 0x12a),
+    ("CRC-11/FLEXRAY", 11, 0x385, 0x01a, 0, 0, 0x000, 0x5a3),
+    ("CRC-11/UMTS", 11, 0x307, 0x000, 0, 0, 0x000, 0x061),
+    ("CRC-12/CDMA2000", 12, 0xf13, 0xfff, 0, 0, 0x000, 0xd4d),
+    ("CRC-12/DECT", 12, 0x80f, 0x000, 0, 0, 0x000, 0xf5b),
+    ("CRC-12/GSM", 12, 0xd31, 0x000, 0, 0, 0xfff, 0xb34),
+    ("CRC-12/UMTS", 12, 0x80f, 0x000, 0, 1, 0x000, 0xdaf),
+    ("CRC-13/BBC", 13, 0x1cf5, 0x0000, 0, 0, 0x0000, 0x04fa),
+    ("CRC-14/DARC", 14, 0x0805, 0x0000, 1, 1, 0x0000, 0x082d),
+    ("CRC-14/GSM", 14, 0x202d, 0x0000, 0, 0, 0x3fff, 0x30ae),
+    ("CRC-15/CAN", 15, 0x4599, 0x0000, 0, 0, 0x0000, 0x059e),
+    ("CRC-15/MPT1327", 15, 0x6815, 0x0000, 0, 0, 0x0001, 0x2566),
+    ("CRC-16/ARC", 16, 0x8005, 0x0000, 1, 1, 0x0000, 0xbb3d),
+    ("CRC-16/CDMA2000", 16, 0xc867, 0xffff, 0, 0, 0x0000, 0x4c06),
+    ("CRC-16/CMS", 16, 0x8005, 0xffff, 0, 0, 0x0000, 0xaee7),
+    ("CRC-16/DDS-110", 16, 0x8005, 0x800d, 0, 0, 0x0000, 0x9ecf),
+    ("CRC-16/DECT-R", 16, 0x0589, 0x0000, 0, 0, 0x0001, 0x007e),
+    ("CRC-16/DECT-X", 16, 0x0589, 0x0000, 0, 0, 0x0000, 0x007f),
+    ("CRC-16/DNP", 16, 0x3d65, 0x0000, 1, 1, 0xffff, 0xea82),
+    ("CRC-16/EN-13757", 16, 0x3d65, 0x0000, 0, 0, 0xffff, 0xc2b7),
+    ("CRC-16/GENIBUS", 16, 0x1021, 0xffff, 0, 0, 0xffff, 0xd64e),
+    ("CRC-16/GSM", 16, 0x1021, 0x0000, 0, 0, 0xffff, 0xce3c),
+    ("CRC-16/IBM-3740", 16, 0x1021, 0xffff, 0, 0, 0x0000, 0x29b1),
+    ("CRC-16/IBM-SDLC", 16, 0x1021, 0xffff, 1, 1, 0xffff, 0x906e),
+    ("CRC-16/ISO-IEC-14443-3-A", 16, 0x1021, 0xc6c6, 1, 1, 0x0000, 0xbf05),
+    ("CRC-16/KERMIT", 16, 0x1021, 0x0000, 1, 1, 0x0000, 0x2189),
+    ("CRC-16/LJ1200", 16, 0x6f63, 0x0000, 0, 0, 0x0000, 0xbdf4),
+    ("CRC-16/M17", 16, 0x5935, 0xffff, 0, 0, 0x0000, 0x772b),
+    ("CRC-16/MAXIM-DOW", 16, 0x8005, 0x0000, 1, 1, 0xffff, 0x44c2),
+    ("CRC-16/MCRF4XX", 16, 0x1021, 0xffff, 1, 1, 0x0000, 0x6f91),
+    ("CRC-16/MODBUS", 16, 0x8005, 0xffff, 1, 1, 0x0000, 0x4b37),
+    ("CRC-16/NRSC-5", 16, 0x080b, 0xffff, 1, 1, 0x0000, 0xa066),
+    ("CRC-16/OPENSAFETY-A", 16, 0x5935, 0x0000, 0, 0, 0x0000, 0x5d38),
+    ("CRC-16/OPENSAFETY-B", 16, 0x755b, 0x0000, 0, 0, 0x0000, 0x20fe),
+    ("CRC-16/PROFIBUS", 16, 0x1dcf, 0xffff, 0, 0, 0xffff, 0xa819),
+    ("CRC-16/RIELLO", 16, 0x1021, 0xb2aa, 1, 1, 0x0000, 0x63d0),
+    ("CRC-16/SPI-FUJITSU", 16, 0x1021, 0x1d0f, 0, 0, 0x0000, 0xe5cc),
+    ("CRC-16/T10-DIF", 16, 0x8bb7, 0x0000, 0, 0, 0x0000, 0xd0db),
+    ("CRC-16/TELEDISK", 16, 0xa097, 0x0000, 0, 0, 0x0000, 0x0fb3),
+    ("CRC-16/TMS37157", 16, 0x1021, 0x89ec, 1, 1, 0x0000, 0x26b1),
+    ("CRC-16/UMTS", 16, 0x8005, 0x0000, 0, 0, 0x0000, 0xfee8),
+    ("CRC-16/USB", 16, 0x8005, 0xffff, 1, 1, 0xffff, 0xb4c8),
+    ("CRC-16/XMODEM", 16, 0x1021, 0x0000, 0, 0, 0x0000, 0x31c3),
+    ("CRC-17/CAN-FD", 17, 0x1685b, 0x00000, 0, 0, 0x00000, 0x04f03),
+    ("CRC-21/CAN-FD", 21, 0x102899, 0x000000, 0, 0, 0x000000, 0x0ed841),
+    ("CRC-24/BLE", 24, 0x00065b, 0x555555, 1, 1, 0x000000, 0xc25a56),
+    ("CRC-24/FLEXRAY-A", 24, 0x5d6dcb, 0xfedcba, 0, 0, 0x000000, 0x7979bd),
+    ("CRC-24/FLEXRAY-B", 24, 0x5d6dcb, 0xabcdef, 0, 0, 0x000000, 0x1f23b8),
+    ("CRC-24/INTERLAKEN", 24, 0x328b63, 0xffffff, 0, 0, 0xffffff, 0xb4f3e6),
+    ("CRC-24/LTE-A", 24, 0x864cfb, 0x000000, 0, 0, 0x000000, 0xcde703),
+    ("CRC-24/LTE-B", 24, 0x800063, 0x000000, 0, 0, 0x000000, 0x23ef52),
+    ("CRC-24/OPENPGP", 24, 0x864cfb, 0xb704ce, 0, 0, 0x000000, 0x21cf02),
+    ("CRC-24/OS-9", 24, 0x800063, 0xffffff, 0, 0, 0xffffff, 0x200fa5),
+    ("CRC-30/CDMA", 30, 0x2030b9c7, 0x3fffffff, 0, 0, 0x3fffffff, 0x04c34abf),
+    ("CRC-31/PHILIPS", 31, 0x04c11db7, 0x7fffffff, 0, 0, 0x7fffffff, 0x0ce9e46c),
+    ("CRC-32/AIXM", 32, 0x814141ab, 0x00000000, 0, 0, 0x00000000, 0x3010bf7f),
+    ("CRC-32/AUTOSAR", 32, 0xf4acfb13, 0xffffffff, 1, 1, 0xffffffff, 0x1697d06a),
+    ("CRC-32/BASE91-D", 32, 0xa833982b, 0xffffffff, 1, 1, 0xffffffff, 0x87315576),
+    ("CRC-32/BZIP2", 32, 0x04c11db7, 0xffffffff, 0, 0, 0xffffffff, 0xfc891918),
+    ("CRC-32/CD-ROM-EDC", 32, 0x8001801b, 0x00000000, 1, 1, 0x00000000, 0x6ec2edc4),
+    ("CRC-32/CKSUM", 32, 0x04c11db7, 0x00000000, 0, 0, 0xffffffff, 0x765e7680),
+    ("CRC-32/ISCSI", 32, 0x1edc6f41, 0xffffffff, 1, 1, 0xffffffff, 0xe3069283),
+    ("CRC-32/ISO-HDLC", 32, 0x04c11db7, 0xffffffff, 1, 1, 0xffffffff, 0xcbf43926),
+    ("CRC-32/JAMCRC", 32, 0x04c11db7, 0xffffffff, 1, 1, 0x00000000, 0x340bc6d9),
+    ("CRC-32/MEF", 32, 0x741b8cd7, 0xffffffff, 1, 1, 0x00000000, 0xd2c22f51),
+    ("CRC-32/MPEG-2", 32, 0x04c11db7, 0xffffffff, 0, 0, 0x00000000, 0x0376e6e7),
+    ("CRC-32/XFER", 32, 0x000000af, 0x00000000, 0, 0, 0x00000000, 0xbd0be338),
+    ("CRC-40/GSM", 40, 0x0004820009, 0x0, 0, 0, 0xffffffffff, 0xd4164fc646),
+    ("CRC-64/ECMA-182", 64, 0x42f0e1eba9ea3693, 0x0, 0, 0, 0x0, 0x6c40df5f0b497347),
+    ("CRC-64/GO-ISO", 64, 0x000000000000001b, 0xffffffffffffffff, 1, 1,
+     0xffffffffffffffff, 0xb90956c775a41001),
+    ("CRC-64/MS", 64, 0x259c84cba6426349, 0xffffffffffffffff, 1, 1, 0x0, 0x75d4b74f024eceea),
+    ("CRC-64/REDIS", 64, 0xad93d23594c935a9, 0x0, 1, 1, 0x0, 0xe9c6d914c4b8d9ca),
+    ("CRC-64/WE", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, 0, 0,
+     0xffffffffffffffff, 0x62ec59e3f1a4f00a),
+    ("CRC-64/XZ", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, 1, 1,
+     0xffffffffffffffff, 0x995dc9bbdf1939fa),
+]
+
+
+def crc_spec(name: str) -> dict:
+    """The catalogue set called `name`, as a spec dict."""
+    for e in CRC_CATALOG:
+        if e[0] == name:
+            return {"width": e[1], "poly": e[2], "init": e[3], "refin": e[4], "refout": e[5],
+                    "xorout": e[6], "check": e[7]}
+    raise KeyError(name)
+
+
+def _reflect(v, w):
+    r = 0
+    for _ in range(w):
+        r = (r << 1) | (v & 1)
+        v >>= 1
+    return r
+
+
+def crc_register(bits, width, poly, init, refin) -> int:
+    bits = _bits(bits)
+    mask = (1 << width) - 1
+    top = 1 << (width - 1)
+    reg = init & mask
+    seq = bits
+    if refin:
+        whole = (bits.size // 8) * 8
+        seq = np.concatenate([bits[:whole].reshape(-1, 8)[:, ::-1].ravel(), bits[whole:]])
+    for v in seq:
+        fb = (1 if reg & top else 0) ^ int(v)
+        reg = (reg << 1) & mask
+        if fb:
+            reg ^= poly
+    return reg
+
+
+def crc(bits, spec) -> int:
+    """The CRC of a bit message under a Rocksoft spec (dict) — atkdsp.h §17."""
+    w = spec["width"]
+    reg = crc_register(bits, w, spec["poly"], spec["init"], spec["refin"])
+    if spec["refout"]:
+        reg = _reflect(reg, w)
+    return (reg ^ spec["xorout"]) & ((1 << w) - 1)
+
+
+def ascii_bits(s) -> np.ndarray:
+    """Bytes (or str) -> bits, each byte MSB first."""
+    if isinstance(s, str):
+        s = s.encode()
+    return np.unpackbits(np.frombuffer(bytes(s), np.uint8))
+
+
+def crc_check_value(spec) -> int:
+    return crc(ascii_bits(b"123456789"), spec)
+
+
+CRC_END = 0
+CRC_SEARCH = 1
+_COMBOS = ((0, 0, 0), (1, 1, 0), (0, 1, 0), (1, 0, 0), (0, 0, 1), (1, 1, 1), (0, 1, 1), (1, 0, 1))
+
+
+def _deg(p):
+    return p.bit_length() - 1
+
+
+def _pmod(a, g):
+    dg = _deg(g)
+    da = _deg(a)
+    while a and da >= dg:
+        a ^= g << (da - dg)
+        da = _deg(a)
+    return a
+
+
+def _pgcd(a, b):
+    while b:
+        a, b = b, _pmod(a, b)
+    return a
+
+
+def _pdiv(a, g):
+    q = 0
+    dg = _deg(g)
+    while a and _deg(a) >= dg:
+        k = _deg(a) - dg
+        q |= 1 << k
+        a ^= g << k
+    return q, a
+
+
+def _strip_x(p):
+    if not p:
+        return p
+    return p >> ((p & -p).bit_length() - 1)
+
+
+def _mulmod(u, v, g, w):
+    r = 0
+    t = u
+    top = 1 << w
+    for k in range(w):
+        if (v >> k) & 1:
+            r ^= t
+        t <<= 1
+        if t & top:
+            t ^= g
+    return r
+
+
+def _xpow(L, g, w):
+    r, base = 1, _pmod(2, g)
+    while L:
+        if L & 1:
+            r = _mulmod(r, base, g, w)
+        base = _mulmod(base, base, g, w)
+        L >>= 1
+    return r
+
+
+def _solve_init(a, rhs, g, w, cap=256):
+    col = []
+    t = a
+    for _k in range(w):
+        col.append(t)
+        t <<= 1
+        if t & (1 << w):
+            t ^= g
+    rows = [sum(((col[k] >> r) & 1) << k for k in range(w)) for r in range(w)]
+    aug = [(rhs >> r) & 1 for r in range(w)]
+    piv = []
+    r0 = 0
+    for c in range(w):
+        if r0 >= w:
+            break
+        p = next((r for r in range(r0, w) if (rows[r] >> c) & 1), -1)
+        if p < 0:
+            continue
+        rows[p], rows[r0] = rows[r0], rows[p]
+        aug[p], aug[r0] = aug[r0], aug[p]
+        for r in range(w):
+            if r != r0 and (rows[r] >> c) & 1:
+                rows[r] ^= rows[r0]
+                aug[r] ^= aug[r0]
+        piv.append(c)
+        r0 += 1
+    np_ = len(piv)
+    if any(aug[r] for r in range(np_, w)):
+        return []
+    free = [c for c in range(w) if c not in piv][:8]
+    out = []
+    for mm in range(1 << len(free)):
+        if len(out) >= cap:
+            break
+        x = 0
+        for f, c in enumerate(free):
+            if (mm >> f) & 1:
+                x |= 1 << c
+        for i in range(np_):
+            v = aug[i] ^ (bin(rows[i] & x & ~(1 << piv[i])).count("1") & 1)
+            if v:
+                x |= 1 << piv[i]
+        out.append(x)
+    return out
+
+
+def _field_value(f, w, layout):
+    if not layout:
+        v = 0
+        for x in f:
+            v = (v << 1) | int(x)
+        return v
+    v = 0
+    for k in range(w // 8):
+        byte = 0
+        for x in f[8 * k:8 * k + 8]:
+            byte = (byte << 1) | int(x)
+        v |= byte << (8 * k)
+    return v
+
+
+def _bits_int(bits):
+    v = 0
+    for x in bits:
+        v = (v << 1) | int(x)
+    return v
+
+
+def crc_recover(frames, width: int = 0, pos: int = CRC_END, max_header: int = 0,
+                pfa: float = 1e-3, cap: int = 8) -> list:
+    """CRC recovery — the twin of atkdsp_crc_recover (atkdsp.h §17), the same
+    search in the same order. `frames` is a list of bit arrays. Returns dicts."""
+    frames = [_bits(f) for f in frames]
+    nf = len(frames)
+    if width and not 3 <= width <= 64:
+        raise ValueError("width 0 or 3..64")
+    if not pfa > 0.0:
+        pfa = 1e-3
+    if nf < 3:
+        return []
+    lens = [f.size for f in frames]
+    distinct = any(x != lens[0] for x in lens)
+    minlen = min(lens)
+    max_off = max_header if pos == CRC_END else (minlen - 7 if minlen > 7 else 0)
+    trials = 0.0
+    log10_thr = _m.log10(pfa)
+    cands = []
+    catalog = [{"width": e[1], "poly": e[2], "init": e[3], "refin": e[4], "refout": e[5],
+                "xorout": e[6]} for e in CRC_CATALOG]
+
+    def verify(spec, layout, h, t):
+        w = spec["width"]
+        for f in frames:
+            cov = f[h:f.size - t]
+            L = cov.size - w
+            if crc(cov[:L], spec) != _field_value(cov[L:], w, layout):
+                return False
+        return True
+
+    for off in range(max_off + 1):
+        h = off if pos == CRC_END else 0
+        t = 0 if pos == CRC_END else off
+        level = []
+        for w in ([width] if width else range(3, 65)):
+            for ci, (refin, refout, layout) in enumerate(_COMBOS):
+                if layout and w % 8:
+                    continue
+                if not width and off > 0 and ci > 0:
+                    continue
+                ps, Ls = [], []
+                ok = True
+                for f in frames:
+                    F = f.size
+                    if F < h + t + w + 1:
+                        ok = False
+                        break
+                    cov = f[h:F - t]
+                    L = cov.size - w
+                    msg = cov[:L]
+                    if refin:
+                        if L % 8:
+                            ok = False
+                            break
+                        msg = msg.reshape(-1, 8)[:, ::-1].ravel()
+                    R = _field_value(cov[L:], w, layout)
+                    if refout:
+                        R = _reflect(R, w)
+                    ps.append((_bits_int(msg) << w) | R)
+                    Ls.append(L)
+                if not ok:
+                    continue
+                for hyp in range(3):
+                    trials += 1.0
+                    G = _recover_G(ps, Ls, w, hyp)
+                    if G is None:
+                        continue
+                    e = _deg(G) - w
+                    if e > 8:
+                        continue
+                    gs = []
+                    if e == 0:
+                        gs.append(G)
+                    else:
+                        for hm in range(1 << (e - 1 if e > 1 else 0)):
+                            hv = 1 | (1 << e) | (hm << 1)
+                            q, r = _pdiv(G, hv)
+                            if r:
+                                continue
+                            gs.append(q)
+                    for gq in gs:
+                        if _deg(gq) != w or not gq & 1:
+                            continue
+                        glow = gq & ((1 << w) - 1)
+                        ib = next((i for i in range(1, nf) if Ls[i] != Ls[0]), -1)
+                        r0 = _pmod(ps[0], gq)
+                        xl0 = _xpow(Ls[0], gq, w)
+                        init_known = True
+                        if hyp == 1:
+                            sols = [0]
+                        elif hyp == 2:
+                            sols = [(1 << w) - 1]
+                        elif ib >= 0:
+                            r1 = _pmod(ps[ib], gq)
+                            xl1 = _xpow(Ls[ib], gq, w)
+                            sols = _solve_init(xl0 ^ xl1, r0 ^ r1, gq, w)
+                        else:
+                            sols = [0]
+                            init_known = False
+                        nver = 0
+                        best = None
+                        for I in sols:
+                            Xp = r0 ^ _mulmod(I, xl0, gq, w)
+                            spec = {"width": w, "poly": glow, "init": I, "refin": refin,
+                                    "refout": refout,
+                                    "xorout": _reflect(Xp, w) if refout else Xp}
+                            if not verify(spec, layout, h, t):
+                                continue
+                            if not nver:
+                                best = spec
+                            nver += 1
+                        if not nver:
+                            continue
+                        if nver > 1:
+                            init_known = False
+                        if hyp != 0:
+                            if ib < 0:
+                                init_known = False
+                            else:
+                                r1 = _pmod(ps[ib], gq)
+                                xl1 = _xpow(Ls[ib], gq, w)
+                                nfit = 0
+                                for Ia in _solve_init(xl0 ^ xl1, r0 ^ r1, gq, w):
+                                    if nfit >= 2:
+                                        break
+                                    Xa = r0 ^ _mulmod(Ia, xl0, gq, w)
+                                    s2 = dict(best, init=Ia, xorout=_reflect(Xa, w) if refout else Xa)
+                                    if verify(s2, layout, h, t):
+                                        nfit += 1
+                                if nfit != 1:
+                                    init_known = False
+                        u = 3 if (hyp == 0 and distinct) else 2
+                        cat = -1
+                        if not init_known:
+                            for k, cs in enumerate(catalog):
+                                if (cs["width"] != w or cs["poly"] != glow or cs["refin"] != refin
+                                        or cs["refout"] != refout):
+                                    continue
+                                if verify(cs, layout, h, t):
+                                    best = dict(best, init=cs["init"], xorout=cs["xorout"])
+                                    cat = k
+                                    break
+                        else:
+                            for k, cs in enumerate(catalog):
+                                if all(cs[x] == best[x] for x in
+                                       ("width", "poly", "init", "refin", "refout", "xorout")):
+                                    cat = k
+                                    break
+                        best = dict(best, check=crc_check_value(best))
+                        c = {"spec": best, "layout": layout, "header_bits": h,
+                             "trailer_bits": t, "init_known": int(init_known),
+                             "frames_ok": nf, "catalog": cat,
+                             "eq_bits": float((nf - u) * w)}
+                        key = (w, glow, best["init"], best["xorout"], refin, refout, layout, h, t)
+                        if any(x.get("_key") == key for x in cands + level):
+                            continue
+                        c["_key"] = key
+                        level.append(c)
+        cands.extend(level)
+    kept = []
+    for c in cands:
+        eq = c.pop("eq_bits")
+        c["log10_pfa"] = _m.log10(trials) - eq * _m.log10(2.0)
+        if eq > 0.0 and c["log10_pfa"] <= log10_thr:
+            kept.append(c)
+    for c in kept:
+        c["alternatives"] = sum(1 for d in kept
+                                if d is not c and d["spec"]["width"] == c["spec"]["width"])
+        c.pop("_key", None)
+
+    def simple(sp):
+        ones = (1 << sp["width"]) - 1
+        return sp["init"] in (0, ones) and sp["xorout"] in (0, ones)
+    kept.sort(key=lambda c: (c["catalog"] < 0, not simple(c["spec"]), c["log10_pfa"],
+                             (c["header_bits"] + c["trailer_bits"]) % 8 != 0,
+                             c["header_bits"] + c["trailer_bits"]))
+    return kept[:cap]
+
+
+def _recover_G(ps, Ls, w, hyp):
+    nf = len(ps)
+    if hyp == 0:
+        GD, nd = 0, 0
+        for i in range(nf):
+            first = next((k for k in range(i) if Ls[k] == Ls[i]), -1)
+            if first < 0:
+                continue
+            d = ps[i] ^ ps[first]
+            if not d:
+                continue
+            GD = d if not nd else _pgcd(GD, d)
+            nd += 1
+        GE, ne, gd = 0, 0, 0
+        for i in range(nf):
+            for j in range(i + 1, nf):
+                if Ls[j] == Ls[i]:
+                    continue
+                for k in range(j + 1, nf):
+                    if ne >= 16:
+                        break
+                    if Ls[k] == Ls[i]:
+                        continue
+                    dij, dik = ps[i] ^ ps[j], ps[i] ^ ps[k]
+                    E = (dij << Ls[i]) ^ (dij << Ls[k]) ^ (dik << Ls[i]) ^ (dik << Ls[j])
+                    if not E:
+                        continue
+                    gd = _m.gcd(gd, _m.gcd(abs(Ls[i] - Ls[j]), abs(Ls[i] - Ls[k])))
+                    GE = E if not ne else _pgcd(GE, E)
+                    ne += 1
+                if ne >= 16:
+                    break
+            if ne >= 16:
+                break
+        if ne >= 2:
+            GE = _strip_x(GE)
+            q, r = _pdiv(GE, 1 | (1 << gd))
+            if not r:
+                GE = q
+        if nd and ne >= 2:
+            G = _pgcd(GD, GE)
+        elif nd:
+            G = GD
+        elif ne >= 2:
+            G = GE
+        else:
+            return None
+    else:
+        I0 = (1 << w) - 1 if hyp == 2 else 0
+        G, np_ = 0, 0
+        for j in range(1, nf):
+            d = ps[0] ^ ps[j]
+            if I0:
+                d ^= (I0 << Ls[0]) ^ (I0 << Ls[j])
+            if not d:
+                continue
+            G = d if not np_ else _pgcd(G, d)
+            np_ += 1
+        if np_ < 2:
+            return None
+    if not G:
+        return None
+    G = _strip_x(G)
+    return G if _deg(G) >= w else None

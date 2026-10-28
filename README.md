@@ -82,7 +82,89 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.13.0 (ABI 14)
+## What is in v0.14.0 (ABI 15)
+
+**The bitstream engine** — phase 1a of `docs/ATKDSP_PLAN.md` §D, the part Bill
+called "extremely important to me as a signals analyst". Header §14–17, twins
+in `reference.py` §14–17, 218 tests in `tests/test_bitstream.py` (C == twin,
+planted truth, negative controls), and a smoke line per kernel. Bits go in one
+per byte (siga's form) and are packed to 64-bit words inside.
+
+| | what | notes |
+|---|---|---|
+| **§14 bits** | `bits_autocorr`, `bits_xcorr`, `bits_search` (errors allowed, inverted / reversed), `bits_columns` (raster sums and parities) | popcount on packed words; 1 M bits × 4096 lags in 0.10 s |
+| | `bits_width_scan` | the raster's right width, numerically: a z-score per width that is N(0,1) for random bits at EVERY width, so widths compare and the threshold is a normal quantile; the harmonic rule picks the fundamental |
+| | `bits_sync_discover` | recurring words nobody listed: period by the commonest gap, phase by the commonest residue, overlapping windows chained into one pattern (up to 128 bits) and trimmed while that makes it more significant; Bonferroni over words × periods × phases; idle and preambles flagged |
+| | `bits_stats` | runs, n-grams 1–8, χ² of words, Maurer's universal test and ApEn (NIST SP 800-22; ApEn checked against NIST's worked example), block entropy by width |
+| | `bits_wht`, `bits_walsh`, `bits_cyclic` | parity relations between columns; the analyzer-strip transforms (sequency power, dyadic autocorrelation, cyclic time / frequency) |
+| **§15 scramblers** | `bm`, `bm_profile` | Berlekamp–Massey on packed words: an L-stage register from 2L bits; `bm_mask` gives siga's mask |
+| | `descramble_add`, `descramble_mult`, `scramble_mult` | siga.bits' mask convention, held to ATK's own `lfsr_sequence` by test; state carried, so any block sizes |
+| | `scrambler_search` | every trinomial and pentanomial to degree 32 (36,456 candidates, 0.5 s on 80 kbit) as a feed-forward filter — the multiplicative descrambler, and an annihilator of any additive scrambler whatever its seed; ranked by the G statistic, which is χ² for random bits, so the threshold is derived; must beat doing nothing; additive seeds recovered from a constant run and stepped back to bit 0 |
+| **§16 FEC** | `Viterbi` / `conv_encode` | K ≤ 15, rate 1/n ≤ 8, any generators, puncturing, terminated / tail-biting / streaming, soft or hard; float32 metrics the twin reproduces bit for bit; tail-biting identical to the PBCH decoder's (test); streaming output identical however it is chunked |
+| | `RS` | GF(2^m), m 3–16, any fcr / prim / shortening, erasures; CCSDS dual basis (the matrix's inverse is NASA's published one, row for row) |
+| | `BCH` | binary, narrow-sense, any m ≤ 16 and t, shortened; BCH(31,21) is POCSAG's code, held to ATK's pager encoder |
+| | `BlockCode` | any small code from its generator (n ≤ 32, n−k ≤ 20) by syndrome table, dmin found; says when a word is equidistant from two codewords instead of guessing; Hamming and Golay generators derived from their polynomials |
+| **§17 CRC** | `crc` + catalogue | width 1–64, Rocksoft parameters, bit-granular messages, table path for long byte runs; 111 named sets, every check value tested, checked against the reveng catalogue |
+| | `crc_recover` | the unknown CRC from frames: GCD of frame combinations in which init and xorout cancel (equal lengths, three lengths, or an assumed init of 0 / all-ones), a 2-unknown solve for init, and every candidate must reproduce EVERY frame; width, reflection, field byte order, an excluded header and bits after the field are searched |
+
+Measured when it was written (Linux, gcc AVX2, one core unless OpenMP):
+
+| what | result |
+|---|---|
+| Viterbi K=7 r=1/2 (171, 133), soft, BPSK/AWGN | BER 2.2e-5 at 3.9 dB, **8.3e-6 at 4.2 dB** (union bound from the code's textbook spectrum: 8.6e-6), 3.3e-6 at 4.7 dB — the 1e-5 crossing at ≈ 4.05 dB against the published 4.2–4.4 |
+| Viterbi K=9 r=1/3 (557, 663, 711) | 1.9e-5 at 3.0 dB, 3.5e-6 at 3.3 dB; no published table was checked, the test asserts it beats K=7 r=1/2 by 5× at 3.6 dB |
+| Viterbi speed | K=7: 5.1 Mbit/s; K=9: 0.76 Mbit/s; K=15: 10 kbit/s (scalar ACS — the AVX2 butterfly is a later increment; K=15 codes are rare) |
+| CCSDS RS(255,223), 16 errors | 109 µs per codeword; 17 errors: 200 of 200 refused, none miscorrected |
+| BCH(31,21), 3 errors (beyond t) | measured: 20–60 % land on a wrong codeword, the rest are refused — stated, not assumed |
+| `crc_recover` | 32-bit CRC with a 64-bit header scan: 0.22 s; width unknown over 10 frames of ≤ 1500 bits: 0.10 s |
+| width scan / sync discovery / stats, 1 M bits | 0.12 s (widths 2–2048) / 0.34 s / 0.03 s |
+
+**What frames cannot decide, and how crc_recover says so.** Three things are
+algebra, not bugs, and the tests pin each one down:
+- *A constant bit is absorbable.* A header that is the same in every frame,
+  or a closing flag after the FCS, is folded into init or xorout by an
+  equally valid set at another offset.
+- *A polynomial that factors is also a CRC of its factors.* XMODEM's
+  x^16 + x^12 + x^5 + 1 = (x+1)·q(x), and its frames are exactly CRC-15s of
+  q. With few frames a spurious factor can stand in for one of g's own.
+- *An (x+1) factor makes init and xorout trade.* With h = g/(x+1),
+  h·x^L ≡ h (mod g) for every L, so (init ⊕ h, xorout ⊕ h) is the same CRC
+  on every message — `init_known = 0`.
+
+So every offset is scanned and every set that reproduces every frame is
+returned, with `alternatives` counting the others of its width, ranked: a
+catalogue set first, then simple sets (init and xorout each 0 or all ones),
+then `log10_pfa`, then a byte-aligned offset (a prior from real protocols,
+said as one), then the smaller offset. `log10_pfa` itself is derived: each
+frame is w bits of equations, g, init and xorout cost w each, and the search's
+trials are counted — which is why four frames suffice from 16 bits up and
+narrower CRCs need more, as many as that arithmetic says.
+
+**Reviewed before release.** An independent review (a second Claude, not the
+author, with an AddressSanitizer + UBSan build and a fuzz sweep) found five
+defects, all fixed, each with a regression test: the streaming Viterbi's
+`out_max` was nllr + n where a call can release nllr + depth − 1 (a short call
+after a long one overflowed the caller's buffer and corrupted the ring); an
+unchecked size at `viterbi_create`; a missing terminator in `viterbi_describe`
+with eight outputs and a 64-column puncture; a shift by 64 (and a hang) for a
+degree-63 scrambler mask; and the Viterbi decodes allocating, against rule 2 —
+all scratch now comes from `_create`. Also from the review: MSVC builds
+without AVX2 count bits in software (`__popcnt64` needs a POPCNT CPU), the
+block-code table build is bounded (2^25 patterns; a degenerate `[I | 0]` code
+took 74 s), and inputs past the 31-bit limits are refused instead of
+truncated. The whole bitstream suite passes under the sanitizers.
+
+**Housekeeping:** `atkdsp_lte_sib1_decode` and `atkdsp_lte_si_decode` are
+marked DO NOT USE in the header (six known physical-layer faults; ATK uses its
+own `lte_sib1_rx.py`). A comment only — no ABI change.
+
+**Not yet:** naming the code (block / convolutional / RS / interleaver
+recognition, plan §D4) is phase 1b; the bench in ATK (plan §D6,
+`BIT_BENCH_PLAN.md`) is 1c. The Windows build of this release has not been
+run from here — `build.bat` picks the new files up by its `src\*.c` glob, and
+the OpenMP loops follow the MSVC 2.0 rule the FFT already learned.
+
+## What was in v0.13.0 (ABI 14)
 
 **`atkdsp_dmr_sync` — the DMR / P25 sync correlator** (`src/dmr_sync.c`,
 header §13, twin `reference.py` §13), the first thing the KrakenSDR DF engine
@@ -369,7 +451,8 @@ depending on whether cmake happened to be installed, with only the
 6. Higher-order cumulants (C20 … C63) for modulation classification.
 7. Cyclostationary engines (FAM / SSCA) and pseudo Wigner-Ville.
 8. Correlators: sync-word search (**DMR / P25 done, 0.13.0**), LFSR
-   descrambler search, Gardner / Mueller-Müller timing.
+   descrambler search (**done, 0.14.0** — and the rest of the bitstream
+   engine, docs/ATKDSP_PLAN.md §D phase 1a), Gardner / Mueller-Müller timing.
 9. Multi-channel: spatial covariance, cross-ambiguity (TDOA/FDOA), MUSIC —
    for a two-channel bladeRF 2.0 and the KrakenSDR.
 10. Cellular survey: PSS/SSS/SSB **correlators** belong here; the broadcast

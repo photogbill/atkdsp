@@ -182,6 +182,126 @@ int main(void) {
         atkdsp_ddc_destroy(d); free(big);
     }
 
+    /* -- the bitstream engine (v0.14.0): one line per kernel --------------- */
+    {
+        /* CRC: the catalogue's check values, and the engine on a bit message */
+        const char *msg = "123456789";
+        uint8_t mb[72];
+        for (int i = 0; i < 9; ++i)
+            for (int k = 0; k < 8; ++k) mb[8 * i + k] = (uint8_t)(((unsigned char)msg[i] >> (7 - k)) & 1u);
+        int okc = atkdsp_crc_catalog_count() >= 100;
+        for (int i = 0; i < atkdsp_crc_catalog_count(); ++i) {
+            atkdsp_crcspec cs; uint64_t v = 0;
+            atkdsp_crc_catalog(i, &cs);
+            if (atkdsp_crc(mb, 72, &cs, &v) != ATKDSP_OK || v != cs.check) okc = 0;
+        }
+        CHECK(okc, "crc: every catalogue set reproduces its check value");
+
+        /* an LFSR, x^15 + x^14 + 1 (siga.bits mask 0xC001) */
+        enum { NB = 4096 };
+        uint8_t *zb = (uint8_t *)calloc(NB, 1), *seq = (uint8_t *)malloc(NB);
+        uint64_t st = 0x2A5D;
+        atkdsp_descramble_add(zb, NB, 0xC001, &st, seq);
+        uint8_t poly[64];
+        ptrdiff_t Lc = atkdsp_bm(seq, 30, poly, sizeof poly);
+        CHECK(Lc == 15 && poly[0] == 1 && poly[1] == 1 && poly[15] == 1, "bm: 30 bits give the 15-stage register");
+        int32_t prof[NB];
+        atkdsp_bm_profile(seq, NB, prof);
+        CHECK(prof[NB - 1] == 15, "bm_profile plateaus at 15");
+        uint8_t *sc = (uint8_t *)malloc(NB), *ds = (uint8_t *)malloc(NB);
+        uint64_t s1 = 0x123, s2 = 0x777;
+        atkdsp_scramble_mult(seq, NB, 0x8011, &s1, sc);
+        atkdsp_descramble_mult(sc, NB, 0x8011, &s2, ds);
+        CHECK(memcmp(ds + 15, seq + 15, NB - 15) == 0, "multiplicative descrambler self-synchronises");
+
+        /* bit primitives on a period-37 stream */
+        uint8_t *pb = (uint8_t *)malloc(NB);
+        for (int i = 0; i < NB; ++i) pb[i] = seq[i % 37];
+        float ac[80];
+        atkdsp_bits_autocorr(pb, NB, 79, ac);
+        CHECK(ac[37] == 1.0f && ac[74] == 1.0f, "bits_autocorr sees the period");
+        float zw[120];
+        atkdsp_bits_width_scan(pb, NB, 2, 121, zw, NULL);
+        int arg = 0; for (int i = 1; i < 120; ++i) if (zw[i] > zw[arg]) arg = i;
+        CHECK(arg + 2 == 37 || (arg + 2) % 37 == 0, "bits_width_scan peaks at the period");
+        atkdsp_bithit hit[8];
+        ptrdiff_t nh = atkdsp_bits_search(pb, 200, pb + 10, 20, 0, 0, hit, 8);
+        CHECK(nh >= 1 && hit[0].pos == 10, "bits_search finds a planted word");
+        atkdsp_bitstats bs;
+        CHECK(atkdsp_bits_stats(seq, NB, &bs) == ATKDSP_OK && bs.n == NB, "bits_stats runs");
+        uint32_t cols[2] = {0, 1}; int32_t spec[4];
+        CHECK(atkdsp_bits_wht(pb, NB, 37, cols, 2, spec) == NB / 37 && spec[0] == NB / 37, "bits_wht counts rows");
+        float sq[256], dy[256], ct[256], cf[129];
+        CHECK(atkdsp_bits_walsh(seq, NB, 256, 0, sq, dy) == 16 && fabsf(dy[0] - 1.0f) < 1e-6f, "bits_walsh");
+        CHECK(atkdsp_bits_cyclic(seq, NB, 256, 0, ct, cf) == 16 && ct[0] == 1.0f, "bits_cyclic");
+        atkdsp_synccand sy[4];
+        CHECK(atkdsp_bits_sync_discover(seq, NB, 16, 3, 0.0, sy, 4) == 0, "sync_discover: an m-sequence holds no recurring word");
+
+        /* Viterbi K=7 r=1/2 round trip, terminated */
+        const uint32_t g7[2] = {0171, 0133};
+        uint8_t code[2 * (200 + 6)], dec[200];
+        float llr[2 * (200 + 6)], met = 0.0f;
+        ptrdiff_t nc = atkdsp_conv_encode(7, 2, g7, NULL, 0, ATKDSP_CONV_TERM, seq, 200, code, sizeof code);
+        for (ptrdiff_t i = 0; i < nc; ++i) llr[i] = code[i] ? -1.0f : 1.0f;
+        llr[17] = -llr[17]; llr[90] = -llr[90];              /* two channel errors */
+        atkdsp_viterbi *vt = atkdsp_viterbi_create(7, 2, g7, NULL, 0, ATKDSP_CONV_TERM, 0, 200);
+        ptrdiff_t nd = atkdsp_viterbi_decode(vt, llr, (size_t)nc, dec, sizeof dec, &met);
+        CHECK(nd == 200 && memcmp(dec, seq, 200) == 0 && met > 0.97f, "viterbi corrects two errors");
+        atkdsp_viterbi_destroy(vt);
+
+        /* CCSDS RS(255,223) in the dual basis: 16 errors */
+        atkdsp_rs *rs = atkdsp_rs_create(8, 0x187, 112, 11, 32, 0, ATKDSP_RS_DUAL_BASIS);
+        uint16_t cw[255], bad[255];
+        for (int i = 0; i < 223; ++i) cw[i] = (uint16_t)((i * 37 + 11) & 0xff);
+        atkdsp_rs_encode(rs, cw, cw + 223);
+        memcpy(bad, cw, sizeof cw);
+        for (int i = 0; i < 16; ++i) bad[i * 15] ^= (uint16_t)(1 + i);
+        CHECK(rs && atkdsp_rs_decode(rs, bad, NULL, 0, NULL) == 16 && memcmp(bad, cw, sizeof cw) == 0,
+              "rs: CCSDS RS(255,223) corrects 16 errors");
+        atkdsp_rs_destroy(rs);
+
+        /* BCH(31,21): POCSAG's generator 0x769 */
+        atkdsp_bch *bch = atkdsp_bch_create(5, 2, 0, 0);
+        uint8_t gen[11]; unsigned gv = 0;
+        atkdsp_bch_generator(bch, gen, sizeof gen);
+        for (int i = 0; i < 11; ++i) gv = (gv << 1) | gen[i];
+        uint8_t bc[31];
+        atkdsp_bch_encode(bch, seq, bc);
+        bc[3] ^= 1; bc[29] ^= 1;
+        CHECK(gv == 0x769 && atkdsp_bch_decode(bch, bc, NULL) == 2 && memcmp(bc, seq, 21) == 0,
+              "bch: BCH(31,21) is POCSAG's code and corrects two");
+        atkdsp_bch_destroy(bch);
+
+        /* Hamming(7,4) by syndrome table */
+        const uint8_t G74[28] = {0,0,0,1,0,1,1, 0,0,1,0,1,1,0, 0,1,0,1,1,0,0, 1,0,1,1,0,0,0};
+        atkdsp_blk *blk = atkdsp_blk_create(7, 4, G74);
+        uint8_t d4[4] = {1, 0, 1, 1}, c7[7], o4[4]; int dmin = 0;
+        atkdsp_blk_encode(blk, d4, c7);
+        c7[2] ^= 1;
+        atkdsp_blk_params(blk, NULL, NULL, &dmin);
+        CHECK(dmin == 3 && atkdsp_blk_decode(blk, c7, o4) == 1 && memcmp(o4, d4, 4) == 0,
+              "blk: Hamming(7,4) dmin 3, corrects one");
+        atkdsp_blk_destroy(blk);
+
+        /* CRC recovery: four XMODEM frames of different lengths */
+        atkdsp_crcspec xm; atkdsp_crc_catalog(0, &xm);
+        for (int i = 0; i < atkdsp_crc_catalog_count(); ++i) {
+            if (strcmp(atkdsp_crc_catalog_name(i), "CRC-16/XMODEM") == 0) { atkdsp_crc_catalog(i, &xm); break; }
+        }
+        uint8_t fr[4 * 400]; size_t lens[4]; size_t o = 0;
+        for (int f = 0; f < 4; ++f) {
+            const size_t L = 80 + 37 * (size_t)f;
+            memcpy(fr + o, seq + 100 * f, L);
+            uint64_t v = 0; atkdsp_crc(fr + o, L, &xm, &v);
+            for (int k = 0; k < 16; ++k) fr[o + L + k] = (uint8_t)((v >> (15 - k)) & 1u);
+            lens[f] = L + 16; o += L + 16;
+        }
+        atkdsp_crccand cc[4];
+        ptrdiff_t ncr = atkdsp_crc_recover(fr, lens, 4, 16, ATKDSP_CRC_END, 0, 0.0, cc, 4);
+        CHECK(ncr >= 1 && cc[0].spec.poly == 0x1021 && cc[0].catalog >= 0, "crc_recover finds XMODEM from four frames");
+        free(zb); free(seq); free(sc); free(ds); free(pb);
+    }
+
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);
     printf("%d failure(s)\n", fails);
     return fails ? 1 : 0;

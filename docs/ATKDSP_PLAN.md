@@ -5,10 +5,26 @@
 > rest of your lists …"* — and on the bitstream section: *"Please, this
 > section is extremely important to me as a signals analyst."*
 
-**Status: PLAN — nothing below is built.** Written against atkdsp v0.13.0 /
-ABI 14 (a Linux build of that commit passed the smoke test and all 361
-cross-check tests on 2026-10-27; the Windows build was not run for this
-plan). The recommended order is §G; the order is Bill's call.
+**Status (2026-10-28): phase 1a is BUILT — atkdsp v0.14.0 / ABI 15** (§D1,
+§D2, §D3, §D5 and the SIB1 housekeeping; README "What is in v0.14.0"). Linux:
+smoke test and 579 tests pass (361 cross-check + 218 bitstream), the bitstream
+suite also under ASan + UBSan after an independent review (README). The Windows
+build has not been run yet. Everything else below is still plan; next in §G is
+1b (naming the code, §D4), then 1c (the bench in ATK, §D6).
+
+Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
+order is Bill's call.
+
+**What building 1a changed in this plan** (the README has the detail):
+- `crc_recover` returns EVERY parameter set that reproduces the frames, not
+  the first. Constant header/trailer bits, a factoring polynomial and an
+  (x+1) factor make some ties undecidable from frames alone (algebra, pinned
+  by tests); the struct gained `alternatives` and takes a `pfa`.
+- The Viterbi create takes `max_bits` (decision memory allocated once, rule 2)
+  and the decoders gained `*_describe` / `*_stats` (rule 5).
+- Scrambler masks use siga.bits' convention for both kinds, held to ATK's own
+  `lfsr_sequence` by test; the search tries odd-weight polynomials only (3 or
+  5 terms), as every primitive polynomial has.
 
 **There are two plans in this folder.** `docs/DSP_EXPANSION_PLAN.md` was
 written minutes earlier by another Claude instance, from the same request.
@@ -1395,7 +1411,7 @@ checked first).
 
 | Phase | Contents | Size | Why here |
 |---|---|---|---|
-| **1a** | **Bitstream engine:** D1 primitives, D2 scrambling + Berlekamp–Massey, D3 Viterbi / RS / BCH / small codes / CRC engine, D5 CRC recovery (+ the SIB1 housekeeping) | L | Bill's top priority. Pure mathematics, fully verifiable against known answers with no hardware, and it touches nothing the other instances are editing in the RF path |
+| **1a** ✅ v0.14.0 | **Bitstream engine:** D1 primitives, D2 scrambling + Berlekamp–Massey, D3 Viterbi / RS / BCH / small codes / CRC engine, D5 CRC recovery (+ the SIB1 housekeeping) | L | Bill's top priority. Pure mathematics, fully verifiable against known answers with no hardware, and it touches nothing the other instances are editing in the RF path |
 | **1b** | **Name the code:** D4 — rank scan, block / convolutional / RS / interleaver recognition, the robust (noisy-stream) variant | M–L | Needs 1a's encoders and decoders for its decode → re-encode evidence |
 | **1c** | **Bitstream bench in ATK:** D6 — dossier, raster colours, chain, the new siga modules | L | The engine is only useful to an analyst once the bench drives it |
 | 2 | **Detection track:** B1 CFAR, B2 burst descriptors + TDMA, A3 C ring | M–L | Cued DF, Bug Sniffer and Drone Discovery all wait on it |

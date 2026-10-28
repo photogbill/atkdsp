@@ -12,6 +12,9 @@ This plan covers the kernels Bill asked for on 2026-10-27:
   descriptors, adaptive equalizer + EVM/MER, general CRC + polynomial recovery,
   long-term occupancy + baseline, strong-signal removal, TX fingerprinting,
   intercept audio cleanup.
+- **Plan then build (added 2026-10-28):** Part C — search kernels from radio
+  astronomy and SETI: spectral kurtosis, drift-rate search, periodic search,
+  single-pulse search, faint-streak search, correlation radiometer.
 - **Separate track:** audio forensics → the Digital Forensics Workshop, NOT
   atkdsp, and NOT SAM. (Intercept cleanup reuses the Diffusion Toolkit's
   existing `test_classical_denoise` / `test_diffusion_denoiser` /
@@ -254,6 +257,139 @@ cheap signal-level filters; the learned denoise is a toolkit call.
 
 ---
 
+# PART C — radio-astronomy search kernels (plan, then build; added 2026-10-28)
+
+Bill, 2026-10-28, on fishing radio astronomy for ways to find weak,
+hard-to-see signals: *"I think the ones that you recommend, we should add.
+Even if they are only for specific scenarios, just make sure that when they
+hover over that option, that text appears explaining when and how it should
+be used."*
+
+Radio astronomy and SETI have spent decades pulling signals out from under
+the noise. What transfers to ATK is their **search over unknown parameters**
+(drift, period, width) and their **noise statistics**; imaging does not (it
+assumes a sky that holds still for hours and many antennas). These kernels
+are the hot loops; how the detector, Sift, DF and passive radar use them —
+and the **hover text** each operator option carries — is in
+`ATK_Diffusion_Toolkit/DETECTION_DESIGN.md` §4.6, `atkdf/docs/ATKDF_PLAN.md`
+§13 and `atkpr/docs/ATKPR_PLAN.md` §6A.18. Same discipline as Part B:
+twin first, C where the loop demands it, every threshold derived or measured
+(never tuned), every search with a negative control in its test, and a real
+or realistically degraded acceptance before anything goes live.
+
+### C1 — `atkdsp_sk` spectral kurtosis
+- **What:** per FFT bin, accumulate S1 = Σ P and S2 = Σ P² over M frames;
+  the generalized estimator (Nita & Gary 2010, N = 1, d = 1)
+  SK = (M+1)/(M−1) · (M·S2/S1² − 1). Gaussian noise → 1; impulsive or
+  intermittent energy → above 1; constant envelope → below 1 (a pure tone
+  → 0). Thresholds for a two-sided flag come from the estimator's own
+  distribution at the configured false-flag rate, not by hand.
+- **Out:** per-bin SK and a flag mask; streaming — the accumulators carry
+  across block edges.
+- **Feeds:** the toolkit's noise floor (`dsp/floor.py`: flagged bins are
+  left out of the estimate), an `SK↑` flag on boxes, and excision of
+  impulsive cells before long integrations (Sift dwells, the escalation
+  buffer, atkdf's covariance, atkpr's CPI).
+- **Blind spot, said in the docstring:** OFDM, LTE and anything noise-like
+  look Gaussian to it.
+- **Accept:** on terminated captures the flag rate matches the configured
+  rate; a planted low-duty pulse train is flagged where the time-averaged
+  power shows nothing; a tone reads below 1; a real capture with a known
+  impulsive source (a switching supply, ignition noise) is flagged.
+- First of Part C: the cheapest, and three consumers wait on it.
+
+### C2 — `atkdsp_drift_tree` drift-rate search (SETI's Taylor de-Doppler tree)
+- **What:** given N_t floor-normalised power spectra, sum power along every
+  straight track drifting up to one bin per frame (0 … N_t bins across the
+  block; negative drifts by mirroring), for every start bin, in
+  N_f·N_t·log2(N_t) operations instead of N_f·N_t²; faster drifts by
+  shifting or scrunching the block. A carrier that drifts keeps its full
+  integration gain instead of smearing across bins. The same tree runs
+  across Sift's per-segment statistics, summing along drifting α tracks
+  instead of one α bin.
+- **Out:** per (start bin, drift rate) summed power; threshold from the
+  Gamma(N_t) distribution of summed exponential cells at Pfa / trials.
+- **Feeds:** Sift (the drift loss its review measured — 13.9 → 4.8 for a
+  carrier drifting 4 Hz over 4 s, `DETECTION_DESIGN.md` §4.4), the Bug
+  Sniffer (cheap oscillators warming up), drift rate as a fingerprint
+  feature (B8); a large drift rate is a linear sweep, so sweep jammers and
+  LFM chirps fall out of the same search.
+- **Accept:** Sift's own drift case, with the margin recovered measured
+  against the 13.9 / 4.8 pair and reported (not claimed); noise-only
+  false-hit rate matches the configured rate; a linear sweep found at its
+  rate.
+
+### C3 — `atkdsp_periodic` periodic search (pulsar methods)
+- **What, four tools on the floor-normalised power or envelope series:**
+  harmonic summing on its FFT (1, 2, 4, 8, 16 harmonics) for narrow
+  repeating pulses; epoch folding at a candidate period with a χ²
+  significance against a flat profile; the fast folding algorithm (FFA)
+  for long periods (~0.5 s and up) where harmonic summing is weak; a small
+  acceleration (period-derivative) grid for a moving emitter.
+- **The trap from the bench, inherited:** the tallest peak is a harmonic as
+  often as the fundamental — score the comb, report the fundamental.
+- **Overlap check before building:** ATK's `siga` pulse/PRI code and A3.3
+  `pulse_runs` need each pulse visible; this works *below* single-pulse
+  detection. Read `pulse.py` first for anything that already folds (not
+  checked 2026-10-28).
+- **Feeds:** beacons, radar PRIs, TDMA frames, switching supplies,
+  telemetry framing — Sift, the Cuts viewer, Drone Discovery.
+- **Accept:** a planted low-duty pulse train found at a per-pulse SNR where
+  no single pulse is detectable; a noise-only negative control at the
+  configured rate; a long-period beacon found by the FFA where harmonic
+  summing misses it.
+
+### C4 — `atkdsp_boxcar_ladder` single-pulse search (fast-radio-burst method)
+- **What:** boxcar filters at widths 1, 2, 4 … 2^k frames on each channel's
+  floor-normalised power; S/N normalised per width; best width wins;
+  detections deduplicated across widths; threshold from Pfa / trials. A
+  burst of any length lands within ~1.5 dB of a matched filter, where a
+  fixed tile dilutes a short burst and splits a long one.
+- **Feeds:** a proposer beside CFAR (A2.1); boxes carry the width.
+- **Accept:** equal-energy bursts of 1 ms, 10 ms, 100 ms and 1 s all found
+  within the ladder's predicted loss; noise-only rate matches.
+
+### C5 — `atkdsp_sumthreshold` faint-streak search (AOFlagger's SumThreshold, turned around)
+- **What:** flag runs of M = 1, 2, 4, 8 … consecutive cells along time or
+  frequency whose mean exceeds χ_M = χ_1 / ρ^(log2 M), iterating with
+  already-flagged cells clamped (Offringa et al. 2010). Astronomers use the
+  flags to delete faint streaks; here the streaks are the find — long weak
+  carriers and short broadband clicks that cell-by-cell CFAR misses.
+- **Thresholds measured, not borrowed:** the published χ_1 and ρ are
+  empirical; ours are set on terminated and quiet-band captures to the
+  profile's false-alarm rate, with the measurement in the docstring.
+- **Feeds:** a proposer beside CFAR; the floor mask; the Bug Sniffer.
+- **Accept:** a continuous carrier below CFAR's per-cell threshold found;
+  noise-only rate matches; compared with CFAR on the same capture.
+
+### C6 — `atkdsp_xcorr_radiometer` correlation radiometer (radio interferometry)
+- **What:** per bin, accumulate the cross-spectra X_i·X_j* over every pair
+  of coherent channels (ten pairs on the Kraken) over long integrations.
+  Each channel's own receiver noise does not correlate and averages toward
+  zero as 1/√(B·T); only energy reaching both antennas survives. That
+  sidesteps the noise-level uncertainty (Tandra–Sahai) that caps every
+  single-receiver energy detector.
+- **Out:** per-bin correlated power and its significance (from the
+  measured spread of the pair products), and the pair phases (a rough
+  bearing for atkdf).
+- **What still correlates, said in the result:** noise that reaches every
+  antenna (city noise, nearby electronics), and the Kraken's shared-clock
+  spurs and board crosstalk — mapped first with terminated inputs, the way
+  Sift maps the radio's own features, and masked.
+- **Investigate, not planned:** the Kraken's calibration noise source as a
+  Dicke-style reference for a gain-drift-free total-power mode — check on
+  the hardware whether its switch isolates the antennas.
+- **Needs:** coherent multi-channel frames from atkdaq.
+- **Accept:** a band-limited Gaussian emitter far below the single-channel
+  floor detected at the integration time the radiometer equation predicts;
+  terminated inputs read zero after the spur mask; compared with
+  single-channel total power at the same integration time.
+
+**Build order inside Part C:** C1 → C2 → C4 → C5 → C3 → C6 (C6 waits on the
+Kraken's coherent frames).
+
+---
+
 # Separate track — audio forensics (NOT atkdsp, NOT SAM)
 
 Lands in **Digital Forensics Workshop** (`forensics_workshop`), which already
@@ -275,6 +411,7 @@ A3 (cp_probe, cyclic_line, pulse)   v0.16 / ABI17   ── small, high-value cap
 A4 (viterbi, rs, bch + workbench)   v0.17 / ABI18   ── Bill's priority; may sub-split
 ────────────────────────────────────────────────────
 B1..B9                              v0.18+          ── twin-first each, as scheduled
+C1..C6                              v0.19+          ── twin-first each; C1 SK first, C6 waits on the Kraken
 ITM propagation (roadmap 4)         own target/ABI  ── C++ or C99, vendor NTIA, see §9.5
 ```
 

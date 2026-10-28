@@ -20,6 +20,8 @@ set(ATKDSP_SOURCES
   src/fft.c src/demod.c src/display.c src/detect.c src/design.c src/ddc.c
   src/lte.c src/lte_pbch.c src/lte_prach.c src/lte_turbo.c src/lte_sib1.c
   src/lte_sib1_phy.c src/lte_si.c src/fsk.c src/dmr_sync.c
+  src/stat.c src/bits.c src/scramble.c src/fec_conv.c src/fec_rs.c src/fec_blk.c
+  src/crc.c src/crc_recover.c
   vendor/pocketfft/pocketfft.c)
 
 add_library(atkdsp SHARED ${ATKDSP_SOURCES})

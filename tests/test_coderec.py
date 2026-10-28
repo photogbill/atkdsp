@@ -121,8 +121,7 @@ def assert_evidence(r, p, pfa=1e-3):
 # the library
 # ============================================================================
 def test_version_and_symbols():
-    assert atkdsp.ABI_VERSION == 16
-    assert atkdsp.version() == "0.15.0"
+    assert atkdsp.ABI_VERSION >= 16            # §18 arrived in 16 (v0.15.0)
     lib = atkdsp.load()
     for name in ("atkdsp_gf2_rank_scan", "atkdsp_block_code_id", "atkdsp_conv_code_id",
                  "atkdsp_rs_code_id", "atkdsp_interleaver_id"):

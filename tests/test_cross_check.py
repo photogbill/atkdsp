@@ -51,7 +51,7 @@ def lowpass(cutoff, fs, ntaps):
 # ---- identity ---------------------------------------------------------------
 def test_abi_and_version():
     assert atkdsp.load().atkdsp_abi_version() == atkdsp.ABI_VERSION
-    assert atkdsp.version() == "0.15.0"
+    assert atkdsp.version() == "0.16.0"
     assert "abi" in atkdsp.build_info()
 
 
@@ -75,7 +75,8 @@ def test_every_bound_symbol_exists_in_this_library():
                  "atkdsp_fir_process", "atkdsp_ddc_process",
                  "atkdsp_spectrum_reduce", "atkdsp_design_lowpass",
                  "atkdsp_dmr_sync_create", "atkdsp_dmr_sync_process",
-                 "atkdsp_dmr_sync_flush"):
+                 "atkdsp_dmr_sync_flush", "atkdsp_cfar_create", "atkdsp_cfar_process",
+                 "atkdsp_burst_measure", "atkdsp_ring_init", "atkdsp_ring_read"):
         assert getattr(lib, name, None) is not None, f"{name} is not in the library"
 
 

@@ -37,15 +37,21 @@ matters, because the display reduction uses every core it is given.
 include/atkdsp.h        THE ABI. Read its header comment first.
 src/                    C99 kernels, one file per group (convert, nco, fir,
                         resample, fft, demod, display, detect, ddc, lte*,
-                        fsk, dmr_sync)
+                        fsk, dmr_sync, the bitstream files, cfar, burst,
+                        ring)
 vendor/pocketfft/       Martin Reinecke's pocketfft (C, BSD-3) — the only
-                        third-party code, used through src/fft.c only
+                        third-party code, used through src/fft.c and, for
+                        the burst word's spectra, src/burst.c
 python/atkdsp/          __init__.py  the ctypes binding
                         reference.py the numpy twins (the specification)
 tests/test_smoke.c      C-only proof the DLL is sane (no Python needed)
 tests/test_cross_check.py  every kernel vs its twin, in uneven blocks
+tests/test_detection.py    CFAR, the burst word, the ring (v0.16.0)
+tests/test_ring_stress.c   the ring under threads; ring_bench.bat runs it
+                        as Bill's 40 MSPS bench
 bench/                  the measurement above
-bin/                    build output: atkdsp.dll / atkdsp.so, atkdsp_smoke
+bin/                    build output: atkdsp.dll / atkdsp.so, atkdsp_smoke,
+                        atkdsp_ring_stress
 build.bat, build.sh, CMakeLists.txt
 ```
 
@@ -82,7 +88,96 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.15.0 (ABI 16)
+## What is in v0.16.0 (ABI 17)
+
+**The detection track** — phase 2 of `docs/ATKDSP_PLAN.md` (§B1, §B2, §A3):
+the detector cued DF, Bug Sniffer and Drone Discovery wait on, the record it
+hands them, and the ring the DVR cuts from. Header §19–21, twins in
+`reference.py` §19–21 (the same sums in the same order, so C == twin hit for
+hit), 88 tests in `tests/test_detection.py`, smoke lines for all three, and
+`tests/test_ring_stress.c` (threads; also Bill's bench, `ring_bench.bat`).
+`ATKDSP_E_OVERRUN` (−6) and `ATKDSP_E_EMPTY` (−7) are new. Also in this
+release: **CRC-64/NVME** joins the CRC catalogue (it reached the reveng
+catalogue after the table was typed; its check value is asserted like the
+rest — 112 of reveng's 113; CRC-82/DARC is wider than the 64-bit engine).
+
+| | what | how |
+|---|---|---|
+| **CFAR** | `atkdsp_cfar_*` | a 1-D CFAR across frequency on each spectrum frame: CA (default), OS (crowded bands), GO / SO (clutter edges); `n_ref` reference cells each side beyond `n_guard` guards (siga's `train` / `guard`); an optional k-frame average; a **mask** (known emitters, operator mutes) that is never tested and never used as reference; at a band edge or past a mask the window **borrows** from the far side so N, and the false-alarm rate, hold there too. **The threshold is solved**, not looked up: Pfa(α) = ∫ Q(K, Kαt) f_T(t) dt for K-look gamma cells (K = looks × k_frames), Simpson in ln t over the range outside which each tail holds < 1e-9·Pfa, Illinois regula falsi in ln α — one solver for all four statistics; `atkdsp_cfar_alpha` exposes it and `describe()` prints α |
+| **the tracker** | same handle | hit bins within `merge_gap` form one blob; a blob joins the track whose span it overlaps most; OPEN after m hits in n frames, CLOSE after k misses, UPDATE when the span grows; one event per track per frame (so `events_max` = frames × max_tracks, and a short buffer is refused before anything is consumed); t0 / t1 inside the k-frame average from a single-frame band test (or flagged COARSE); fc as the excess-weighted centroid; level, noise (T / E[T], unbiased), SNR, band SNR; flags EDGE, MASK_ADJ, FLUSHED |
+| **burst descriptor word** | `atkdsp_burst_measure` | the comms PDW from channelised I/Q and a coarse [i0, i1): edges by a least-squares step around the burst's core — at the half-power level for a constant envelope, at the likelihood boundary for a Gaussian-like one (flag GAUSSIAN: such a signal fades through half power on its own); 99 % OBW from the noise-subtracted Welch spectrum with the residual left **signed** (clipped residuals add up to more than the 0.5 % tails at 10 dB); −26 dB width (or NaN below the floor); centroid fc; drift from segment centroids; rise / fall 10–90 %; peak / mean / noise dBFS; SNR; flags for whatever could not be measured |
+| **the ring** | `atkdsp_ring_*` | in CALLER memory — private, or a named shared mapping another process attaches to; one producer that never waits, up to 16 consumers with their own cursors; a seqlock per block (2 seq + 1 writing, 2 seq + 2 committed), so a torn block is never returned — it is counted and reported lost, exact to the block; claim / commit zero-copy for the producer, read or peek / release for consumers, `copy_range` for the DVR; per-block meta with RETUNE / OVERFLOW / CAL flags; atomics through a shim (gcc/clang `__atomic`, MSVC Interlocked + barriers) — C99, no threads started |
+
+Measured (Linux, gcc; `tests/test_detection.py`):
+
+| check | result |
+|---|---|
+| α against the K = 1 closed forms (CA, OS, GO, SO) at Pfa 1e-2 … 1e-12 | within 1e-9; CA with K = 2, 4, 8 looks against the incomplete beta within 1e-9 |
+| false-alarm rate on noise, CA / OS / GO / SO at **1e-2, 1e-3, 1e-4** | inside the exact binomial 99 % interval, counted at cells far enough apart to be independent; also with 4- and 2.5-look input, with the 4-frame average, and at the band edges (borrowed windows) |
+| planted bursts in 50 ms of a 20 MSPS capture, 1024 bins (a 2 ms carrier, a 5 ms FSK burst, a 10 ms 200 kHz noise-like burst, a 1 ms carrier) and a masked repeater | **one detection each**, fc within a bin (19.5 kHz), t0 within a frame (51.2 µs), t1 within two; the repeater none; nothing else — on the twin and on C |
+| OS beside a strong neighbour | a 16 dB signal 10 bins from a 40 dB one: CA misses it, OS finds it |
+| burst edges, keyed constant envelope (carrier, FSK) at 100 kS/s | **within 2 samples at 10 dB**, 0 at 20–30 dB (§B2's acceptance) |
+| burst edges, Gaussian-like 10 kHz burst | within 30 / 12 / 4 samples at 10 / 20 / 30 dB — its own fades set that |
+| 99 % OBW of a 10 kHz flat burst | within a bin at 10–30 dB |
+| drift of a carrier (50 kHz/s) | within 5 % at 10–30 dB (FSK: ~10 %, the symbol mix moves each segment's centroid) |
+| rise time of a 400-sample raised-cosine ramp at 30 dB | within 10 %; a ramp shorter than 2× the smoothing is flagged unresolved |
+| ring, C stress (producer + fast / 3×-work / stalled consumers) | no torn block returned in 3 million blocks at full speed (≈ 6 GB/s, 250 k torn reads caught and counted); read + lost = committed for every consumer, exactly; at 160 MB/s (40 MSPS ci16) the fast and slow consumers lose nothing |
+| ring across processes | a second Python process attaches to a named mapping and reads the same seqs, bytes and headers |
+| sanitizers | the smoke test, the stress program and the whole Python suite (847 tests, after the review's fixes) clean under ASan + UBSan |
+
+**Checked twice.** An independent review of the first build found eleven
+defects, each fixed and held by a test (the last section of
+`tests/test_detection.py`, and ATK's `test_cue_detector.py` /
+`test_iq_ring_native.py`):
+
+- `burst_measure` wrote past its FFT buffer on a burst over ~1.57 M
+  samples and silently truncated its drift segments past 524 288; the
+  segments are now at most 32768 samples, spread over the burst (twin too).
+- The ring binding's `claim()` / `peek()` views pointed at memory that
+  `close()` or the garbage collector could free (a segfault); the views now
+  hold the buffer or mapping.
+- A NaN reference cell: GO / SO dropped it when it was the left side and
+  OS's quickselect had no order for it, so C and twin disagreed; any NaN
+  now makes the statistic NaN in every mode.
+- The incomplete gamma stopped at 1000 iterations, wrong past a shape of
+  ~5e4 (α for K = 1e4 looks off by up to a third); the bound now grows with
+  √a, and `looks` is capped at 1e4.
+- `atkdsp_ring_attach` accepted a header whose sizes were zero and then read
+  past the mapping; every size is checked first.
+- The MSVC atomics: `_ARM_BARRIER_ISH` for 32-bit ARM, single-access 64-bit
+  loads and stores on 32-bit x86, a fence in the ARM64 32-bit load; and
+  `burst.c`'s indices are `ptrdiff_t` (Windows `long` is 32 bits). Built here
+  with clang for the x64, x86, ARM64 and ARM MSVC targets.
+- `burst_measure` with less noise than its L/8 guard set N to 0 and called a
+  whole burst truncated; it now falls back to whatever lies outside, and
+  truncated means the edge step is at the buffer's end.
+- ATK side: TDMA folding of CFAR times found the frame grid itself as a
+  "period" (it now takes the grid's resolution and folds no finer than
+  twice it); the native DVR ring held a fourteenth of its budget with small
+  pushes (it now packs them) and copied cuts under the producer's lock (a
+  3 s stall; now outside it); `measure()` overwrote a t0 the I/Q did not
+  hold.
+
+What held up, as the reviewer checked it: the α closed forms over the whole
+range, C == twin on 1500 random CFAR streams and 3000 fuzzed burst inputs,
+no torn block and exact lost counts in its own peek / release and
+copy_range stress, no leaks over 900 create / destroy cycles.
+
+Cost: CA / GO / SO 0.10–0.13 ms per 4096-bin frame, **OS 2.2 ms** (a
+quickselect per bin — fine for display frames at tens per second, the use
+the plan names; a sliding order statistic would be the fix if OS is wanted
+on every FFT frame at 40 MSPS); creating a CFAR solves α in milliseconds;
+`burst_measure` 0.85 ms for a 20 000-sample buffer (twin 15 ms).
+
+**Not yet:** Bill's 40 MSPS ten-minute ring bench on his PC
+(`ring_bench.bat`, after `build.bat`); a real bladeRF capture for the CFAR
+acceptance (the synthetic one stands in); the modulation hint in the burst
+word (§B4's probes); the toolkit's `dsp/cfar.py` cross-check (that folder is
+not connected — `siga.detect.cfar` is checked on the ATK side); the MSVC
+build of the ring's atomics is written and reviewed but compiled here only
+by gcc.
+
+## What was in v0.15.0 (ABI 16)
 
 **Naming the code** — phase 1b of `docs/ATKDSP_PLAN.md` §D4: given only the
 bits, say which code made them. Header §18, twins in `reference.py` §18 (the
@@ -465,6 +560,15 @@ is absent or the ABI is wrong, ATK runs on the numpy twins and says so on the
 Setup page; it never silently computes something different. The twins live
 here, in `python/atkdsp/reference.py`, so ATK's fallback and this repo's
 specification are one file.
+
+Since v0.16.0 the detection track has three ATK callers: `atk/core/cue_detector.py`
+(the CFAR and burst tracker over a receiver's spectrum frames, the records
+cued DF waits on, and `measure()` with the burst descriptor word),
+`atk/core/tdma.py` (frame timing folded from those records' start times —
+Python, as the plan says), and `atk/core/iq_cut.py`, whose DVR ring can sit
+on the C ring (`settings["sdr"]["dvr_native"]`, off until `ring_bench.bat`
+has passed on the PC). Bug Sniffer's engine is lent the CFAR through ATK's
+hooks (`energy_cfar`).
 
 ## Roadmap (ABI 3 and later)
 

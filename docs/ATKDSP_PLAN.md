@@ -13,6 +13,39 @@ is in v0.15.0"). Linux: smoke test and the whole suite pass (361 cross-check +
 Windows build has not been run yet. Everything else below is still plan; next
 in §G is 1c (the bench in ATK, §D6).
 
+**1c is BUILT (2026-10-28)** — in ATK, not here: the Bit Bench workspace
+(`ATK\atk\core\bitbench\`, `ATK\atk\ui\bitbench_view.py`), specified by
+`ATK\docs\BIT_BENCH_PLAN.md` (which replaces §D6) and recorded in its §10. No
+atkdsp source changed for it; ATK now expects ABI 16 (v0.15.0). Its
+acceptance — the Scoped B harness, raw bits to payload by buttons alone —
+passes on the native library and on the numpy twins. One weakness it found
+here, not fixed: **a structured payload inside a block code** (text under
+Hamming(7,4) behind an interleaver) gives `block_code_id` / `interleaver_id`
+extra single-position checks — the payload's fixed bits — and they then
+refuse the stream as "sliding" or "fails unlike noise" on short captures
+(often at 28 kbit; 1 seed in 20 at 42 kbit). The proposed fix is in §D4:
+take weight-1 checks out of the null space (report them as fixed bits)
+before the sliding and noise-likeness tests.
+
+**Phase 2 is BUILT (2026-10-28)** — atkdsp v0.16.0 / ABI 17 (§B1 CFAR and
+the burst tracker, §B2's burst descriptor word, §A3 the ring; README "What is
+in v0.16.0"). Linux: smoke test, the ring stress program and the whole suite
+(848 tests) pass, also under ASan + UBSan; an independent review's eleven
+defects are fixed and held by tests (README, "Checked twice"). Choices made in
+the build that differ from the text below: `atkdsp_cfar_create` takes a
+config struct (thirteen parameters, not nine — `looks`, the OS rank,
+merge gap, min width and the track cap had to be somewhere);
+`atkdsp_burst_measure` takes an `nfft` (0 = automatic) and its `thresh_db` 0
+picks the edge rule by envelope (half power for a constant envelope, the
+likelihood boundary for a Gaussian-like one — measured, see the header);
+the ring adds `close`, `peek` / `release` and `describe`, rejects an empty
+block (so `read` returning 0 always means "nothing new"), and its counters
+struct is `atkdsp_ring_counters` (the name `atkdsp_ring_stats` is the
+function). The TDMA timing analyzer is ATK-side Python, as the plan says
+(`ATK\atk\core\tdma.py`). Still open: Bill's 40 MSPS ten-minute ring bench
+(`ring_bench.bat`), a real bladeRF capture for the CFAR acceptance, and the
+toolkit's `dsp/cfar.py` cross-check (that folder is not connected).
+
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
 
@@ -1438,8 +1471,8 @@ checked first).
 |---|---|---|---|
 | **1a** ✅ v0.14.0 | **Bitstream engine:** D1 primitives, D2 scrambling + Berlekamp–Massey, D3 Viterbi / RS / BCH / small codes / CRC engine, D5 CRC recovery (+ the SIB1 housekeeping) | L | Bill's top priority. Pure mathematics, fully verifiable against known answers with no hardware, and it touches nothing the other instances are editing in the RF path |
 | **1b** ✅ v0.15.0 | **Name the code:** D4 — rank scan, block / convolutional / RS / interleaver recognition, the robust (noisy-stream) variant | M–L | Needs 1a's encoders and decoders for its decode → re-encode evidence |
-| **1c** | **Bitstream bench in ATK:** D6 — dossier, raster colours, chain, the new siga modules | L | The engine is only useful to an analyst once the bench drives it |
-| 2 | **Detection track:** B1 CFAR, B2 burst descriptors + TDMA, A3 C ring | M–L | Cued DF, Bug Sniffer and Drone Discovery all wait on it |
+| **1c** | **Bitstream bench in ATK:** D6 — dossier, raster colours, chain, the new siga modules **(BUILT 2026-10-28 as ATK's Bit Bench — see its plan's §10)** | L | The engine is only useful to an analyst once the bench drives it |
+| 2 | **Detection track:** B1 CFAR, B2 burst descriptors + TDMA, A3 C ring **(BUILT 2026-10-28 — v0.16.0 / ABI 17)** | M–L | Cued DF, Bug Sniffer and Drone Discovery all wait on it |
 | 3 | **Small, high value:** C3 analog IDs, B4 cyclic probes, B3 pulse runs | M | ID-tagged analog bearings, waterfall captions, live PDWs |
 | 4 | **Engine:** A1 float32 FFT, A2 fused mixer, A4 channelizer | L | Before the wider SDRs (B210, Signal Hound); the channelizer feeds C3 on many channels at once |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |

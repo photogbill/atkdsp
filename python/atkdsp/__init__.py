@@ -48,7 +48,9 @@ __all__ = [
 #: 14 adds the DMR / P25 sync correlator, DmrSync (§13).
 #: 15 adds the bitstream engine (§14-17): bit primitives, scramblers, FEC, CRC.
 #: 16 adds naming the code (§18): rank scan, block / conv / RS / interleaver id.
-ABI_VERSION = 16
+#: 17 adds the detection track (§19-21): CFAR + burst tracker, the burst
+#:    descriptor word, the ring buffer; ATKDSP_E_OVERRUN and ATKDSP_E_EMPTY.
+ABI_VERSION = 17
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -2287,3 +2289,553 @@ def interleaver_id(b, n_lo: int = 8, n_hi: int = 512, pfa: float = 1e-3, seed: i
 
 
 __all__ += ["gf2_rank_scan", "block_code_id", "conv_code_id", "rs_code_id", "interleaver_id"]
+
+
+# ============================================================================
+# THE DETECTION TRACK (v0.16.0, ABI 17): §19 CFAR + burst tracker, §20 the
+# burst descriptor word, §21 the ring. Logging as the bitstream kernels:
+# describe() at INFO when made, counters at DEBUG every 1000 calls, every
+# error code at WARNING with the call's arguments.
+# ============================================================================
+_det_log = _logging.getLogger("atkdsp.detect")
+E_OVERRUN = -6
+E_EMPTY = -7
+_ERRORS[-6] = "overrun (the ring lapped this reader)"
+_ERRORS[-7] = "nothing there"
+
+CFAR_CA, CFAR_OS, CFAR_GO, CFAR_SO = 0, 1, 2, 3
+CFAR_OPEN, CFAR_UPDATE, CFAR_CLOSE = 1, 2, 3
+CFAR_T0_COARSE, CFAR_T1_COARSE, CFAR_EDGE, CFAR_MASK_ADJ, CFAR_FLUSHED = 1, 2, 4, 8, 16
+CFAR_MODES = {"ca": 0, "os": 1, "go": 2, "so": 3}
+cfar_defaults = _ref.cfar_defaults
+
+
+def _dchk(rc, what, **args):
+    if rc < 0:
+        _det_log.warning("%s returned %d (%s); args %s", what, rc,
+                         _ERRORS.get(rc, "error"), args)
+    return _check(rc, what)
+
+
+class _CfarConfig(C.Structure):
+    _fields_ = [("mode", C.c_int32), ("n_ref", C.c_int32), ("n_guard", C.c_int32),
+                ("k_frames", C.c_int32), ("pfa", C.c_double), ("looks", C.c_double),
+                ("os_k", C.c_int32), ("open_m", C.c_int32), ("open_n", C.c_int32),
+                ("close_k", C.c_int32), ("merge_gap", C.c_int32), ("min_bins", C.c_int32),
+                ("max_tracks", C.c_int32), ("reserved", C.c_int32 * 3)]
+
+
+class _CfarEvent(C.Structure):
+    _fields_ = [("t0", C.c_double), ("t1", C.c_double), ("fc_bin", C.c_double),
+                ("type", C.c_int32), ("id", C.c_uint32), ("flags", C.c_uint32),
+                ("lo_bin", C.c_int32), ("hi_bin", C.c_int32), ("n_hits", C.c_int32),
+                ("level_db", C.c_float), ("noise_db", C.c_float), ("snr_db", C.c_float),
+                ("band_snr_db", C.c_float)]
+
+
+class _CfarCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in
+                ("frames", "warmup", "cells_tested", "cell_hits", "untestable",
+                 "opened", "closed", "updates", "dropped", "resets", "tracks")]
+
+
+def _bind_cfar(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
+    lib.atkdsp_cfar_defaults.argtypes = [P(_CfarConfig)]
+    lib.atkdsp_cfar_defaults.restype = None
+    lib.atkdsp_cfar_alpha.argtypes = [i, i, d, d, i, P(d), P(d)]
+    lib.atkdsp_cfar_alpha.restype = i
+    lib.atkdsp_cfar_create.argtypes = [sz, P(_CfarConfig)]
+    lib.atkdsp_cfar_create.restype = vp
+    lib.atkdsp_cfar_destroy.argtypes = [vp]
+    lib.atkdsp_cfar_destroy.restype = None
+    lib.atkdsp_cfar_reset.argtypes = [vp]
+    lib.atkdsp_cfar_reset.restype = None
+    lib.atkdsp_cfar_set_mask.argtypes = [vp, P(C.c_uint8)]
+    lib.atkdsp_cfar_set_mask.restype = i
+    lib.atkdsp_cfar_events_max.argtypes = [vp, sz]
+    lib.atkdsp_cfar_events_max.restype = sz
+    lib.atkdsp_cfar_process.argtypes = [vp, P(C.c_float), sz, d, d, P(_CfarEvent), sz]
+    lib.atkdsp_cfar_process.restype = C.c_ssize_t
+    lib.atkdsp_cfar_flush.argtypes = [vp, P(_CfarEvent), sz]
+    lib.atkdsp_cfar_flush.restype = C.c_ssize_t
+    lib.atkdsp_cfar_last.argtypes = [vp, P(C.c_float), P(C.c_float), P(C.c_uint8)]
+    lib.atkdsp_cfar_last.restype = i
+    lib.atkdsp_cfar_info.argtypes = [vp, P(d), P(d), P(d), P(_CfarConfig)]
+    lib.atkdsp_cfar_info.restype = i
+    lib.atkdsp_cfar_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_cfar_describe.restype = i
+    lib.atkdsp_cfar_stats.argtypes = [vp, P(_CfarCounters)]
+    lib.atkdsp_cfar_stats.restype = i
+
+
+_BIND_EXTRA.append(_bind_cfar)
+
+
+def cfar_alpha(mode, n_ref: int, pfa: float, looks: float = 1.0, os_k: int = 0) -> tuple:
+    """(alpha, E[T]) — the CFAR threshold multiplier solved for `pfa` per cell
+    (atkdsp.h §19); the twin is reference.cfar_alpha."""
+    mode = CFAR_MODES.get(mode, mode) if isinstance(mode, str) else int(mode)
+    a, et = C.c_double(), C.c_double()
+    _dchk(load().atkdsp_cfar_alpha(int(mode), int(n_ref), float(pfa), float(looks), int(os_k),
+                                    C.byref(a), C.byref(et)),
+          "cfar_alpha", mode=mode, n_ref=n_ref, pfa=pfa, looks=looks, os_k=os_k)
+    return a.value, et.value
+
+
+def _cfar_event_dict(e) -> dict:
+    return {"type": int(e.type), "id": int(e.id), "flags": int(e.flags), "lo": int(e.lo_bin),
+            "hi": int(e.hi_bin), "n_hits": int(e.n_hits), "t0": float(e.t0),
+            "t1": float(e.t1), "fc_bin": float(e.fc_bin), "level_db": float(e.level_db),
+            "noise_db": float(e.noise_db), "snr_db": float(e.snr_db),
+            "band_snr_db": float(e.band_snr_db)}
+
+
+class Cfar:
+    """CFAR across frequency + the burst tracker (atkdsp.h §19). Options are
+    the atkdsp_cfar_config fields as keywords (mode may be 'ca'/'os'/'go'/
+    'so'). process() returns OPEN / UPDATE / CLOSE events as dicts with the
+    twin's keys (reference.Cfar). The twin is the fallback ATK uses when the
+    library is absent."""
+
+    _kind = "cfar"
+
+    def __init__(self, nbins: int, **cfg):
+        self._lib = load()
+        c = _ref.cfar_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise AtkDspError(f"unknown CFAR option {key!r}; known: {sorted(c)}")
+            c[key] = CFAR_MODES.get(v, v) if key == "mode" and isinstance(v, str) else v
+        for key in c:
+            c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
+        why = _ref._cfar_check(int(nbins), c)
+        if why:
+            raise AtkDspError(f"cfar_create({nbins} bins, {c}) refused — {why}")
+        self.nbins = int(nbins)
+        k = _CfarConfig()
+        for key, v in c.items():
+            setattr(k, key, v)
+        self._h = self._lib.atkdsp_cfar_create(self.nbins, C.byref(k))
+        if not self._h:
+            raise AtkDspError(f"cfar_create({nbins} bins, {c}) refused — the threshold "
+                              "could not be solved for that Pfa (use more reference cells)")
+        self._buf = None
+        self._ncalls = 0
+        a, ac, et, rc = C.c_double(), C.c_double(), C.c_double(), _CfarConfig()
+        self._lib.atkdsp_cfar_info(self._h, C.byref(a), C.byref(ac), C.byref(et), C.byref(rc))
+        self.alpha, self.alpha_ca, self.et = a.value, ac.value, et.value
+        self.cfg = {n: getattr(rc, n) for n, _t in _CfarConfig._fields_ if n != "reserved"}
+        _det_log.info("cfar created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_cfar_destroy(h)
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(1024)
+        self._lib.atkdsp_cfar_describe(self._h, buf, 1024)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CfarCounters()
+        self._lib.atkdsp_cfar_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+    def reset(self) -> None:
+        self._lib.atkdsp_cfar_reset(self._h)
+
+    def set_mask(self, mask) -> None:
+        if mask is None:
+            self._lib.atkdsp_cfar_set_mask(self._h, None)
+            return
+        m = np.ascontiguousarray(np.asarray(mask).ravel() != 0, dtype=np.uint8)
+        if m.size != self.nbins:
+            raise AtkDspError(f"mask has {m.size} entries; the CFAR has {self.nbins} bins")
+        _dchk(self._lib.atkdsp_cfar_set_mask(self._h, _u8p(m)), "cfar_set_mask")
+
+    def events_max(self, nframes: int) -> int:
+        return int(self._lib.atkdsp_cfar_events_max(self._h, int(nframes)))
+
+    def process(self, frames_db, frame_t0: float, frame_dt: float) -> list:
+        f = np.ascontiguousarray(frames_db, dtype=np.float32)
+        if f.ndim == 1:
+            f = f.reshape(1, -1)
+        if f.ndim != 2 or f.shape[1] != self.nbins:
+            raise AtkDspError(f"frames must be (nframes, {self.nbins}); got {f.shape}")
+        nf = f.shape[0]
+        cap = self.events_max(nf)
+        if self._buf is None or len(self._buf) < cap:
+            self._buf = (_CfarEvent * max(cap, 1))()
+        n = _dchk(self._lib.atkdsp_cfar_process(self._h, _fp(f), nf, float(frame_t0),
+                                                float(frame_dt), self._buf, cap),
+                  "cfar_process", nframes=nf, frame_t0=frame_t0, frame_dt=frame_dt)
+        self._ncalls += 1
+        if self._ncalls % 1000 == 0:
+            _det_log.debug("cfar stats: %s", self.stats())
+        return [_cfar_event_dict(self._buf[j]) for j in range(n)]
+
+    def flush(self) -> list:
+        cap = int(self.cfg["max_tracks"])
+        buf = (_CfarEvent * cap)()
+        n = _dchk(self._lib.atkdsp_cfar_flush(self._h, buf, cap), "cfar_flush")
+        return [_cfar_event_dict(buf[j]) for j in range(n)]
+
+    def last(self):
+        """(averaged power dB, threshold dB (NaN untested), hits) of the last
+        tested frame, or None before one."""
+        a = np.empty(self.nbins, np.float32)
+        t = np.empty(self.nbins, np.float32)
+        h = np.empty(self.nbins, np.uint8)
+        rc = self._lib.atkdsp_cfar_last(self._h, _fp(a), _fp(t), _u8p(h))
+        if rc == E_EMPTY:
+            return None
+        _dchk(rc, "cfar_last")
+        return a, t, h
+
+
+__all__ += ["E_OVERRUN", "E_EMPTY", "CFAR_CA", "CFAR_OS", "CFAR_GO", "CFAR_SO", "CFAR_OPEN",
+            "CFAR_UPDATE", "CFAR_CLOSE", "CFAR_T0_COARSE", "CFAR_T1_COARSE", "CFAR_EDGE",
+            "CFAR_MASK_ADJ", "CFAR_FLUSHED", "cfar_alpha", "Cfar"]
+
+
+# ---- §20 the burst descriptor word ------------------------------------------------
+BDW_TRUNC_START, BDW_TRUNC_END, BDW_NO_NOISE, BDW_LOW_SNR = 1, 2, 4, 8
+BDW_RISE_UNRESOLVED, BDW_FALL_UNRESOLVED, BDW_BW26_FLOOR, BDW_SHORT = 16, 32, 64, 128
+BDW_GAUSSIAN = 256
+BDW_FLAG_NAMES = {1: "truncated start", 2: "truncated end", 4: "no noise outside",
+                  8: "low SNR", 16: "rise unresolved", 32: "fall unresolved",
+                  64: "-26 dB width below the noise floor", 128: "too short for drift",
+                  256: "Gaussian-like envelope"}
+
+
+class _Bdw(C.Structure):
+    _fields_ = [("t0", C.c_double), ("t1", C.c_double), ("duration_s", C.c_double),
+                ("fc_hz", C.c_double), ("drift_hz_s", C.c_double), ("obw99_hz", C.c_double),
+                ("bw26_hz", C.c_double), ("rise_s", C.c_double), ("fall_s", C.c_double),
+                ("reserved_d", C.c_double), ("peak_dbfs", C.c_float), ("mean_dbfs", C.c_float),
+                ("noise_dbfs", C.c_float), ("snr_db", C.c_float), ("mod_hint", C.c_int32),
+                ("flags", C.c_uint32), ("nfft", C.c_int32), ("window", C.c_int32)]
+
+
+def _bind_burst(lib) -> None:
+    lib.atkdsp_burst_measure.argtypes = [C.POINTER(_Cf32), C.c_size_t, C.c_double, C.c_size_t,
+                                         C.c_size_t, C.c_float, C.c_int, C.POINTER(_Bdw)]
+    lib.atkdsp_burst_measure.restype = C.c_int
+
+
+_BIND_EXTRA.append(_bind_burst)
+
+
+def burst_measure(iq, fs: float, i0: int, i1: int, thresh_db: float = 0.0,
+                  nfft: int = 0):
+    """One burst's descriptor word (atkdsp.h §20) from channelised I/Q and a
+    coarse [i0, i1): a dict with the twin's keys (reference.burst_measure),
+    or None when there is no burst there (ATKDSP_E_EMPTY)."""
+    x = _cf32(iq, "iq")
+    o = _Bdw()
+    rc = load().atkdsp_burst_measure(_cfp(x), x.size, float(fs), int(i0), int(i1),
+                                     float(thresh_db), int(nfft), C.byref(o))
+    if rc == E_EMPTY:
+        _det_log.debug("burst_measure: nothing at [%d, %d)", i0, i1)
+        return None
+    _dchk(rc, "burst_measure", n=x.size, fs=fs, i0=i0, i1=i1, thresh_db=thresh_db, nfft=nfft)
+    d = _struct_dict(o)
+    d.pop("reserved_d", None)
+    return d
+
+
+__all__ += ["BDW_TRUNC_START", "BDW_TRUNC_END", "BDW_NO_NOISE", "BDW_LOW_SNR",
+            "BDW_RISE_UNRESOLVED", "BDW_FALL_UNRESOLVED", "BDW_BW26_FLOOR", "BDW_SHORT",
+            "BDW_GAUSSIAN", "BDW_FLAG_NAMES", "burst_measure"]
+
+
+# ---- §21 the ring ------------------------------------------------------------------
+RING_MAX_CONSUMERS = 16
+RING_RETUNE, RING_OVERFLOW, RING_CAL = 1, 2, 4
+ring_bytes_twin = _ref.ring_bytes
+
+
+class _RingMeta(C.Structure):
+    _fields_ = [("seq", C.c_uint64), ("first_sample", C.c_uint64), ("t_utc_ns", C.c_int64),
+                ("fc_hz", C.c_double), ("fs_hz", C.c_double), ("gain_db", C.c_float),
+                ("format", C.c_int32), ("flags", C.c_uint32), ("nbytes", C.c_uint32)]
+
+
+class _RingCounters(C.Structure):
+    _fields_ = [("committed", C.c_uint64), ("oldest", C.c_uint64), ("block_bytes", C.c_uint64),
+                ("nblocks", C.c_uint64), ("total_bytes", C.c_uint64), ("torn", C.c_uint64),
+                ("max_consumers", C.c_uint32), ("active", C.c_uint32),
+                ("active_mask", C.c_uint32), ("reserved", C.c_uint32),
+                ("lost", C.c_uint64 * 16), ("read", C.c_uint64 * 16), ("lag", C.c_uint64 * 16)]
+
+
+def _bind_ring(lib) -> None:
+    P, vp, sz = C.POINTER, C.c_void_p, C.c_size_t
+    lib.atkdsp_ring_bytes.argtypes = [sz, sz, C.c_int]
+    lib.atkdsp_ring_bytes.restype = sz
+    lib.atkdsp_ring_init.argtypes = [vp, sz, sz, sz, C.c_int]
+    lib.atkdsp_ring_init.restype = vp
+    lib.atkdsp_ring_attach.argtypes = [vp, sz]
+    lib.atkdsp_ring_attach.restype = vp
+    lib.atkdsp_ring_claim.argtypes = [vp]
+    lib.atkdsp_ring_claim.restype = vp
+    lib.atkdsp_ring_commit.argtypes = [vp, P(_RingMeta)]
+    lib.atkdsp_ring_commit.restype = C.c_int
+    lib.atkdsp_ring_open.argtypes = [vp, C.c_int]
+    lib.atkdsp_ring_open.restype = C.c_int
+    lib.atkdsp_ring_close.argtypes = [vp, C.c_int]
+    lib.atkdsp_ring_close.restype = C.c_int
+    lib.atkdsp_ring_read.argtypes = [vp, C.c_int, vp, sz, P(_RingMeta), P(C.c_uint64)]
+    lib.atkdsp_ring_read.restype = C.c_ssize_t
+    lib.atkdsp_ring_peek.argtypes = [vp, C.c_int, P(_RingMeta), P(C.c_uint64)]
+    lib.atkdsp_ring_peek.restype = vp
+    lib.atkdsp_ring_release.argtypes = [vp, C.c_int]
+    lib.atkdsp_ring_release.restype = C.c_int
+    lib.atkdsp_ring_copy_range.argtypes = [vp, C.c_uint64, C.c_uint64, vp, sz, P(_RingMeta), sz]
+    lib.atkdsp_ring_copy_range.restype = C.c_ssize_t
+    lib.atkdsp_ring_stats.argtypes = [vp, P(_RingCounters)]
+    lib.atkdsp_ring_stats.restype = C.c_int
+    lib.atkdsp_ring_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_ring_describe.restype = C.c_int
+
+
+_BIND_EXTRA.append(_bind_ring)
+
+
+def _meta_dict(m) -> dict:
+    return {"seq": int(m.seq), "first_sample": int(m.first_sample), "t_utc_ns": int(m.t_utc_ns),
+            "fc_hz": float(m.fc_hz), "fs_hz": float(m.fs_hz), "gain_db": float(m.gain_db),
+            "format": int(m.format), "flags": int(m.flags), "nbytes": int(m.nbytes)}
+
+
+def ring_bytes(block_bytes: int, nblocks: int, max_consumers: int = 4) -> int:
+    """Bytes of memory a ring of this shape needs (atkdsp.h §21); 0 if impossible."""
+    return int(load().atkdsp_ring_bytes(int(block_bytes), int(nblocks), int(max_consumers)))
+
+
+class Ring:
+    """The atkdsp ring (atkdsp.h §21) in memory this object owns: a private
+    numpy buffer, or — with `name` — a named shared-memory mapping another
+    process can attach to with Ring.attach(name). Windows backs a named
+    mapping with the paging file and Linux with /dev/shm: RAM, never a file
+    in a user folder. The twin is reference.Ring (single process)."""
+
+    def __init__(self, block_bytes: int, nblocks: int, max_consumers: int = 4,
+                 name: str | None = None, _attach: bool = False):
+        self._lib = load()
+        self._shm = None
+        self._mbuf = None
+        self.name = name
+        if _attach:
+            self._shm = _shm_open(name)
+            size = self._shm.size
+            self._addr = C.addressof(C.c_char.from_buffer(self._shm.buf))
+            self._h = self._lib.atkdsp_ring_attach(self._addr, size)
+            if not self._h:
+                self._shm.close()
+                raise AtkDspError(f"ring_attach({name!r}): not an atkdsp ring of this "
+                                  "version (magic, version or sizes wrong)")
+        else:
+            size = self._lib.atkdsp_ring_bytes(int(block_bytes), int(nblocks), int(max_consumers))
+            if not size:
+                raise AtkDspError(f"ring_bytes({block_bytes}, {nblocks}, {max_consumers}) "
+                                  "refused — block_bytes >= 1, nblocks >= 2, consumers 1..16")
+            if name:
+                self._shm = _quiet_shm_class()(name=name, create=True, size=size)
+                self._addr = C.addressof(C.c_char.from_buffer(self._shm.buf))
+            else:
+                self._mbuf = np.zeros(size + 64, np.uint8)
+                base = self._mbuf.ctypes.data
+                self._addr = base + (-base) % 64
+            self._h = self._lib.atkdsp_ring_init(self._addr, size, int(block_bytes),
+                                                 int(nblocks), int(max_consumers))
+            if not self._h:
+                raise AtkDspError("ring_init refused the memory (alignment or size)")
+        self.size = size
+        st = self.stats()
+        self.block_bytes, self.nblocks = st["block_bytes"], st["nblocks"]
+        self.max_consumers = st["max_consumers"]
+        self._rbuf = np.empty(self.block_bytes, np.uint8)
+        self._claimed = False
+        _det_log.info("ring %s: %s", "attached" if _attach else "made", self.describe())
+
+    def _view(self, p: int, n: int) -> np.ndarray:
+        """n bytes of the ring at address p, as a numpy view that HOLDS the
+        memory it points into (the private buffer, or the shared mapping), so
+        a view kept past close() or past this object keeps the bytes alive
+        instead of pointing at freed memory."""
+        off = int(p) - int(self._addr)
+        if self._shm is not None:
+            base = self._addr - C.addressof(C.c_char.from_buffer(self._shm.buf))
+            return np.frombuffer(self._shm.buf, np.uint8, count=n, offset=base + off)
+        start = (self._addr - self._mbuf.ctypes.data) + off
+        return self._mbuf[start:start + n]
+
+    @classmethod
+    def attach(cls, name: str) -> "Ring":
+        """Another process's named ring."""
+        return cls(0, 0, 0, name=name, _attach=True)
+
+    def close(self, unlink: bool = False) -> None:
+        """Let go of the memory. The ring is unusable after this; a view handed
+        out earlier keeps its bytes (the mapping is released with the last
+        view)."""
+        self._h = None
+        if self._shm is not None:
+            shm, self._shm = self._shm, None
+            try:
+                shm.close()
+            except BufferError:      # a view still holds it; released with the view
+                pass
+            if unlink:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _need(self):
+        if not self._h:
+            raise AtkDspError("this ring has been closed")
+        return self._h
+
+    # -- producer -------------------------------------------------------------
+    def claim(self) -> np.ndarray:
+        """The next block to fill, in place (block_bytes, uint8)."""
+        p = self._lib.atkdsp_ring_claim(self._need())
+        self._claimed = True
+        return self._view(p, self.block_bytes)
+
+    def commit(self, nbytes: int, **meta) -> None:
+        m = _RingMeta()
+        for k, v in meta.items():
+            if k in ("seq", "nbytes") or not hasattr(m, k):
+                raise AtkDspError(f"unknown ring meta {k!r}")
+            setattr(m, k, v)
+        m.nbytes = int(nbytes)
+        _dchk(self._lib.atkdsp_ring_commit(self._need(), C.byref(m)), "ring_commit",
+              nbytes=nbytes, claimed=self._claimed)
+        self._claimed = False
+
+    def write(self, data, **meta) -> None:
+        """claim + copy + commit."""
+        b = np.frombuffer(memoryview(data).cast("B"), np.uint8)
+        if b.size > self.block_bytes:
+            raise AtkDspError(f"{b.size} bytes is more than one block ({self.block_bytes})")
+        blk = self.claim()
+        blk[:b.size] = b
+        self.commit(b.size, **meta)
+
+    # -- consumers ------------------------------------------------------------
+    def open(self, from_oldest: bool = False) -> int:
+        cid = self._lib.atkdsp_ring_open(self._need(), int(bool(from_oldest)))
+        if cid < 0:
+            _dchk(cid, "ring_open", from_oldest=from_oldest)
+        return cid
+
+    def close_consumer(self, cid: int) -> None:
+        self._lib.atkdsp_ring_close(self._need(), int(cid))
+
+    def read(self, cid: int):
+        """(bytes, meta, lost) of the next block, or (None, None, lost)."""
+        m, lost = _RingMeta(), C.c_uint64()
+        n = self._lib.atkdsp_ring_read(self._need(), int(cid), self._rbuf.ctypes.data,
+                                       self._rbuf.size, C.byref(m), C.byref(lost))
+        if n < 0:
+            _dchk(n, "ring_read", cid=cid)
+        if n == 0:
+            return None, None, int(lost.value)
+        return self._rbuf[:n].copy(), _meta_dict(m), int(lost.value)
+
+    def peek(self, cid: int):
+        """Zero-copy: (view, meta, lost); call release(cid) when done."""
+        m, lost = _RingMeta(), C.c_uint64()
+        p = self._lib.atkdsp_ring_peek(self._need(), int(cid), C.byref(m), C.byref(lost))
+        if not p:
+            return None, None, int(lost.value)
+        return self._view(p, int(m.nbytes)), _meta_dict(m), int(lost.value)
+
+    def release(self, cid: int) -> bool:
+        """True when the peeked block survived; False when it was overwritten
+        while held (discard whatever was computed from it)."""
+        rc = self._lib.atkdsp_ring_release(self._need(), int(cid))
+        if rc == E_OVERRUN:
+            _det_log.debug("ring_release(%d): the block was overwritten while held", cid)
+            return False
+        _dchk(rc, "ring_release", cid=cid)
+        return True
+
+    def copy_range(self, seq0: int, seq1: int):
+        """The blocks seq0 <= seq < seq1 still held: (bytes, [meta])."""
+        st = self.stats()
+        lo, hi = max(int(seq0), st["oldest"]), min(int(seq1), st["committed"])
+        nmax = max(hi - lo, 0)
+        out = np.empty(max(nmax * self.block_bytes, 1), np.uint8)
+        metas = (_RingMeta * max(nmax, 1))()
+        n = self._lib.atkdsp_ring_copy_range(self._need(), int(seq0), int(seq1),
+                                             out.ctypes.data, out.size, metas, nmax)
+        if n < 0:
+            _dchk(n, "ring_copy_range", seq0=seq0, seq1=seq1)
+        ms = [_meta_dict(metas[i]) for i in range(n)]
+        return out[:sum(m["nbytes"] for m in ms)].copy(), ms
+
+    def stats(self) -> dict:
+        s = _RingCounters()
+        self._lib.atkdsp_ring_stats(self._need(), C.byref(s))
+        k = int(s.max_consumers)
+        return {"committed": int(s.committed), "oldest": int(s.oldest),
+                "block_bytes": int(s.block_bytes), "nblocks": int(s.nblocks),
+                "total_bytes": int(s.total_bytes), "max_consumers": k,
+                "active": int(s.active), "torn": int(s.torn),
+                "lost": [int(s.lost[i]) for i in range(k)],
+                "read": [int(s.read[i]) for i in range(k)],
+                "lag": [int(s.lag[i]) for i in range(k)]}
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_ring_describe(self._need(), buf, 512)
+        return buf.value.decode()
+
+
+_QUIET_SHM = None
+
+
+def _quiet_shm_class():
+    """SharedMemory whose finaliser does not complain when a view handed out
+    by Ring still holds the mapping (the view keeps it alive on purpose; the
+    mapping goes with the last view)."""
+    global _QUIET_SHM
+    if _QUIET_SHM is None:
+        from multiprocessing import shared_memory
+
+        class _QuietSharedMemory(shared_memory.SharedMemory):
+            def __del__(self):
+                try:
+                    self.close()
+                except BufferError:
+                    pass
+        _QUIET_SHM = _QuietSharedMemory
+    return _QUIET_SHM
+
+
+def _shm_open(name):
+    """Attach to an existing named mapping without this process's resource
+    tracker unlinking it at exit (it belongs to its creator)."""
+    cls = _quiet_shm_class()
+    try:
+        return cls(name=name, create=False, track=False)
+    except TypeError:                      # Python < 3.13 has no track=
+        shm = cls(name=name, create=False)
+        if sys.platform != "win32":
+            try:
+                from multiprocessing import resource_tracker
+                resource_tracker.unregister(shm._name, "shared_memory")
+            except Exception:              # noqa: BLE001 — best effort
+                pass
+        return shm
+
+
+__all__ += ["RING_MAX_CONSUMERS", "RING_RETUNE", "RING_OVERFLOW", "RING_CAL", "ring_bytes",
+            "Ring"]

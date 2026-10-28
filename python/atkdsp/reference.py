@@ -3312,10 +3312,15 @@ def _bits(b) -> np.ndarray:
 
 
 # ---- §14 helpers: the statistics src/stat.c shares ---------------------------
+def _igam_iters(a) -> int:
+    """The iteration bound src/stat.c uses: both expansions need O(sqrt(a))."""
+    return 1000 + int(10.0 * _m.sqrt(a if a > 0.0 else 0.0))
+
+
 def _gamma_p_series(a, x):
     ap, dl = a, 1.0 / a
     s = dl
-    for _ in range(1000):
+    for _ in range(_igam_iters(a)):
         ap += 1.0
         dl *= x / ap
         s += dl
@@ -3330,7 +3335,7 @@ def _gamma_q_cf_log(a, x):
     c = 1.0 / tiny
     d = 1.0 / b
     h = d
-    for i in range(1, 1000):
+    for i in range(1, _igam_iters(a)):
         an = -float(i) * (float(i) - a)
         b += 2.0
         d = an * d + b
@@ -4850,6 +4855,8 @@ CRC_CATALOG = [
     ("CRC-64/GO-ISO", 64, 0x000000000000001b, 0xffffffffffffffff, 1, 1,
      0xffffffffffffffff, 0xb90956c775a41001),
     ("CRC-64/MS", 64, 0x259c84cba6426349, 0xffffffffffffffff, 1, 1, 0x0, 0x75d4b74f024eceea),
+    ("CRC-64/NVME", 64, 0xad93d23594c93659, 0xffffffffffffffff, 1, 1, 0xffffffffffffffff,
+     0xae8b14860a799888),
     ("CRC-64/REDIS", 64, 0xad93d23594c935a9, 0x0, 1, 1, 0x0, 0xe9c6d914c4b8d9ca),
     ("CRC-64/WE", 64, 0x42f0e1eba9ea3693, 0xffffffffffffffff, 0, 0,
      0xffffffffffffffff, 0x62ec59e3f1a4f00a),
@@ -6795,3 +6802,1306 @@ def interleaver_id(b, n_lo: int = 8, n_hi: int = 512, pfa: float = 1e-3, seed: i
         return out
     out["found"] = True
     return out
+
+
+# ============================================================================
+# THE DETECTION TRACK (v0.16.0, ABI 17) — docs/ATKDSP_PLAN.md §B1, §B2, §A3
+# ============================================================================
+# §19 CFAR and the burst tracker, §20 the burst descriptor word, §21 the ring.
+# Each is the specification src/cfar.c, src/burst.c and src/ring.c are held to.
+
+# ---- §19 helpers: the incomplete gamma in log space, both tails ---------------
+def log_igam_pq(a, x):
+    """(ln P(a, x), ln Q(a, x)) — both regularised incomplete gammas, each
+    finite far into its own tail. The arithmetic of src/stat.c's
+    atk_log_igam_pq, step for step."""
+    if not x > 0.0:
+        return -_m.inf, 0.0
+    lg = _m.lgamma(a)
+    if x < a + 1.0:
+        ap, dl = a, 1.0 / a
+        s = dl
+        for _ in range(_igam_iters(a)):
+            ap += 1.0
+            dl *= x / ap
+            s += dl
+            if abs(dl) < abs(s) * 1e-16:
+                break
+        lnp = _m.log(s) - x + a * _m.log(x) - lg
+        p = _m.exp(lnp)
+        return lnp, (_m.log1p(-p) if p < 1.0 else -_m.inf)
+    lnq = -x + a * _m.log(x) - lg + _gamma_q_cf_log(a, x)
+    q = _m.exp(lnq)
+    return (_m.log1p(-q) if q < 1.0 else -_m.inf), lnq
+
+
+def _v_log_igam_pq(a, x):
+    """log_igam_pq over an array of x (one shape a): the same series and
+    continued fraction, each element stopping where the scalar loop would."""
+    x = np.asarray(x, dtype=np.float64)
+    lnp = np.full(x.shape, -np.inf)
+    lnq = np.zeros(x.shape)
+    lg = _m.lgamma(a)
+    pos = x > 0.0
+    ser = pos & (x < a + 1.0)
+    cf = pos & ~ser
+    if ser.any():
+        xs = x[ser]
+        dl = np.full(xs.shape, 1.0 / a)
+        s = dl.copy()
+        act = np.ones(xs.shape, bool)
+        ap = a
+        for _ in range(_igam_iters(a)):
+            ap += 1.0
+            dl[act] *= xs[act] / ap
+            s[act] += dl[act]
+            act &= ~(np.abs(dl) < np.abs(s) * 1e-16)
+            if not act.any():
+                break
+        lp = np.log(s) - xs + a * np.log(xs) - lg
+        p = np.exp(lp)
+        lnp[ser] = lp
+        with np.errstate(divide="ignore"):
+            lnq[ser] = np.where(p < 1.0, np.log1p(-np.minimum(p, 1.0)), -np.inf)
+    if cf.any():
+        xs = x[cf]
+        tiny = 1e-300
+        b = xs + 1.0 - a
+        c = np.full(xs.shape, 1.0 / tiny)
+        d = 1.0 / b
+        h = d.copy()
+        act = np.ones(xs.shape, bool)
+        for i in range(1, _igam_iters(a)):
+            an = -float(i) * (float(i) - a)
+            b = b + 2.0
+            dn = an * d + b
+            dn = np.where(np.abs(dn) < tiny, tiny, dn)
+            cn = b + an / c
+            cn = np.where(np.abs(cn) < tiny, tiny, cn)
+            dn = 1.0 / dn
+            dl = dn * cn
+            d = np.where(act, dn, d)
+            c = np.where(act, cn, c)
+            h = np.where(act, h * dl, h)
+            act &= ~(np.abs(dl - 1.0) < 1e-16)
+            if not act.any():
+                break
+        lq = -xs + a * np.log(xs) - lg + np.log(h)
+        q = np.exp(lq)
+        lnq[cf] = lq
+        with np.errstate(divide="ignore"):
+            lnp[cf] = np.where(q < 1.0, np.log1p(-np.minimum(q, 1.0)), -np.inf)
+    return lnp, lnq
+
+
+# ---- §19 CFAR -------------------------------------------------------------------
+CFAR_CA, CFAR_OS, CFAR_GO, CFAR_SO = 0, 1, 2, 3
+CFAR_MODE_NAMES = ("CA", "OS", "GO", "SO")
+CFAR_OPEN, CFAR_UPDATE, CFAR_CLOSE = 1, 2, 3
+CFAR_T0_COARSE, CFAR_T1_COARSE, CFAR_EDGE, CFAR_MASK_ADJ, CFAR_FLUSHED = 1, 2, 4, 8, 16
+#: The single-frame band test that places t0 / t1 inside the k-frame average
+#: runs only inside a confirmed track, over at most k frames, so its rate is
+#: a per-track chance of an edge one frame early (§19 in atkdsp.h).
+CFAR_EDGE_PFA = 1e-3
+_K10 = _m.log(10.0) / 10.0          # dB -> natural log of power
+
+
+def cfar_defaults() -> dict:
+    """The defaults atkdsp_cfar_defaults() writes."""
+    return dict(mode=CFAR_CA, n_ref=16, n_guard=4, k_frames=1, pfa=1e-6, looks=1.0,
+                os_k=0, open_m=2, open_n=3, close_k=3, merge_gap=1, min_bins=1,
+                max_tracks=256)
+
+
+def _cfar_check(nbins, c) -> str:
+    """'' when the configuration is valid, else the reason (the C returns NULL)."""
+    N = 2 * c["n_ref"]
+    if c["mode"] not in (0, 1, 2, 3):
+        return "mode must be CA, OS, GO or SO"
+    if not 1 <= c["n_ref"] <= 256 or not 0 <= c["n_guard"] <= 256:
+        return "n_ref 1..256 and n_guard 0..256"
+    if nbins < N + 2 * c["n_guard"] + 1 or nbins > (1 << 24) or nbins * N > (1 << 26):
+        return "nbins must hold one full window (2 n_ref + 2 n_guard + 1) and nbins x 2 n_ref <= 2^26"
+    if not 1 <= c["k_frames"] <= 64 or not 0.25 <= c["looks"] <= 1e4:
+        return "k_frames 1..64 and looks 0.25..1e4"
+    if not 1e-15 <= c["pfa"] <= 0.5:
+        return "pfa 1e-15..0.5"
+    if c["mode"] == CFAR_OS and not 0 <= c["os_k"] <= N:
+        return "os_k 1..2 n_ref (0 = three quarters)"
+    if not 1 <= c["open_n"] <= 64 or not 1 <= c["open_m"] <= c["open_n"]:
+        return "open_m 1..open_n and open_n 1..64"
+    if not 1 <= c["close_k"] <= 1000 or not 0 <= c["merge_gap"] <= nbins:
+        return "close_k 1..1000 and merge_gap 0..nbins"
+    if not 1 <= c["min_bins"] <= nbins or not 1 <= c["max_tracks"] <= 65536:
+        return "min_bins 1..nbins and max_tracks 1..65536"
+    return ""
+
+
+def _ln_gpdf(s, t):
+    """ln of the Gamma(s) density with mean 1 (scale 1/s) at t (> 0)."""
+    return s * _m.log(s) + (s - 1.0) * np.log(t) - s * t - _m.lgamma(s)
+
+
+def _cfar_log_density(mode, t, N, K, k):
+    """ln density of the reference statistic T (noise mean 1 per cell) at t."""
+    n = N // 2
+    if mode == CFAR_CA:
+        return _ln_gpdf(N * K, t)
+    if mode in (CFAR_GO, CFAR_SO):
+        s = n * K
+        lp, lq = _v_log_igam_pq(s, s * t)
+        return _m.log(2.0) + (lp if mode == CFAR_GO else lq) + _ln_gpdf(s, t)
+    lp, lq = _v_log_igam_pq(K, K * t)
+    out = (_m.log(N) + _m.lgamma(N) - _m.lgamma(k) - _m.lgamma(N - k + 1)
+           + _ln_gpdf(K, t))
+    if k > 1:
+        out = out + (k - 1) * lp
+    if N > k:
+        out = out + (N - k) * lq
+    return out
+
+
+def _cfar_log_cdf_sf(mode, t, N, K, k):
+    """(ln P(T <= t), ln P(T > t)) — the tails that bound the integration."""
+    n = N // 2
+    if mode == CFAR_CA:
+        return log_igam_pq(N * K, N * K * t)
+    if mode in (CFAR_GO, CFAR_SO):
+        s = n * K
+        lp, lq = log_igam_pq(s, s * t)
+        if mode == CFAR_GO:
+            return 2.0 * lp, lq + _m.log1p(_m.exp(lp))
+        return lp + _m.log1p(_m.exp(lq)), 2.0 * lq
+    lp, lq = log_igam_pq(K, K * t)
+    cdf = -_m.inf if lp == -_m.inf else log10_binom_tail(N, k, lp) * _LN10
+    sf = -_m.inf if lq == -_m.inf else log10_binom_tail(N, N - k + 1, lq) * _LN10
+    return cdf, sf
+
+
+def _cfar_grid(mode, N, K, k, pfa):
+    """The integration grid: u = ln t over [u_lo, u_hi] and the Simpson-weighted
+    density G_j (sum G_j = 1 - the two tails), plus E[T]. The tails cut off
+    are each below 1e-9 x pfa, so truncation moves Pfa by < 2e-9 of itself."""
+    ln_eps = _m.log(1e-9 * pfa)
+    lo, hi = -700.0, 7.0
+    if _cfar_log_cdf_sf(mode, _m.exp(lo), N, K, k)[0] >= ln_eps:
+        u_lo = lo
+    else:
+        a, b = lo, hi
+        for _ in range(60):
+            mid = 0.5 * (a + b)
+            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, K, k)[0] < ln_eps:
+                a = mid
+            else:
+                b = mid
+        u_lo = a
+    if _cfar_log_cdf_sf(mode, _m.exp(hi), N, K, k)[1] > ln_eps:
+        u_hi = hi
+    else:
+        a, b = u_lo, hi
+        for _ in range(60):
+            mid = 0.5 * (a + b)
+            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, K, k)[1] > ln_eps:
+                a = mid
+            else:
+                b = mid
+        u_hi = b
+    s_ref = (N // 2) * K if mode in (CFAR_GO, CFAR_SO) else N * K
+    h0 = min(0.01, 0.2 / _m.sqrt(s_ref))
+    span = u_hi - u_lo
+    M = 2 * int(_m.ceil(span / (2.0 * h0)))
+    M = min(max(M, 512), 131072)
+    h = span / M
+    u = u_lo + h * np.arange(M + 1, dtype=np.float64)
+    t = np.exp(u)
+    w = np.full(M + 1, 2.0)
+    w[1::2] = 4.0
+    w[0] = w[M] = 1.0
+    w *= h / 3.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        lg = _cfar_log_density(mode, t, N, K, k) + u
+        G = np.where(np.isfinite(lg), np.exp(np.where(np.isfinite(lg), lg, 0.0)), 0.0) * w
+    ET = 0.0
+    for j in range(M + 1):            # sequential, as the C sums
+        ET += G[j] * t[j]
+    return t, G, ET
+
+
+def _cfar_pfa(t, G, K, alpha):
+    """Pfa(alpha) = sum_j G_j Q(K, K alpha t_j), summed in index order."""
+    q = np.exp(_v_log_igam_pq(K, K * alpha * t)[1])
+    v = G * q
+    s = 0.0
+    for x in v:
+        s += x
+    return s
+
+
+def cfar_alpha(mode, n_ref, pfa, K=1.0, os_k=0):
+    """The threshold multiplier for `pfa` per cell: (alpha, E[T]). T is the
+    reference statistic in units of the noise mean (CA: the mean of N = 2
+    n_ref cells; GO / SO: the greater / smaller of the two side means; OS:
+    the os_k-th smallest of the N cells); the cell under test is K-look
+    gamma. Pfa(alpha) = integral Q(K, K alpha t) f_T(t) dt, solved for alpha
+    by regula falsi (Illinois) in ln alpha. K = 1 reproduces the closed forms:
+    CA alpha = N (Pfa^(-1/N) - 1); OS Pfa = prod_{i<k} (N-i)/(N-i+alpha)."""
+    N = 2 * int(n_ref)
+    k = int(os_k) or (3 * N + 3) // 4
+    t, G, ET = _cfar_grid(mode, N, float(K), k, float(pfa))
+    lnpfa = _m.log(pfa)
+
+    def f(v):
+        return _m.log(max(_cfar_pfa(t, G, float(K), _m.exp(v)), 1e-300)) - lnpfa
+    a, b = _m.log(1e-3), _m.log(1e18)
+    fa, fb = f(a), f(b)
+    if not (fa > 0.0 and fb < 0.0):
+        raise ValueError("pfa cannot be reached with alpha in 1e-3..1e18 — "
+                         "use more reference cells")
+    side, c, prev = 0, a, None
+    for _ in range(300):
+        c = (a * fb - b * fa) / (fb - fa)
+        fc = f(c)
+        if fc == 0.0:
+            break
+        if fc > 0.0:
+            a, fa = c, fc
+            if side == 1:
+                fb *= 0.5
+            side = 1
+        else:
+            b, fb = c, fc
+            if side == -1:
+                fa *= 0.5
+            side = -1
+        if prev is not None and abs(c - prev) <= 1e-14 * max(1.0, abs(c)):
+            break
+        prev = c
+    return _m.exp(c), ET
+
+
+def cfar_edge_beta(nb, looks):
+    """beta with P(Gamma(nb*looks) / (nb*looks) > beta) = CFAR_EDGE_PFA: the
+    single-frame band test for nb bins. Bisection in ln beta, 100 steps."""
+    s = float(nb) * float(looks)
+    target = _m.log(CFAR_EDGE_PFA)
+    a, b = _m.log(1e-6), _m.log(1e6)
+    for _ in range(100):
+        mid = 0.5 * (a + b)
+        if log_igam_pq(s, s * _m.exp(mid))[1] > target:
+            a = mid
+        else:
+            b = mid
+    return _m.exp(b)
+
+
+def _popcount(x: int) -> int:
+    return bin(x).count("1")
+
+
+class Cfar:
+    """Twin of atkdsp_cfar (atkdsp.h §19): a 1-D CFAR across frequency on each
+    frame and a burst tracker across frames. Frames are power spectra in dB,
+    one row per frame, AVERAGE power per bin (a max-hold frame is not gamma
+    and breaks the false-alarm rate). Events are dicts with the C struct's
+    fields; see atkdsp.h §19 for every definition."""
+
+    def __init__(self, nbins: int, **cfg):
+        c = cfar_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise ValueError(f"unknown CFAR option {key!r}")
+            c[key] = v
+        for key in c:
+            c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
+        why = _cfar_check(int(nbins), c)
+        if why:
+            raise ValueError(f"CFAR refused: {why}")
+        self.nbins = int(nbins)
+        self.cfg = c
+        N = 2 * c["n_ref"]
+        if c["mode"] == CFAR_OS and c["os_k"] == 0:
+            c["os_k"] = (3 * N + 3) // 4
+        self.K = c["looks"] * c["k_frames"]
+        self.alpha, self.et = cfar_alpha(c["mode"], c["n_ref"], c["pfa"], self.K, c["os_k"])
+        if c["mode"] in (CFAR_GO, CFAR_SO):
+            self.alpha_ca, _ = cfar_alpha(CFAR_CA, c["n_ref"], c["pfa"], self.K)
+        else:
+            self.alpha_ca = self.alpha
+        self._beta = {}
+        self.mask = np.zeros(self.nbins, bool)
+        self._tables()
+        k = c["k_frames"]
+        self._hist = np.zeros((k, self.nbins))
+        self._ht = np.zeros(k)
+        self._hd = np.zeros(k)
+        self._seen = 0
+        self._frame = 0                      # global frame index
+        self._tracks = []
+        self._next_id = 1
+        self._last = None
+        self._st = dict(frames=0, warmup=0, cells_tested=0, cell_hits=0, untestable=0,
+                        opened=0, closed=0, updates=0, dropped=0, resets=0)
+
+    # -- configuration --------------------------------------------------------
+    def set_mask(self, mask) -> None:
+        m = np.asarray(mask)
+        if m.size != self.nbins:
+            raise ValueError("mask must have nbins entries")
+        self.mask = m.astype(bool).ravel().copy()
+        self._tables()
+
+    def _tables(self) -> None:
+        """Per bin: the N reference cells (left nearest-first, right
+        nearest-first, then any cells borrowed from the far side at an edge
+        or past a mask), whether it is testable, and whether both sides were
+        whole (GO / SO need that; a shifted bin falls back to CA)."""
+        nb, nr, ng = self.nbins, self.cfg["n_ref"], self.cfg["n_guard"]
+        N = 2 * nr
+        idx = np.zeros((nb, N), np.int64)
+        ok = np.zeros(nb, bool)
+        sided = np.zeros(nb, bool)
+        m = self.mask
+        for i in range(nb):
+            if m[i]:
+                continue
+            left, right = [], []
+            j = i - ng - 1
+            while j >= 0 and len(left) < nr:
+                if not m[j]:
+                    left.append(j)
+                j -= 1
+            jl = j
+            j = i + ng + 1
+            while j < nb and len(right) < nr:
+                if not m[j]:
+                    right.append(j)
+                j += 1
+            jr = j
+            ext = []
+            short_l, short_r = nr - len(left), nr - len(right)
+            j = jr
+            while short_l > 0 and j < nb:
+                if not m[j]:
+                    ext.append(j)
+                    short_l -= 1
+                j += 1
+            j = jl
+            while short_r > 0 and j >= 0:
+                if not m[j]:
+                    ext.append(j)
+                    short_r -= 1
+                j -= 1
+            cells = left + right + ext
+            if len(cells) < N:
+                continue
+            idx[i] = cells
+            ok[i] = True
+            sided[i] = not ext
+        self._idx, self._ok, self._sided = idx, ok, sided
+
+    def _beta_for(self, nb: int) -> float:
+        if nb not in self._beta:
+            self._beta[nb] = cfar_edge_beta(nb, self.cfg["looks"])
+        return self._beta[nb]
+
+    # -- the per-frame test ---------------------------------------------------
+    def _reference(self, X):
+        c = self.cfg
+        N, n = 2 * c["n_ref"], c["n_ref"]
+        idx = self._idx
+        mode = c["mode"]
+        alpha = np.full(self.nbins, self.alpha)
+        noise_scale = np.full(self.nbins, self.et)
+        if mode == CFAR_OS:
+            Xr = X[idx]
+            Z = np.partition(Xr, c["os_k"] - 1, axis=1)[:, c["os_k"] - 1]
+            Z = np.where(np.isnan(Xr).any(axis=1), np.nan, Z)     # a NaN cell: T is NaN
+        else:
+            Z = np.zeros(self.nbins)
+            for col in range(N):
+                Z += X[idx[:, col]]
+            Z /= N
+            if mode in (CFAR_GO, CFAR_SO):
+                L = np.zeros(self.nbins)
+                R = np.zeros(self.nbins)
+                for col in range(n):
+                    L += X[idx[:, col]]
+                for col in range(n, N):
+                    R += X[idx[:, col]]
+                L /= n
+                R /= n
+                side = np.maximum(L, R) if mode == CFAR_GO else np.minimum(L, R)
+                s = self._sided
+                Z = np.where(s, side, Z)
+                alpha = np.where(s, self.alpha, self.alpha_ca)
+                noise_scale = np.where(s, self.et, 1.0)
+        return Z, alpha, noise_scale
+
+    def process(self, frames_db, frame_t0: float, frame_dt: float) -> list:
+        F = np.asarray(frames_db, dtype=np.float32)
+        if F.ndim == 1:
+            F = F.reshape(1, -1)
+        if F.shape[1] != self.nbins:
+            raise ValueError("frames must have nbins columns")
+        out = []
+        for j in range(F.shape[0]):
+            out += self._one(F[j], float(frame_t0) + j * float(frame_dt), float(frame_dt))
+        return out
+
+    def _one(self, row, tf, dt) -> list:
+        c = self.cfg
+        k = c["k_frames"]
+        st = self._st
+        st["frames"] += 1
+        raw = np.exp(np.maximum(row.astype(np.float64), -300.0) * _K10)
+        slot = self._frame % k
+        self._hist[slot] = raw
+        self._ht[slot] = tf
+        self._hd[slot] = dt
+        self._seen += 1
+        F = self._frame
+        self._frame += 1
+        if self._seen < k:
+            st["warmup"] += 1
+            return []
+        X = np.zeros(self.nbins)
+        for r in range(k):
+            X += self._hist[(F + 1 + r) % k]
+        X /= k
+        Z, alpha, scale = self._reference(X)
+        ok = self._ok
+        thr = alpha * Z
+        hits = ok & (X > thr)
+        noise = Z / scale
+        st["cells_tested"] += int(ok.sum())
+        st["cell_hits"] += int(hits.sum())
+        st["untestable"] += int((~ok & ~self.mask).sum())
+        self._last = (X, np.where(ok, thr, np.nan), hits)
+        # blobs
+        blobs = []
+        hi_idx = np.flatnonzero(hits)
+        g = c["merge_gap"]
+        if hi_idx.size:
+            start = prev = int(hi_idx[0])
+            members = [start]
+            for b in hi_idx[1:]:
+                b = int(b)
+                if b - prev - 1 <= g:
+                    members.append(b)
+                else:
+                    blobs.append(members)
+                    members = [b]
+                prev = b
+            blobs.append(members)
+        obs = []
+        for mem in blobs:
+            lo, hi = mem[0], mem[-1]
+            if hi - lo + 1 < c["min_bins"]:
+                continue
+            mb = np.asarray(mem)
+            e = np.maximum(X[mb] - noise[mb], 0.0)
+            sbe = se = sx = sn = 0.0
+            for q in range(mb.size):
+                sbe += float(mb[q]) * e[q]
+                se += e[q]
+                sx += X[mb[q]]
+                sn += noise[mb[q]]
+            p = int(mb[int(np.argmax(X[mb]))])
+            obs.append(dict(lo=lo, hi=hi, sbe=sbe, se=se, sx=sx, sn=sn,
+                            px=float(X[p]), pn=float(noise[p])))
+        # association
+        m = g + 1
+        assign = {}
+        newb = []
+        for o in obs:
+            best, bov = None, None
+            for tr in self._tracks:
+                if o["lo"] <= tr["cur_hi"] + m and o["hi"] >= tr["cur_lo"] - m:
+                    ov = min(o["hi"], tr["cur_hi"]) - max(o["lo"], tr["cur_lo"]) + 1
+                    if bov is None or ov > bov:
+                        best, bov = tr, ov
+            if best is None:
+                newb.append(o)
+            else:
+                assign.setdefault(best["id"], []).append(o)
+        for o in newb:
+            if len(self._tracks) >= c["max_tracks"]:
+                st["dropped"] += 1
+                continue
+            tr = dict(id=self._next_id, state=0, hist=0, misses=0, n_hits=0,
+                      cur_lo=o["lo"], cur_hi=o["hi"], ulo=o["lo"], uhi=o["hi"],
+                      sbe=0.0, se=0.0, px=-1.0, pn=0.0, band=0.0, flags=0,
+                      t0=0.0, last_hit=-1, t_hit_end=0.0, dt_hit=dt,
+                      last_raw=-1, t_raw_end=0.0, new=True)
+            self._next_id = (self._next_id + 1) & 0xFFFFFFFF or 1
+            self._tracks.append(tr)
+            assign[tr["id"]] = [o]
+        # update
+        events = []
+        keep = []
+        maskn = (1 << c["open_n"]) - 1
+        for tr in self._tracks:
+            ob = assign.get(tr["id"])
+            grew = False
+            if ob:
+                lo = min(o["lo"] for o in ob)
+                hi = max(o["hi"] for o in ob)
+                tr["hist"] = ((tr["hist"] << 1) | 1) & maskn
+                tr["misses"] = 0
+                tr["n_hits"] += 1
+                tr["cur_lo"], tr["cur_hi"] = lo, hi
+                if not tr["new"]:
+                    grew = lo < tr["ulo"] or hi > tr["uhi"]
+                tr["ulo"], tr["uhi"] = min(tr["ulo"], lo), max(tr["uhi"], hi)
+                sx = sn = 0.0
+                for o in ob:
+                    tr["sbe"] += o["sbe"]
+                    tr["se"] += o["se"]
+                    sx += o["sx"]
+                    sn += o["sn"]
+                    if o["px"] > tr["px"]:
+                        tr["px"], tr["pn"] = o["px"], o["pn"]
+                if sn > 0.0 and sx / sn > tr["band"]:
+                    tr["band"] = sx / sn
+                tr["last_hit"] = F
+                tr["t_hit_end"] = tf + dt
+                tr["dt_hit"] = dt
+                if tr["new"]:
+                    tr["new"] = False
+                    if k == 1:
+                        tr["t0"] = tf
+                    else:
+                        tr["t0"] = None
+                        for r in range(k):
+                            s = (F + 1 + r) % k
+                            if self._band_pass(self._hist[s], noise, lo, hi):
+                                tr["t0"] = float(self._ht[s])
+                                break
+                        if tr["t0"] is None:
+                            tr["t0"] = tf - 0.5 * (k - 1) * dt
+                            tr["flags"] |= CFAR_T0_COARSE
+            else:
+                tr["hist"] = (tr["hist"] << 1) & maskn
+                tr["misses"] += 1
+            if k > 1 and self._band_pass(raw, noise, tr["cur_lo"], tr["cur_hi"]):
+                tr["last_raw"] = F
+                tr["t_raw_end"] = tf + dt
+            if tr["state"] == 0:
+                if _popcount(tr["hist"]) >= c["open_m"]:
+                    tr["state"] = 1
+                    st["opened"] += 1
+                    events.append(self._event(CFAR_OPEN, tr))
+                elif tr["hist"] == 0:
+                    continue
+            elif tr["misses"] >= c["close_k"]:
+                events.append(self._close(tr, 0))
+                continue
+            elif grew:
+                st["updates"] += 1
+                events.append(self._event(CFAR_UPDATE, tr))
+            keep.append(tr)
+        self._tracks = keep
+        return events
+
+    def _band_pass(self, raw, noise, lo, hi) -> bool:
+        sr = sz = 0.0
+        nb = 0
+        for b in range(lo, hi + 1):
+            if self._ok[b]:
+                sr += raw[b]
+                sz += noise[b]
+                nb += 1
+        return nb > 0 and sr > self._beta_for(nb) * sz
+
+    def _flags(self, tr) -> int:
+        f = tr["flags"]
+        nb = self.nbins
+        lo, hi = tr["ulo"], tr["uhi"]
+        if not self._sided[lo:hi + 1].all() or not self._ok[lo:hi + 1].all():
+            f |= CFAR_EDGE
+        m = self.cfg["merge_gap"] + 1
+        if self.mask[max(0, lo - m):min(nb, hi + m + 1)].any():
+            f |= CFAR_MASK_ADJ
+        return f
+
+    def _event(self, typ, tr, t1=float("nan"), extra=0) -> dict:
+        fc = float(tr["sbe"] / tr["se"]) if tr["se"] > 0.0 else 0.5 * (tr["ulo"] + tr["uhi"])
+        lv = float(np.float32(10.0 * _m.log10(tr["px"]))) if tr["px"] > 0 else float("-inf")
+        nz = float(np.float32(10.0 * _m.log10(tr["pn"]))) if tr["pn"] > 0 else float("-inf")
+        return dict(type=typ, id=tr["id"], flags=self._flags(tr) | extra,
+                    lo=tr["ulo"], hi=tr["uhi"], n_hits=tr["n_hits"], t0=tr["t0"], t1=t1,
+                    fc_bin=fc, level_db=lv, noise_db=nz,
+                    snr_db=float(np.float32(lv - nz)) if tr["pn"] > 0 else float("inf"),
+                    band_snr_db=float(np.float32(10.0 * _m.log10(tr["band"])))
+                    if tr["band"] > 0 else float("-inf"))
+
+    def _close(self, tr, extra) -> dict:
+        k = self.cfg["k_frames"]
+        if k == 1:
+            t1 = tr["t_hit_end"]
+        elif tr["last_raw"] >= tr["last_hit"] - (k - 1):
+            t1 = tr["t_raw_end"]
+        else:
+            t1 = tr["t_hit_end"] - 0.5 * (k - 1) * tr["dt_hit"]
+            tr["flags"] |= CFAR_T1_COARSE
+        self._st["closed"] += 1
+        return self._event(CFAR_CLOSE, tr, t1, extra)
+
+    def flush(self) -> list:
+        """Close every open track now (CLOSE, flag FLUSHED); drop the pending
+        ones. The stream may continue."""
+        ev = [self._close(tr, CFAR_FLUSHED) for tr in self._tracks if tr["state"] == 1]
+        self._tracks = []
+        return ev
+
+    def reset(self) -> None:
+        self._tracks = []
+        self._seen = 0
+        self._frame = 0
+        self._hist[:] = 0.0
+        self._last = None
+        self._st["resets"] += 1
+
+    def last(self):
+        """(averaged power dB, threshold dB (NaN untested), hits) of the last
+        tested frame, or None before one."""
+        if self._last is None:
+            return None
+        X, thr, hits = self._last
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return ((10.0 * np.log10(X)).astype(np.float32),
+                    (10.0 * np.log10(thr)).astype(np.float32), hits.astype(np.uint8))
+
+    def events_max(self, nframes: int) -> int:
+        return int(nframes) * self.cfg["max_tracks"]
+
+    def stats(self) -> dict:
+        d = dict(self._st)
+        d["tracks"] = len(self._tracks)
+        return d
+
+    def describe(self) -> str:
+        return cfar_describe(self.nbins, self.cfg, self.alpha, int(self.mask.sum()),
+                             len(self._tracks))
+
+
+def cfar_describe(nbins, c, alpha, masked, ntracks) -> str:
+    mode = CFAR_MODE_NAMES[c["mode"]]
+    os_txt = f" (rank {c['os_k']} of {2 * c['n_ref']})" if c["mode"] == CFAR_OS else ""
+    return (f"CFAR {mode}{os_txt}: {c['n_ref']}+{c['n_ref']} reference cells, "
+            f"{c['n_guard']} guard each side, Pfa {c['pfa']:.3g} per cell per frame, "
+            f"K = {c['looks']:g} look(s) x {c['k_frames']} frame(s), alpha {alpha:.4g} "
+            f"({10.0 * _m.log10(alpha):.2f} dB); open {c['open_m']} of {c['open_n']}, "
+            f"close after {c['close_k']} misses, merge gap {c['merge_gap']}, "
+            f"min {c['min_bins']} bin(s); {nbins} bins, {masked} masked, "
+            f"tracks {ntracks}/{c['max_tracks']}")
+
+
+# ---- §20 the burst descriptor word ---------------------------------------------------
+BDW_TRUNC_START, BDW_TRUNC_END, BDW_NO_NOISE, BDW_LOW_SNR = 1, 2, 4, 8
+BDW_RISE_UNRESOLVED, BDW_FALL_UNRESOLVED, BDW_BW26_FLOOR, BDW_SHORT = 16, 32, 64, 128
+BDW_GAUSSIAN = 256
+BDW_DEFAULT_THRESH_DB = 3.0102999566398120     # half power, when thresh_db > 0 is asked for without N
+
+
+def _bdw_hann(n):
+    """The periodic (DFT-even) Hann window both implementations use."""
+    j = np.arange(n, dtype=np.float64)
+    return 0.5 - 0.5 * np.cos(2.0 * np.pi * j / n)
+
+
+def _seq_mean(v) -> float:
+    s = 0.0
+    for x in v:
+        s += x
+    return s / len(v)
+
+
+def _bdw_welch(x, nfft):
+    """Hann, hop nfft/2, |FFT|^2 averaged over whole segments, shifted so
+    index 0 is -fs/2. Returns (psd, segments, sum w^2)."""
+    w = _bdw_hann(nfft)
+    hop = nfft // 2
+    acc = np.zeros(nfft)
+    nseg = 0
+    s = 0
+    while s + nfft <= x.size:
+        X = np.fft.fft(x[s:s + nfft] * w)
+        acc += X.real * X.real + X.imag * X.imag
+        nseg += 1
+        s += hop
+    return np.fft.fftshift(acc / max(nseg, 1)), nseg, float(np.sum(w * w))
+
+
+def _bdw_obw(D, fs, nfft, frac=0.99):
+    """The occupied band of a noise-subtracted PSD D (shifted, SIGNED: the
+    residual of the noise is left to cancel, because clipping it at zero
+    adds a positive bias of every bin's fluctuation, and at 10 dB that alone
+    is more than the 0.5 % tails). The lower edge is where the power summed
+    from the bottom reaches (1 - frac)/2 of the total, the upper where the
+    sum from the top does, each interpolated in its bin: (f_lo, f_hi, k_lo,
+    k_hi), or None when there is no power above the noise."""
+    df = fs / nfft
+    T = 0.0
+    for v in D:
+        T += v
+    if not T > 0.0:
+        return None
+    tail = 0.5 * (1.0 - frac) * T
+    cum = 0.0
+    f_lo = None
+    k_lo = 0
+    for k in range(nfft):
+        prev = cum
+        cum += D[k]
+        if cum >= tail and D[k] > 0.0:
+            f_lo = (k - nfft // 2) * df - 0.5 * df + df * (tail - prev) / D[k]
+            k_lo = k
+            break
+    cum = 0.0
+    f_hi = None
+    k_hi = nfft - 1
+    for k in range(nfft - 1, -1, -1):
+        prev = cum
+        cum += D[k]
+        if cum >= tail and D[k] > 0.0:
+            f_hi = (k - nfft // 2) * df + 0.5 * df - df * (tail - prev) / D[k]
+            k_hi = k
+            break
+    if f_lo is None or f_hi is None or k_hi < k_lo:
+        return None
+    return f_lo, f_hi, k_lo, k_hi
+
+
+def _bdw_auto_nfft(L):
+    """The largest power of two <= L / 8, in 16..4096: eight or more
+    half-overlapped segments, so the Hann taper at the ends weighs little."""
+    m = 16
+    while m * 2 <= L // 8 and m * 2 <= 4096:
+        m *= 2
+    return m
+
+
+def _bdw_runs(ps, lvl, gap):
+    """Runs of ps >= lvl, merged across gaps of <= gap samples: [(a, b)]."""
+    runs = []
+    n = ps.size
+    j = 0
+    while j < n:
+        if ps[j] >= lvl:
+            a = j
+            while j < n and ps[j] >= lvl:
+                j += 1
+            b = j - 1
+            if runs and a - runs[-1][1] - 1 <= gap:
+                runs[-1] = (runs[-1][0], b)
+            else:
+                runs.append((a, b))
+        else:
+            j += 1
+    return runs
+
+
+def _bdw_smooth(p, W):
+    """Centred moving average of width W (odd), shrinking at the ends."""
+    n = p.size
+    cs = np.zeros(n + 1)
+    cs[1:] = np.cumsum(p)
+    h = W // 2
+    j = np.arange(n)
+    a = np.maximum(j - h, 0)
+    b = np.minimum(j + h + 1, n)
+    return (cs[b] - cs[a]) / (b - a)
+
+
+def _bdw_cusum_start(p, lvl, a, b):
+    """argmax over tau in [a, b+1] of sum_{j=tau}^{b} (p_j - lvl) (the
+    least-squares step between the two levels); ties keep the later tau."""
+    best, tau, acc = 0.0, b + 1, 0.0
+    for j in range(b, a - 1, -1):
+        acc += p[j] - lvl
+        if acc > best:
+            best, tau = acc, j
+    return tau
+
+
+def _bdw_cusum_end(p, lvl, a, b):
+    best, tau, acc = 0.0, a - 1, 0.0
+    for j in range(a, b + 1):
+        acc += p[j] - lvl
+        if acc > best:
+            best, tau = acc, j
+    return tau
+
+
+def burst_measure(iq, fs: float, i0: int, i1: int, thresh_db: float = 0.0,
+                  nfft: int = 0) -> dict:
+    """Twin of atkdsp_burst_measure (atkdsp.h §20): one burst's descriptor
+    word from channelised I/Q and a coarse [i0, i1) (the CFAR's t0 / t1 in
+    samples). Raises ValueError for bad arguments and LookupError when there
+    is no burst at the coarse position (the C's ATKDSP_E_ARG / E_EMPTY)."""
+    x = np.asarray(iq, dtype=np.complex64)
+    n = x.size
+    i0, i1, fs = int(i0), int(i1), float(fs)
+    if not fs > 0.0 or n < 32 or not 0 <= i0 < i1 <= n or i1 - i0 < 16:
+        raise ValueError("burst_measure: fs > 0, n >= 32, 0 <= i0 < i1 <= n, i1 - i0 >= 16")
+    if thresh_db is None or not float(thresh_db) <= 40.0:      # NaN too
+        raise ValueError("burst_measure: thresh_db 0..40")
+    thr = float(thresh_db) if thresh_db > 0.0 else 0.0
+    xr = x.real.astype(np.float64)
+    xi = x.imag.astype(np.float64)
+    p = xr * xr + xi * xi
+    flags = 0
+    L = i1 - i0
+    g = L // 8 + 8
+    m0, m1 = i0 + L // 4, i1 - L // 4
+    P = _seq_mean(p[m0:m1])
+    outside = np.concatenate([p[:max(i0 - g, 0)], p[min(i1 + g, n):]])
+    guarded = outside.size >= 32
+    if not guarded:                # no room for the guard: whatever lies outside
+        outside = np.concatenate([p[:i0], p[i1:]])
+    if outside.size >= 32:
+        N = _seq_mean(outside)
+        # unguarded samples that sit within 1 dB of the plateau are the burst
+        # itself (it fills the buffer), not noise
+        if not guarded and not P > 1.25 * N:
+            N = 0.0
+            flags |= BDW_NO_NOISE
+    else:
+        N = 0.0
+        flags |= BDW_NO_NOISE
+    if not P > N:
+        raise LookupError("burst_measure: no burst at the coarse position")
+    # the preliminary bandwidth, for the smoothing
+    xm = x[m0:m1].astype(np.complex128)
+    nf0 = _bdw_auto_nfft(xm.size)
+    psd, nseg, u = _bdw_welch(xm, nf0)
+    ob = _bdw_obw(psd - N * u, fs, nf0)
+    b_est = fs / nf0
+    if ob is not None and ob[1] - ob[0] > b_est:
+        b_est = ob[1] - ob[0]
+    wmax = max(1, L // 4)
+    W = int(_m.floor(32.0 * fs / b_est + 0.5))
+    W = min(max(W, 3), wmax)
+    if W % 2 == 0:
+        W = W - 1 if W > 1 else 1
+    Wr = int(_m.floor(fs / b_est + 0.5))
+    Wr = min(max(Wr, 1), W, 63)
+    if Wr % 2 == 0:
+        Wr -= 1
+    mid = (i0 + i1) // 2
+
+    def edges(N, P, gauss=False):
+        if thr > 0.0 or not N > 0.0 or not gauss:
+            t_ = thr if thr > 0.0 else BDW_DEFAULT_THRESH_DB
+            lvl = N + (P - N) * 10.0 ** (-t_ / 10.0)
+        else:
+            # the likelihood boundary: noise and burst as exponential power
+            # (Gaussian noise, Gaussian-like signal) with means N and P; the
+            # per-sample log-likelihood ratio changes sign at this level
+            lvl = _m.log(P / N) * N * P / (P - N)
+        ps = _bdw_smooth(p, W)
+        runs = _bdw_runs(ps, N + 0.25 * (P - N), W)
+        sel = None
+        for a, b in runs:
+            if a <= mid <= b:
+                sel = (a, b)
+                break
+        if sel is None:
+            best = 0
+            for a, b in runs:
+                ov = min(b, m1 - 1) - max(a, m0) + 1
+                if ov > best:
+                    best, sel = ov, (a, b)
+        if sel is None:
+            raise LookupError("burst_measure: no burst at the coarse position")
+        e0, e1 = sel
+        R = W + 8
+        half = (e1 - e0) // 2
+        f = 0
+        # the step is searched for even when the smoothed core reaches the
+        # buffer's end (smoothing spreads a burst by half a window, which can
+        # exceed a short margin); truncated means the step is AT the end
+        a, b = max(0, e0 - R), min(n - 1, e0 + min(R, half))
+        tau = _bdw_cusum_start(p, lvl, a, b)
+        t0 = tau - 0.5
+        if tau == 0:
+            f |= BDW_TRUNC_START
+        a, b = max(0, e1 - min(R, half)), min(n - 1, e1 + R)
+        tau = _bdw_cusum_end(p, lvl, a, b)
+        t1 = tau + 0.5
+        if tau == n - 1:
+            f |= BDW_TRUNC_END
+        return lvl, t0, t1, f
+    lvl, t0, t1, ef = edges(N, P)
+    # second pass: the noise from outside the measured burst, the plateau from inside
+    R2 = 2 * W + 8
+    lo_cut, hi_cut = int(_m.floor(t0)) - R2, int(_m.ceil(t1)) + R2
+    outside = np.concatenate([p[:max(lo_cut, 0)], p[min(max(hi_cut, 0), n):]])
+    if outside.size >= 32:
+        N = _seq_mean(outside)
+        flags &= ~BDW_NO_NOISE
+    a, b = int(_m.ceil(t0)) + W, int(_m.floor(t1)) - W
+    if b - a + 1 < 16:
+        a, b = max(int(_m.ceil(t0)), 0), min(int(_m.floor(t1)), n - 1)
+    if b < a:
+        raise LookupError("burst_measure: no burst at the coarse position")
+    core = p[a:b + 1]
+    P = _seq_mean(core)
+    if not P > N:
+        raise LookupError("burst_measure: no burst at the coarse position")
+    # How the burst's own power fluctuates, noise removed: ~0 for a constant
+    # envelope (FM, FSK, a carrier), ~1 for a Gaussian-like signal (OFDM,
+    # spread spectrum, noise). A constant envelope's edge is its half-power
+    # crossing; a Gaussian one fades through that level on its own, so its
+    # edge is the likelihood boundary instead (atkdsp.h §20).
+    var = 0.0
+    for v in core:
+        var += (v - P) * (v - P)
+    var /= core.size
+    S_ = P - N
+    kappa = (var - N * N - 2.0 * S_ * N) / (S_ * S_)
+    gauss = kappa > 0.5
+    if gauss and thr == 0.0 and N > 0.0:
+        flags |= BDW_GAUSSIAN
+    lvl, t0, t1, ef = edges(N, P, gauss)
+    flags |= ef
+    s0, s1 = max(int(_m.ceil(t0)), 0), min(int(_m.floor(t1)), n - 1)
+    if s1 < s0:
+        raise LookupError("burst_measure: no burst at the coarse position")
+    seg = p[s0:s1 + 1]
+    pk = float(np.max(seg))
+    mean_p = _seq_mean(seg)
+    snr = 10.0 * _m.log10((P - N) / N) if N > 0.0 else float("inf")
+    if N > 0.0 and snr < 6.0:
+        flags |= BDW_LOW_SNR
+    # rise and fall, 10-90 % amplitude (1 % and 81 % of the power above noise)
+    pr = _bdw_smooth(p, Wr)
+    l10, l90 = N + 0.01 * (P - N), N + 0.81 * (P - N)
+
+    def cross(j_from, j_to, level):
+        """first crossing of `level` walking j_from -> j_to (step +-1),
+        interpolated; None if it never crosses."""
+        step = 1 if j_to >= j_from else -1
+        j = j_from
+        while j != j_to:
+            k = j + step
+            a_, b_ = pr[j], pr[k]
+            if (a_ < level) != (b_ < level):
+                return j + step * (level - a_) / (b_ - a_)
+            j = k
+        return None
+    noise_sd = N / _m.sqrt(Wr) if N > 0.0 else 0.0
+    if gauss:            # its envelope fades on its own: no 10-90 % to measure
+        flags |= BDW_RISE_UNRESOLVED | BDW_FALL_UNRESOLVED
+    rise = fall = float("nan")
+    if not ef & BDW_TRUNC_START:
+        c0 = int(_m.floor(t0))
+        lim = max(0, c0 - R2)
+        t10 = cross(min(c0 + 1, n - 1), lim, l10)
+        t90 = cross(max(c0, 0), min(n - 1, s1), l90)
+        if t10 is not None and t90 is not None:
+            rise = (t90 - t10) / fs
+        if 0.01 * (P - N) < 3.0 * noise_sd or not rise > (2.0 * Wr / fs):
+            flags |= BDW_RISE_UNRESOLVED
+    else:
+        flags |= BDW_RISE_UNRESOLVED
+    if not ef & BDW_TRUNC_END:
+        c1 = int(_m.ceil(t1))
+        lim = min(n - 1, c1 + R2)
+        t10 = cross(max(c1 - 1, 0), lim, l10)
+        t90 = cross(min(c1, n - 1), max(0, s0), l90)
+        if t10 is not None and t90 is not None:
+            fall = (t10 - t90) / fs
+        if 0.01 * (P - N) < 3.0 * noise_sd or not fall > (2.0 * Wr / fs):
+            flags |= BDW_FALL_UNRESOLVED
+    else:
+        flags |= BDW_FALL_UNRESOLVED
+    # the spectrum of the burst: [s0, s1] widened by half a segment each side,
+    # so the burst's whole length sits under the overlapped Hann windows'
+    # flat sum (the noise outside it is subtracted with the rest)
+    nb_len = s1 - s0 + 1
+    nf = int(nfft) if nfft else _bdw_auto_nfft(nb_len)
+    if nf < 16 or nf & (nf - 1) or nf > 65536:
+        nf = _bdw_auto_nfft(nb_len)
+    A_, B_ = max(0, s0 - nf // 2), min(n, s1 + 1 + nf // 2)
+    if B_ - A_ < nf:
+        nf = 16
+        while nf * 2 <= B_ - A_:
+            nf *= 2
+        if B_ - A_ < 16:
+            raise LookupError("burst_measure: the burst is too short to measure")
+    psd, nseg, u = _bdw_welch(x[A_:B_].astype(np.complex128), nf)
+    nbin = N * u
+    D = psd - nbin
+    ob = _bdw_obw(D, fs, nf)
+    if ob is None:
+        raise LookupError("burst_measure: no power above the noise in the burst")
+    f_lo, f_hi, k_lo, k_hi = ob
+    df = fs / nf
+    sw = sf = 0.0
+    for k in range(k_lo, k_hi + 1):
+        sw += D[k]
+        sf += (k - nf // 2) * df * D[k]
+    fc = sf / sw if sw > 0.0 else 0.5 * (f_lo + f_hi)
+    dmax = float(np.max(D))
+    line = dmax * 10.0 ** (-2.6)
+    if nbin * (1.0 + 3.0 / _m.sqrt(nseg)) > line:
+        flags |= BDW_BW26_FLOOR
+        bw26 = float("nan")
+    else:
+        ka = next(k for k in range(nf) if D[k] >= line)
+        kb = next(k for k in range(nf - 1, -1, -1) if D[k] >= line)
+        bw26 = (kb - ka + 1) * df
+    # drift: the centroid of each segment's spectrum inside the occupied band
+    c0, c1 = s0 + Wr, s1 - Wr + 1
+    if c1 - c0 < 16:
+        c0, c1 = s0, s1 + 1
+    nsegd = min(8, (c1 - c0) // 64)
+    drift = float("nan")
+    if nsegd >= 3:
+        step = (c1 - c0) // nsegd          # segments spread over the whole burst,
+        Ls = min(step, 32768)              # each at most 32768 samples long
+        nf2 = 16
+        while nf2 < 2 * Ls and nf2 < 65536:
+            nf2 *= 2
+        ws = _bdw_hann(Ls)
+        us = float(np.sum(ws * ws))
+        dres = fs / Ls
+        flo, fhi = f_lo - 2.0 * dres, f_hi + 2.0 * dres
+        ts, fcs = [], []
+        for sg in range(nsegd):
+            a = c0 + sg * step + (step - Ls) // 2
+            buf = np.zeros(nf2, np.complex128)
+            buf[:Ls] = x[a:a + Ls].astype(np.complex128) * ws
+            X = np.fft.fftshift(np.fft.fft(buf))
+            Pk = X.real * X.real + X.imag * X.imag
+            sw = sf = 0.0
+            for k in range(nf2):
+                fk = (k - nf2 // 2) * (fs / nf2)
+                if flo <= fk <= fhi:
+                    d = Pk[k] - N * us
+                    sw += d
+                    sf += fk * d
+            if sw > 0.0:
+                ts.append((a + 0.5 * Ls - c0) / fs)
+                fcs.append(sf / sw)
+        if len(ts) >= 3:
+            mt = _seq_mean(ts)
+            mf = _seq_mean(fcs)
+            sxy = sxx = 0.0
+            for t_, f_ in zip(ts, fcs):
+                sxy += (t_ - mt) * (f_ - mf)
+                sxx += (t_ - mt) * (t_ - mt)
+            drift = sxy / sxx if sxx > 0.0 else float("nan")
+    if not drift == drift:
+        flags |= BDW_SHORT
+
+    def db(v):
+        return float(np.float32(10.0 * _m.log10(v))) if v > 0.0 else float("-inf")
+    return dict(t0=t0, t1=t1, duration_s=(t1 - t0) / fs, fc_hz=fc, drift_hz_s=drift,
+                obw99_hz=f_hi - f_lo, bw26_hz=bw26, rise_s=rise, fall_s=fall,
+                peak_dbfs=db(pk), mean_dbfs=db(mean_p),
+                noise_dbfs=db(N) if not flags & BDW_NO_NOISE else float("nan"),
+                snr_db=float(np.float32(snr)) if not flags & BDW_NO_NOISE else float("nan"),
+                mod_hint=0, flags=flags, nfft=nf, window=W)
+
+
+# ---- §21 the ring ------------------------------------------------------------------
+RING_MAX_CONSUMERS = 16
+RING_HEADER_BYTES = 256
+RING_CONSUMER_BYTES = 64
+RING_SLOT_HEADER = 64
+RING_META_KEYS = ("seq", "first_sample", "t_utc_ns", "fc_hz", "fs_hz", "gain_db", "format",
+                  "flags", "nbytes")
+RING_RETUNE = 1          # meta flags: the block follows a retune
+RING_OVERFLOW = 2        # the device reported lost samples before this block
+RING_CAL = 4             # calibration state changed
+
+
+def _r64(v):
+    return (int(v) + 63) // 64 * 64
+
+
+def ring_bytes(block_bytes: int, nblocks: int, max_consumers: int) -> int:
+    """Bytes of caller memory a ring needs; 0 for an impossible shape."""
+    if block_bytes < 1 or nblocks < 2 or not 1 <= max_consumers <= RING_MAX_CONSUMERS:
+        return 0
+    return (RING_HEADER_BYTES + RING_CONSUMER_BYTES * max_consumers
+            + nblocks * (RING_SLOT_HEADER + _r64(block_bytes)))
+
+
+class Ring:
+    """Twin of atkdsp_ring (atkdsp.h §21): the same semantics in one process
+    — one producer that never waits, up to 16 consumers each with its own
+    cursor, a seqlock per block (lock = 2 seq + 1 while seq is written, 2 seq
+    + 2 once committed), lost counts exact to the block. Cross-process
+    attach is native only (a declared exception: shared memory between
+    processes has no numpy meaning)."""
+
+    def __init__(self, block_bytes: int, nblocks: int, max_consumers: int = 4):
+        if not ring_bytes(block_bytes, nblocks, max_consumers):
+            raise ValueError("ring: block_bytes >= 1, nblocks >= 2, max_consumers 1..16")
+        self.block_bytes = _r64(block_bytes)
+        self.nblocks = int(nblocks)
+        self.max_consumers = int(max_consumers)
+        self.data = np.zeros((self.nblocks, self.block_bytes), np.uint8)
+        self.lock = [0] * self.nblocks
+        self.meta = [None] * self.nblocks
+        self.write_seq = 0
+        self.claimed = False
+        self.torn = 0
+        self.cons = [None] * self.max_consumers
+
+    # -- producer -------------------------------------------------------------
+    def claim(self) -> np.ndarray:
+        s = self.write_seq
+        i = s % self.nblocks
+        self.lock[i] = 2 * s + 1
+        self.claimed = True
+        return self.data[i]
+
+    def commit(self, nbytes: int, **meta) -> int:
+        if not self.claimed or not 1 <= int(nbytes) <= self.block_bytes:
+            raise ValueError("ring_commit: claim first; 1 <= nbytes <= block_bytes")
+        s = self.write_seq
+        i = s % self.nblocks
+        m = {k: 0 for k in RING_META_KEYS}
+        for k, v in meta.items():
+            if k not in m or k in ("seq", "nbytes"):
+                raise ValueError(f"unknown ring meta {k!r}")
+            m[k] = v
+        m["seq"], m["nbytes"] = s, int(nbytes)
+        for k in ("fc_hz", "fs_hz", "gain_db"):
+            m[k] = float(m[k])
+        self.meta[i] = m
+        self.lock[i] = 2 * s + 2
+        self.write_seq = s + 1
+        self.claimed = False
+        return 0
+
+    def write(self, data, **meta) -> int:
+        b = np.frombuffer(bytes(data), np.uint8)
+        if b.size > self.block_bytes:
+            raise ValueError("ring_write: more than one block")
+        blk = self.claim()
+        blk[:b.size] = b
+        return self.commit(b.size, **meta)
+
+    # -- consumers ------------------------------------------------------------
+    def _oldest(self, w):
+        return w - self.nblocks if w > self.nblocks else 0
+
+    def open(self, from_oldest: bool = False) -> int:
+        for i in range(self.max_consumers):
+            if self.cons[i] is None:
+                w = self.write_seq
+                self.cons[i] = dict(cursor=self._oldest(w) if from_oldest else w, lost=0,
+                                    nread=0, peek=-1)
+                return i
+        raise IndexError("ring_open: no consumer slot free")
+
+    def close(self, cid: int) -> None:
+        self.cons[cid] = None
+
+    close_consumer = close          # the binding's name for it
+
+    def _next(self, c):
+        """Advance c's cursor past what is gone; (seq, slot, lost) of the next
+        readable block, or None (nothing new)."""
+        lost = 0
+        while True:
+            s, w = c["cursor"], self.write_seq
+            if s >= w:
+                return None, lost
+            if w - s > self.nblocks:
+                lost += w - self.nblocks - s
+                s = c["cursor"] = w - self.nblocks
+            i = s % self.nblocks
+            v = self.lock[i]
+            if v != 2 * s + 2:
+                if v > 2 * s + 2:          # lapped (or being rewritten): it is gone
+                    lost += 1
+                    c["cursor"] = s + 1
+                    continue
+                return None, lost
+            return (s, i), lost
+
+    def read(self, cid: int, cap: int | None = None):
+        """(bytes, meta, lost) of the next block, or (None, None, lost) when
+        nothing new. A cap below the block's size raises without consuming."""
+        c = self.cons[cid]
+        nxt, lost = self._next(c)
+        c["lost"] += lost
+        if nxt is None:
+            return None, None, lost
+        s, i = nxt
+        m = dict(self.meta[i])
+        if cap is not None and m["nbytes"] > cap:
+            raise OverflowError("ring_read: cap below the block's size")
+        out = self.data[i, :m["nbytes"]].copy()
+        c["cursor"] = s + 1
+        c["nread"] += 1
+        return out, m, lost
+
+    def peek(self, cid: int):
+        """Zero-copy: (view, meta, lost); release() says whether it held."""
+        c = self.cons[cid]
+        nxt, lost = self._next(c)
+        c["lost"] += lost
+        if nxt is None:
+            return None, None, lost
+        s, i = nxt
+        c["peek"] = s
+        return self.data[i, :self.meta[i]["nbytes"]], dict(self.meta[i]), lost
+
+    def release(self, cid: int) -> int:
+        c = self.cons[cid]
+        s = c["peek"]
+        if s < 0:
+            raise ValueError("ring_release: nothing peeked")
+        c["peek"] = -1
+        c["cursor"] = s + 1
+        if self.lock[s % self.nblocks] == 2 * s + 2:
+            c["nread"] += 1
+            return 0
+        c["lost"] += 1
+        self.torn += 1
+        return -6
+
+    def copy_range(self, seq0: int, seq1: int, cap: int | None = None, mcap: int | None = None):
+        """Blocks seq0 <= seq < seq1 still in the ring, packed: (bytes, metas)."""
+        w = self.write_seq
+        parts, metas, used = [], [], 0
+        for s in range(max(int(seq0), self._oldest(w)), min(int(seq1), w)):
+            i = s % self.nblocks
+            if self.lock[i] != 2 * s + 2:
+                continue
+            m = self.meta[i]
+            if (cap is not None and used + m["nbytes"] > cap) or \
+                    (mcap is not None and len(metas) >= mcap):
+                break
+            parts.append(self.data[i, :m["nbytes"]].copy())
+            metas.append(dict(m))
+            used += m["nbytes"]
+        return (np.concatenate(parts) if parts else np.zeros(0, np.uint8)), metas
+
+    def stats(self) -> dict:
+        w = self.write_seq
+        return dict(committed=w, oldest=self._oldest(w), block_bytes=self.block_bytes,
+                    nblocks=self.nblocks, max_consumers=self.max_consumers,
+                    active=sum(c is not None for c in self.cons), torn=self.torn,
+                    lost=[c["lost"] if c else 0 for c in self.cons],
+                    read=[c["nread"] if c else 0 for c in self.cons],
+                    lag=[w - c["cursor"] if c else 0 for c in self.cons])
+
+    def describe(self) -> str:
+        return ring_describe(self.stats())
+
+
+def ring_describe(st) -> str:
+    total = st["nblocks"] * st["block_bytes"]
+    return (f"ring: {st['nblocks']} blocks x {st['block_bytes']} bytes "
+            f"({total / 1048576.0:.1f} MiB of data), {st['active']} of "
+            f"{st['max_consumers']} consumers, {st['committed']} committed, "
+            f"{st['torn']} torn reads")

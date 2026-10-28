@@ -22,6 +22,7 @@ set(ATKDSP_SOURCES
   src/lte_sib1_phy.c src/lte_si.c src/fsk.c src/dmr_sync.c
   src/stat.c src/bits.c src/scramble.c src/fec_conv.c src/fec_rs.c src/fec_blk.c
   src/crc.c src/crc_recover.c src/gf2.c src/coderec.c
+  src/cfar.c src/burst.c src/ring.c
   vendor/pocketfft/pocketfft.c)
 
 add_library(atkdsp SHARED ${ATKDSP_SOURCES})
@@ -70,8 +71,18 @@ if(ATKDSP_TESTS)
   endif()
   set_target_properties(atkdsp_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+  # the ring's stress test and Bill's bench (tests/test_ring_stress.c)
+  find_package(Threads)
+  add_executable(atkdsp_ring_stress tests/test_ring_stress.c)
+  target_link_libraries(atkdsp_ring_stress PRIVATE atkdsp ${CMAKE_THREAD_LIBS_INIT})
+  if(NOT MSVC)
+    target_compile_definitions(atkdsp_ring_stress PRIVATE _POSIX_C_SOURCE=200112L)
+  endif()
+  set_target_properties(atkdsp_ring_stress PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
   enable_testing()
   add_test(NAME smoke COMMAND atkdsp_smoke)
+  add_test(NAME ring_stress COMMAND atkdsp_ring_stress 1)
 endif()
 
 install(TARGETS atkdsp DESTINATION bin)

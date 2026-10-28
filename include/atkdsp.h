@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 16
-#define ATKDSP_VERSION_STRING "0.15.0"
+#define ATKDSP_ABI_VERSION 17
+#define ATKDSP_VERSION_STRING "0.16.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -96,6 +96,12 @@ extern "C" {
 /* 15 -> 16: naming the code (§18; docs/ATKDSP_PLAN.md §D4, phase 1b) — the
  * rank-deficiency heat map, block / convolutional / Reed-Solomon / block
  * interleaver recognition, each with a robust (noisy-stream) search. */
+/* 16 -> 17: the detection track (§19-21; docs/ATKDSP_PLAN.md §B1, §B2, §A3,
+ * phase 2) — CFAR (CA / OS / GO / SO, threshold solved for K-look gamma
+ * cells) with the burst tracker; the burst descriptor word; the ring buffer
+ * in caller memory (one producer, up to 16 consumers, a seqlock per block,
+ * attachable from another process). ATKDSP_E_OVERRUN (-6) and
+ * ATKDSP_E_EMPTY (-7) are new. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -104,6 +110,8 @@ extern "C" {
 #define ATKDSP_E_CAP        -3   /* caller's output buffer too small         */
 #define ATKDSP_E_FFT        -4   /* the FFT backend reported failure         */
 #define ATKDSP_E_DECODE     -5   /* a decoder found the word uncorrectable   */
+#define ATKDSP_E_OVERRUN    -6   /* a ring reader was lapped: the data is gone */
+#define ATKDSP_E_EMPTY      -7   /* nothing there to return or to measure     */
 
 /* ---- types ------------------------------------------------------------- */
 typedef struct { float re, im; } atkdsp_cf32;
@@ -1616,6 +1624,356 @@ typedef struct {
 } atkdsp_ilvid;               /* 32 bytes */
 ATKDSP_API int atkdsp_interleaver_id(const uint8_t *b, size_t n, int n_lo, int n_hi,
                                      double pfa, uint64_t seed, atkdsp_ilvid *out);
+
+/* ==== THE DETECTION TRACK (v0.16.0, ABI 17) ===============================
+ * docs/ATKDSP_PLAN.md §B1, §B2, §A3. Sections 19-21: CFAR and the burst
+ * tracker, the burst descriptor word, the ring. Twins in reference.py §19-21.
+ */
+
+/* ---- 19. CFAR and the burst tracker (§B1) --------------------------------
+ * A 1-D CFAR across frequency on each spectrum frame, and a tracker across
+ * frames that turns hit bins into one record per burst (OPEN, UPDATE,
+ * CLOSE) — the detector cued DF, Bug Sniffer and Drone Discovery wait on.
+ *
+ * INPUT. Frames are power spectra in dB, nbins per frame, row-major, AVERAGE
+ * power per bin: a periodogram (looks = 1) or an average of several
+ * (looks = the effective number averaged). A max-hold frame is not gamma
+ * distributed and breaks the false-alarm rate: feed the AVERAGE line
+ * (atkdsp_spectrum_reduce with the avg detector, or atkdsp_spectrum_stats'
+ * average, which comes in the same pass as a display's max-hold), with
+ * looks = the FFT frames averaged into it. Values below -300 dB are read as -300. A NaN bin never hits, and
+ * a NaN among a bin's reference cells makes its statistic NaN in every mode,
+ * so that bin is not hit either: mask NaN bins.
+ *
+ * THE TEST. k_frames frames are averaged (linear power, a sliding window),
+ * so a cell's noise is gamma with K = looks x k_frames looks. Each bin's
+ * reference is N = 2 n_ref cells, n_ref each side beyond n_guard guard cells
+ * (siga.detect.cfar's `train` and `guard`). Masked bins are never tested and
+ * never used as reference; the window walks past them. At a band edge (or
+ * past a mask) a side that runs short borrows the shortfall from the other
+ * side, so N stays N and the false-alarm rate holds there too — a bin that
+ * cannot gather N cells is untestable. The statistic T:
+ *   CA  the mean of the N cells (the default);
+ *   OS  the os_k-th smallest (crowded bands: a neighbour does not raise it;
+ *       os_k 0 = ceil(3N/4));
+ *   GO  the greater of the two side means (clutter edges: fewer false alarms);
+ *   SO  the smaller (closely spaced targets). A GO/SO bin whose window had to
+ *       borrow falls back to CA, with CA's alpha.
+ * A cell hits when its average > alpha x T. THE THRESHOLD IS DERIVED:
+ *   Pfa(alpha) = integral Q(K, K alpha t) f_T(t) dt
+ * with f_T the density of T for unit-mean K-look gamma cells (gamma for CA,
+ * the max / min of two gammas for GO / SO, the order statistic for OS),
+ * integrated by Simpson's rule in ln t over the range outside which each
+ * tail holds less than 1e-9 x Pfa, and solved for alpha by regula falsi
+ * (Illinois) in ln alpha. K = 1 reproduces the closed forms to 1e-9:
+ * CA alpha = N (Pfa^(-1/N) - 1); OS Pfa = prod_{i<k} (N-i)/(N-i+alpha); GO and
+ * SO Gandhi & Kassam (1988). Pfa is per cell per frame; with k_frames > 1
+ * successive frames share cells, so hits are correlated in time (the rate
+ * per frame is still Pfa). atkdsp_cfar_alpha exposes the solver.
+ *
+ * THE TRACKER. Hit bins closer than merge_gap non-hit bins form one blob
+ * (min_bins wide or more). A blob joins the track whose last span it
+ * overlaps most, within merge_gap + 1 bins (ties: the older track); a track
+ * may take several blobs (a signal breaking up); a blob near no track
+ * starts a pending one (beyond max_tracks it is dropped and counted). A
+ * pending track OPENs after open_m hit frames in the last open_n, and is
+ * forgotten if it has none; an open track CLOSEs after close_k frames in a
+ * row without a hit, and reports UPDATE when its span grows. One event per
+ * track per frame at most, so atkdsp_cfar_events_max = nframes x max_tracks.
+ *   t0  the start of its first hit frame. With k_frames > 1 the average
+ *       lags the burst, so the k raw frames up to the first hit are tested
+ *       on their own (the band's raw power against its noise, a single-frame
+ *       gamma test at CFAR_EDGE_PFA = 1e-3 for the band's width) and t0 is
+ *       the start of the earliest that passes; if none does, t0 is the
+ *       midpoint of that window and T0_COARSE is set.
+ *   t1  the end of its last hit frame; with k_frames > 1 the end of the last
+ *       frame whose raw band passed the same test, if it is within k - 1
+ *       frames of the last hit (else the midpoint, and T1_COARSE). A frame
+ *       spans [frame_t0 + j dt, frame_t0 + (j+1) dt).
+ *   fc_bin   the excess-weighted centroid over the track's life (fractional
+ *            bin; the caller knows Hz per bin and where bin 0 sits).
+ *   lo/hi    the union of its spans; level_db the peak averaged bin power,
+ *            noise_db the noise estimate there (T / E[T], unbiased in
+ *            homogeneous noise), snr_db their difference, band_snr_db the
+ *            best frame's sum over the hit bins against their noise.
+ *   flags    T0_COARSE, T1_COARSE; EDGE (a bin of the span used a borrowed
+ *            window); MASK_ADJ (a masked bin within merge_gap + 1); FLUSHED
+ *            (closed by atkdsp_cfar_flush).
+ *
+ * The plan's create(nbins, mode, n_ref, ...) became a config struct:
+ * thirteen parameters, and the next one does not reorder a call. */
+#define ATKDSP_CFAR_CA 0
+#define ATKDSP_CFAR_OS 1
+#define ATKDSP_CFAR_GO 2
+#define ATKDSP_CFAR_SO 3
+#define ATKDSP_CFAR_OPEN   1
+#define ATKDSP_CFAR_UPDATE 2
+#define ATKDSP_CFAR_CLOSE  3
+#define ATKDSP_CFAR_T0_COARSE 1u
+#define ATKDSP_CFAR_T1_COARSE 2u
+#define ATKDSP_CFAR_EDGE      4u
+#define ATKDSP_CFAR_MASK_ADJ  8u
+#define ATKDSP_CFAR_FLUSHED  16u
+#define ATKDSP_CFAR_EDGE_PFA 1e-3
+
+typedef struct {
+    int32_t mode;        /* ATKDSP_CFAR_CA (default) / OS / GO / SO          */
+    int32_t n_ref;       /* reference cells EACH side, 1..256 (16)           */
+    int32_t n_guard;     /* guard cells each side, 0..256 (4)                */
+    int32_t k_frames;    /* frames averaged before testing, 1..64 (1)        */
+    double  pfa;         /* per cell per frame, 1e-15..0.5 (1e-6)            */
+    double  looks;       /* periodograms averaged into one frame, 0.25..1e4 (1) */
+    int32_t os_k;        /* OS rank 1..2 n_ref; 0 = ceil(3N/4)                */
+    int32_t open_m;      /* open after open_m hit frames ... (2)             */
+    int32_t open_n;      /* ... in the last open_n, 1..64 (3)                */
+    int32_t close_k;     /* close after close_k misses in a row, 1..1000 (3) */
+    int32_t merge_gap;   /* non-hit bins inside one detection (1)            */
+    int32_t min_bins;    /* narrower blobs ignored (1)                       */
+    int32_t max_tracks;  /* pending + open at once, 1..65536 (256)           */
+    int32_t reserved[3];
+} atkdsp_cfar_config;    /* 72 bytes */
+
+typedef struct {
+    double   t0, t1;     /* seconds; t1 NaN until CLOSE                      */
+    double   fc_bin;     /* excess-weighted centroid, fractional bin         */
+    int32_t  type;       /* OPEN / UPDATE / CLOSE                            */
+    uint32_t id;         /* unique per handle (from 1)                       */
+    uint32_t flags;
+    int32_t  lo_bin, hi_bin;
+    int32_t  n_hits;     /* frames with a hit                                */
+    float    level_db, noise_db, snr_db, band_snr_db;
+} atkdsp_cfar_event;     /* 64 bytes */
+
+typedef struct {
+    uint64_t frames, warmup;      /* taken; before k_frames had arrived     */
+    uint64_t cells_tested, cell_hits, untestable;
+    uint64_t opened, closed, updates;
+    uint64_t dropped;             /* blobs refused at max_tracks             */
+    uint64_t resets;
+    uint64_t tracks;              /* pending + open now                      */
+} atkdsp_cfar_counters;           /* 88 bytes */
+
+typedef struct atkdsp_cfar atkdsp_cfar;
+ATKDSP_API void         atkdsp_cfar_defaults(atkdsp_cfar_config *cfg);
+/* The solver alone: alpha for (mode, n_ref, pfa) with `looks` total looks
+ * (K) and the OS rank; *et (may be NULL) = E[T] in units of the noise mean. */
+ATKDSP_API int          atkdsp_cfar_alpha(int mode, int n_ref, double pfa, double looks,
+                                          int os_k, double *alpha, double *et);
+/* NULL on an invalid configuration (the binding prints the ranges above). */
+ATKDSP_API atkdsp_cfar *atkdsp_cfar_create(size_t nbins, const atkdsp_cfar_config *cfg);
+ATKDSP_API void         atkdsp_cfar_destroy(atkdsp_cfar *c);
+/* Forget the frames and the tracks (a retune); the mask stays. */
+ATKDSP_API void         atkdsp_cfar_reset(atkdsp_cfar *c);
+/* nbins bytes, nonzero = masked (known emitters, operator mutes); NULL
+ * clears. Rebuilds the reference windows; open tracks carry on. */
+ATKDSP_API int          atkdsp_cfar_set_mask(atkdsp_cfar *c, const uint8_t *mask);
+ATKDSP_API size_t       atkdsp_cfar_events_max(const atkdsp_cfar *c, size_t nframes);
+/* cap below events_max(nframes) is refused before anything is consumed. */
+ATKDSP_API ptrdiff_t    atkdsp_cfar_process(atkdsp_cfar *c, const float *frames_db,
+                                            size_t nframes, double frame_t0,
+                                            double frame_dt, atkdsp_cfar_event *ev,
+                                            size_t cap);
+/* CLOSE every open track now (FLUSHED), forget the pending ones; the stream
+ * may continue. cap >= max_tracks always suffices. */
+ATKDSP_API ptrdiff_t    atkdsp_cfar_flush(atkdsp_cfar *c, atkdsp_cfar_event *ev, size_t cap);
+/* The last tested frame: averaged power and threshold (dB; NaN where not
+ * tested) and the hit mask, nbins each; any may be NULL. ATKDSP_E_EMPTY
+ * before the first tested frame. For drawing the threshold on a display. */
+ATKDSP_API int          atkdsp_cfar_last(const atkdsp_cfar *c, float *avg_db, float *thr_db,
+                                         uint8_t *hits);
+/* alpha, CA's alpha (GO / SO edge fallback), E[T], and the configuration as
+ * resolved (os_k filled in). Any may be NULL. */
+ATKDSP_API int          atkdsp_cfar_info(const atkdsp_cfar *c, double *alpha, double *alpha_ca,
+                                         double *et, atkdsp_cfar_config *cfg);
+/* "CFAR CA: 16+16 reference cells, 4 guard each side, Pfa 1e-06 per cell per
+ * frame, K = 1 look(s) x 1 frame(s), alpha 17.28 (12.37 dB); open 2 of 3,
+ * close after 3 misses, merge gap 1, min 1 bin(s); 4096 bins, 0 masked,
+ * tracks 0/256" */
+ATKDSP_API int          atkdsp_cfar_describe(const atkdsp_cfar *c, char *buf, size_t cap);
+ATKDSP_API int          atkdsp_cfar_stats(const atkdsp_cfar *c, atkdsp_cfar_counters *st);
+
+/* ---- 20. The burst descriptor word (§B2) ---------------------------------
+ * Radar has the PDW; this is the comms equivalent — one record per burst,
+ * measured on channelised I/Q (centred near 0 Hz, a few times the burst's
+ * bandwidth) around a coarse [i0, i1) such as the CFAR's t0 / t1 converted
+ * to samples. The buffer should hold noise on at least one side: the noise
+ * level N comes from outside [i0, i1) — beyond a guard of (i1 - i0)/8 + 8
+ * samples when the buffer has 32 or more there, else from all of what lies
+ * outside (and if that is within 1 dB of the plateau it is the burst itself)
+ * — and is re-measured outside the burst once its edges are found; with no
+ * noise to be had, NO_NOISE (the levels that need N are NaN).
+ * Truncated means the edge step is AT the buffer's end (TRUNC_START /
+ * TRUNC_END), not that the smoothed core reaches it.
+ *
+ *   t0, t1   the burst's edges as sample POSITIONS in the buffer: a burst
+ *            whose first sample is s and last e has t0 = s - 0.5 and t1 =
+ *            e + 0.5 (the boundaries between samples). Found by a
+ *            least-squares step between the noise level N and the plateau
+ *            P around each end of the burst's core (the run where the power,
+ *            smoothed over `window` samples, holds above a quarter of the
+ *            way from N to P), at a level that depends on the envelope:
+ *              - a constant envelope (FM, FSK, a carrier): the half-power
+ *                crossing, N + (P - N)/2 (or thresh_db below P when
+ *                thresh_db > 0 is given);
+ *              - a Gaussian-like one (OFDM, spread spectrum; flag GAUSSIAN,
+ *                from the burst's own power fluctuation with the noise's
+ *                share removed, > 0.5): the likelihood boundary
+ *                ln(P/N) N P / (P - N), because such a signal fades through
+ *                its half-power level on its own.
+ *            Measured (tests/test_detection.py): a hard-keyed constant-
+ *            envelope burst within 2 samples at 10 dB SNR (at the channel
+ *            rate, noise in the whole channel), 0 at 20-30 dB; a Gaussian-
+ *            like burst 10 kHz wide at 100 kS/s within ~20 samples at 10 dB,
+ *            ~7 at 20 dB, 2 at 30 dB (its own fades set that); on a slow
+ *            ramp the edge is the ramp's half-power point.
+ *   fc_hz    the power centroid of the burst's spectrum inside its 99 %
+ *            band, relative to 0 Hz of the buffer.
+ *   obw99_hz the 99 % occupied bandwidth: the noise-subtracted Welch
+ *            spectrum (Hann, nfft, hop nfft/2, the burst widened by nfft/2
+ *            each side so its whole length is under the windows' flat sum;
+ *            nfft 0 = the largest power of two <= burst/8 in 16..4096), its
+ *            residual left SIGNED so the noise cancels, edges where the
+ *            power summed from each end reaches 0.5 %, interpolated in the
+ *            bin. Within a bin at 10-30 dB.
+ *   bw26_hz  bins within 26 dB of the peak, outermost to outermost; NaN and
+ *            BW26_FLOOR when the noise floor (+3 sigma of the average) is
+ *            above that line.
+ *   drift_hz_s  a line through the centroids of 3-8 segments spread over
+ *            the burst (each 64 to 32768 samples); NaN and SHORT below that. Within
+ *            5 % for a carrier at 10-30 dB; on FSK the symbol mix moves each
+ *            segment's centroid, so it is coarser (~10 % in the tests).
+ *   rise_s, fall_s  10 % to 90 % of the amplitude above the noise, on the
+ *            power smoothed over Wr = fs / bandwidth samples (<= 63);
+ *            RISE_UNRESOLVED / FALL_UNRESOLVED when the 10 % level is
+ *            inside 3 sigma of the smoothed noise, when the result is under
+ *            2 Wr (smoothing-limited), when a truncated end has none, and
+ *            always for a GAUSSIAN burst.
+ *   peak_dbfs, mean_dbfs  10 log10 of the peak and mean |x|^2 over
+ *            [t0, t1] (0 dBFS = a full-scale complex sinusoid, |x| = 1);
+ *            noise_dbfs = N; snr_db = (P - N) / N; LOW_SNR below 6 dB.
+ *   mod_hint 0: unknown. The §B4 probes will fill it.
+ * A one-shot analysis call (it allocates scratch for the call).
+ * ATKDSP_E_EMPTY when there is no burst at [i0, i1) (no power above the
+ * noise there). */
+#define ATKDSP_BDW_TRUNC_START       1u   /* the burst began before the buffer */
+#define ATKDSP_BDW_TRUNC_END         2u
+#define ATKDSP_BDW_NO_NOISE          4u
+#define ATKDSP_BDW_LOW_SNR           8u
+#define ATKDSP_BDW_RISE_UNRESOLVED  16u
+#define ATKDSP_BDW_FALL_UNRESOLVED  32u
+#define ATKDSP_BDW_BW26_FLOOR       64u
+#define ATKDSP_BDW_SHORT           128u
+#define ATKDSP_BDW_GAUSSIAN        256u
+#define ATKDSP_BDW_HALF_POWER_DB   3.0102999566398120
+
+typedef struct {
+    double   t0, t1;          /* sample positions of the edges (s - 0.5, e + 0.5) */
+    double   duration_s;
+    double   fc_hz, drift_hz_s;
+    double   obw99_hz, bw26_hz;
+    double   rise_s, fall_s;
+    double   reserved_d;
+    float    peak_dbfs, mean_dbfs, noise_dbfs, snr_db;
+    int32_t  mod_hint;
+    uint32_t flags;
+    int32_t  nfft;            /* the spectrum's segment length                 */
+    int32_t  window;          /* the core smoothing, samples                   */
+} atkdsp_bdw;                 /* 112 bytes */
+
+/* thresh_db 0 = the edge rule above; > 0 = that many dB below the plateau
+ * for every envelope. nfft 0 = automatic. */
+ATKDSP_API int atkdsp_burst_measure(const atkdsp_cf32 *iq, size_t n, double fs,
+                                    size_t i0_coarse, size_t i1_coarse, float thresh_db,
+                                    int nfft, atkdsp_bdw *out);
+
+/* ---- 21. The ring (§A3) ----------------------------------------------------
+ * A block ring that lives in CALLER memory — a private buffer inside ATK, or
+ * a named shared-memory mapping a program in another process attaches to
+ * (atkpr's processor, the next native consumer). The §RF-F2 block ring and
+ * the §RF-F9 DVR. The library allocates nothing and starts no thread.
+ *   - ONE producer, up to 16 consumers, each with its own cursor.
+ *   - THE PRODUCER NEVER WAITS (an SDR cannot): claim() hands it the next
+ *     block to fill in place, commit() publishes it with its header. A slow
+ *     consumer is lapped and told exactly how many blocks it lost.
+ *   - Fixed-size blocks (block_bytes, rounded up to 64), each with an
+ *     atkdsp_ring_meta: seq (set by commit), the global index of its first
+ *     sample, UTC ns, centre and sample rate, gain, the sample format, flags
+ *     (RETUNE, OVERFLOW, CAL — so a DVR cut never spans a retune without
+ *     saying so) and nbytes (<= block_bytes).
+ *   - A SEQLOCK per block: the lock word is 2 seq + 1 while seq is written
+ *     and 2 seq + 2 once committed; a reader checks it before and after its
+ *     copy, so a torn block is never returned — it is counted (torn) and
+ *     reported lost.
+ *   - read() copies; peek() / release() is zero-copy: peek returns a pointer
+ *     into the ring, and release says whether the block survived the use
+ *     (ATKDSP_E_OVERRUN: it was overwritten — discard what you computed).
+ *   - copy_range(seq0, seq1) cuts a past span for the DVR (Export pre-D
+ *     I/Q, DF the selection): whole blocks still in the ring, packed, with
+ *     their headers; it returns the number copied and stops at cap / mcap.
+ *   - 64-bit sequence numbers; the size is bounded by memory alone. 40 MSPS
+ *     of ci16 is 160 MB/s, so 30 s of DVR is 4.8 GB: ATK's Setup states the
+ *     RAM before it allocates.
+ * The memory must be 8-byte aligned (64 is better) and atkdsp_ring_bytes()
+ * long. init() formats it; attach() validates a ring another process made
+ * (NULL if the magic, the version or the sizes are wrong). Producer calls
+ * come from one thread; each consumer id from one thread at a time.
+ * Layout: docs in src/ring.c (fixed offsets, so any language can read it). */
+#define ATKDSP_RING_MAX_CONSUMERS 16
+#define ATKDSP_RING_RETUNE   1u     /* meta flags: the first block after a retune */
+#define ATKDSP_RING_OVERFLOW 2u     /* the device dropped samples before it        */
+#define ATKDSP_RING_CAL      4u     /* the calibration state changed               */
+
+typedef struct {
+    uint64_t seq, first_sample;
+    int64_t  t_utc_ns;
+    double   fc_hz, fs_hz;
+    float    gain_db;
+    int32_t  format;               /* the caller's code (ATK: atkdsp.FMT)         */
+    uint32_t flags, nbytes;
+} atkdsp_ring_meta;                /* 56 bytes */
+
+typedef struct {
+    uint64_t committed, oldest;    /* blocks [oldest, committed) are held          */
+    uint64_t block_bytes, nblocks, total_bytes;
+    uint64_t torn;                 /* reads that caught a block being overwritten  */
+    uint32_t max_consumers, active, active_mask, reserved;
+    uint64_t lost[ATKDSP_RING_MAX_CONSUMERS];  /* per consumer id                   */
+    uint64_t read[ATKDSP_RING_MAX_CONSUMERS];
+    uint64_t lag[ATKDSP_RING_MAX_CONSUMERS];   /* committed - cursor               */
+} atkdsp_ring_counters;            /* 448 bytes */
+
+typedef struct atkdsp_ring atkdsp_ring;
+/* Bytes of memory a ring needs (0: block_bytes >= 1, nblocks >= 2,
+ * max_consumers 1..16). */
+ATKDSP_API size_t       atkdsp_ring_bytes(size_t block_bytes, size_t nblocks, int max_consumers);
+ATKDSP_API atkdsp_ring *atkdsp_ring_init(void *mem, size_t mem_bytes, size_t block_bytes,
+                                         size_t nblocks, int max_consumers);
+ATKDSP_API atkdsp_ring *atkdsp_ring_attach(void *mem, size_t mem_bytes);
+/* Producer: the next block to fill (block_bytes writable), then commit it.
+ * commit sets meta.seq; nbytes 0 or above block_bytes, or no claim, is E_ARG
+ * (so read's 0 always means "nothing new"). */
+ATKDSP_API void        *atkdsp_ring_claim(atkdsp_ring *r);
+ATKDSP_API int          atkdsp_ring_commit(atkdsp_ring *r, const atkdsp_ring_meta *m);
+/* A consumer id (0..15), reading from the next block committed or from the
+ * oldest still held; E_CAP when all max_consumers are taken. close frees it
+ * (a consumer in a process that died can be closed by anyone). */
+ATKDSP_API int          atkdsp_ring_open(atkdsp_ring *r, int from_oldest);
+ATKDSP_API int          atkdsp_ring_close(atkdsp_ring *r, int id);
+/* The next block: its bytes (0 = nothing new), its header, and the blocks
+ * lost since the last call (lapped or torn). A block larger than cap is
+ * E_CAP and stays to be read again with a bigger buffer. */
+ATKDSP_API ptrdiff_t    atkdsp_ring_read(atkdsp_ring *r, int id, void *out, size_t cap,
+                                         atkdsp_ring_meta *m, uint64_t *lost);
+ATKDSP_API const void  *atkdsp_ring_peek(atkdsp_ring *r, int id, atkdsp_ring_meta *m,
+                                         uint64_t *lost);
+ATKDSP_API int          atkdsp_ring_release(atkdsp_ring *r, int id);
+ATKDSP_API ptrdiff_t    atkdsp_ring_copy_range(const atkdsp_ring *r, uint64_t seq0,
+                                               uint64_t seq1, void *out, size_t cap,
+                                               atkdsp_ring_meta *metas, size_t mcap);
+ATKDSP_API int          atkdsp_ring_stats(const atkdsp_ring *r, atkdsp_ring_counters *st);
+/* "ring: 256 blocks x 1048576 bytes (256.0 MiB of data), 3 of 16 consumers,
+ * 1234 committed, 0 torn reads" */
+ATKDSP_API int          atkdsp_ring_describe(const atkdsp_ring *r, char *buf, size_t cap);
 
 #ifdef __cplusplus
 }

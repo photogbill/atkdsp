@@ -44,6 +44,8 @@ echo atkdsp: cmake not found, compiling with cl.exe directly
 cl /nologo /O2 /W3 /fp:precise /arch:AVX2 /openmp /DATKDSP_BUILD=1 /Iinclude /Ivendor\pocketfft ^
    src\*.c vendor\pocketfft\pocketfft.c /LD /Fe:bin\atkdsp.dll /Fo:bin\ || exit /b 1
 cl /nologo /O2 /Iinclude tests\test_smoke.c /Fe:bin\atkdsp_smoke.exe /Fo:bin\ bin\atkdsp.lib || exit /b 1
+rem the ring's stress test and Bill's bench (tests\test_ring_stress.c)
+cl /nologo /O2 /Iinclude tests\test_ring_stress.c /Fe:bin\atkdsp_ring_stress.exe /Fo:bin\ bin\atkdsp.lib || exit /b 1
 del /q bin\*.obj bin\*.exp 2>nul
 goto :smoke
 
@@ -61,6 +63,8 @@ if exist bin\Release\atkdsp.dll copy /y bin\Release\atkdsp.dll bin\ >nul
 if exist bin\Release\atkdsp_smoke.exe copy /y bin\Release\atkdsp_smoke.exe bin\ >nul
 if exist build\Release\atkdsp.dll copy /y build\Release\atkdsp.dll bin\ >nul
 if exist build\Release\atkdsp_smoke.exe copy /y build\Release\atkdsp_smoke.exe bin\ >nul
+if exist bin\Release\atkdsp_ring_stress.exe copy /y bin\Release\atkdsp_ring_stress.exe bin\ >nul
+if exist build\Release\atkdsp_ring_stress.exe copy /y build\Release\atkdsp_ring_stress.exe bin\ >nul
 
 :smoke
 if not exist bin\atkdsp.dll (

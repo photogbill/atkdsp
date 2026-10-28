@@ -4,6 +4,7 @@
  * checks against numpy live in tests/test_cross_check.py; this file exists so
  * a build with no Python can still prove the DLL is sane. Exit 0 = pass. */
 #include "atkdsp.h"
+#define ATK_SMOKE_PI 3.14159265358979323846
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -364,6 +365,94 @@ int main(void) {
             free(rd); free(hs); free(cs); free(rb2); free(il);
         }
         free(zb); free(seq); free(sc); free(ds); free(pb);
+    }
+
+    /* ---- the detection track (v0.16.0) ---- */
+    {
+        /* CFAR: alpha reproduces CA's closed form; a planted burst gives one track */
+        double al = 0.0, et = 0.0;
+        CHECK(atkdsp_cfar_alpha(ATKDSP_CFAR_CA, 16, 1e-6, 1.0, 0, &al, &et) == ATKDSP_OK
+              && fabs(al / (32.0 * (pow(1e-6, -1.0 / 32.0) - 1.0)) - 1.0) < 1e-7,
+              "cfar_alpha: CA alpha = N (Pfa^(-1/N) - 1)");
+        atkdsp_cfar_config cc;
+        atkdsp_cfar_defaults(&cc);
+        enum { NBC = 256, NF = 40 };
+        atkdsp_cfar *cf = atkdsp_cfar_create(NBC, &cc);
+        CHECK(cf != NULL, "cfar create");
+        float *fr = (float *)malloc(sizeof(float) * NBC * NF);
+        uint64_t st = 12345;
+        for (int f = 0; f < NF; ++f)
+            for (int b = 0; b < NBC; ++b) {
+                st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+                const double u = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+                double p = -log(u);                              /* unit exponential noise */
+                if (b == 100 && f >= 10 && f < 20) p += 1000.0;  /* a 30 dB burst */
+                fr[f * NBC + b] = (float)(10.0 * log10(p));
+            }
+        const size_t evcap = atkdsp_cfar_events_max(cf, NF) + 256;
+        atkdsp_cfar_event *ev = (atkdsp_cfar_event *)malloc(evcap * sizeof *ev);
+        ptrdiff_t ne = atkdsp_cfar_process(cf, fr, NF, 0.0, 0.001, ev, evcap);
+        ne += atkdsp_cfar_flush(cf, ev + (ne > 0 ? ne : 0), 256);
+        int closes = 0, good = 0;
+        for (ptrdiff_t i = 0; i < ne; ++i)
+            if (ev[i].type == ATKDSP_CFAR_CLOSE) {
+                ++closes;
+                good = fabs(ev[i].fc_bin - 100.0) < 0.5 && fabs(ev[i].t0 - 0.010) < 1e-9
+                       && fabs(ev[i].t1 - 0.020) < 1e-9;
+            }
+        CHECK(closes == 1 && good, "cfar: one track for one burst, fc and t0/t1 exact");
+        char cdesc[512];
+        CHECK(atkdsp_cfar_describe(cf, cdesc, sizeof cdesc) == ATKDSP_OK
+              && strstr(cdesc, "CFAR CA") != NULL, "cfar describe");
+        atkdsp_cfar_destroy(cf);
+        free(fr);
+        free(ev);
+
+        /* burst_measure: a carrier keyed on at sample 3000, off after 6999 */
+        enum { NBM = 10000 };
+        atkdsp_cf32 *bx = (atkdsp_cf32 *)malloc(sizeof(atkdsp_cf32) * NBM);
+        for (int i = 0; i < NBM; ++i) {
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u1 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u2 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            const double rr = sqrt(-log(u1)), th = 2.0 * ATK_SMOKE_PI * u2;   /* unit-power noise */
+            double re = rr * cos(th), im = rr * sin(th);
+            if (i >= 3000 && i < 7000) {
+                re += 10.0 * cos(2.0 * ATK_SMOKE_PI * 0.05 * i);
+                im += 10.0 * sin(2.0 * ATK_SMOKE_PI * 0.05 * i);
+            }
+            bx[i].re = (float)re; bx[i].im = (float)im;
+        }
+        atkdsp_bdw bd;
+        CHECK(atkdsp_burst_measure(bx, NBM, 100000.0, 2900, 7100, 0.0f, 0, &bd) == ATKDSP_OK
+              && fabs(bd.t0 - 2999.5) <= 2.0 && fabs(bd.t1 - 6999.5) <= 2.0
+              && fabs(bd.fc_hz - 5000.0) < 100.0 && fabs(bd.snr_db - 20.0) < 1.0,
+              "burst_measure: edges within 2 samples, fc, SNR");
+        free(bx);
+
+        /* ring: lap a consumer and count exactly what it lost */
+        const size_t rb = atkdsp_ring_bytes(100, 4, 2);
+        void *rm = NULL;
+        rm = malloc(rb + 64);
+        void *ra = (void *)(((uintptr_t)rm + 63) & ~(uintptr_t)63);
+        atkdsp_ring *ring = atkdsp_ring_init(ra, rb, 100, 4, 2);
+        CHECK(ring != NULL && atkdsp_ring_attach(ra, rb) == ring, "ring init / attach");
+        const int cid = atkdsp_ring_open(ring, 0);
+        for (uint64_t q = 0; q < 10; ++q) {
+            uint8_t *blkp = (uint8_t *)atkdsp_ring_claim(ring);
+            memset(blkp, (int)q, 100);
+            atkdsp_ring_meta mm;
+            memset(&mm, 0, sizeof mm);
+            mm.nbytes = 100;
+            atkdsp_ring_commit(ring, &mm);
+        }
+        uint8_t got[128];
+        atkdsp_ring_meta gm;
+        uint64_t lostb = 0;
+        const ptrdiff_t gn = atkdsp_ring_read(ring, cid, got, sizeof got, &gm, &lostb);
+        CHECK(gn == 100 && lostb == 6 && gm.seq == 6 && got[0] == 6, "ring: lapped reader told it lost exactly 6");
+        free(rm);
     }
 
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);

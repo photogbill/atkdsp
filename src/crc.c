@@ -139,6 +139,10 @@ static const crc_entry CATALOG[] = {
                                   0xffffffffffffffffULL, 0xb90956c775a41001ULL},
     {"CRC-64/MS",             64, 0x259c84cba6426349ULL, 0xffffffffffffffffULL, T, T,
                                   0x0ULL, 0x75d4b74f024eceeaULL},
+    /* CRC-64/NVME (v0.16.0): added to the reveng catalogue after this table
+     * was first typed; its check value is asserted like every other. */
+    {"CRC-64/NVME",           64, 0xad93d23594c93659ULL, 0xffffffffffffffffULL, T, T,
+                              0xffffffffffffffffULL, 0xae8b14860a799888ULL},
     {"CRC-64/REDIS",          64, 0xad93d23594c935a9ULL, 0x0ULL, T, T, 0x0ULL, 0xe9c6d914c4b8d9caULL},
     {"CRC-64/WE",             64, 0x42f0e1eba9ea3693ULL, 0xffffffffffffffffULL, F, F,
                                   0xffffffffffffffffULL, 0x62ec59e3f1a4f00aULL},

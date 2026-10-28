@@ -7,10 +7,17 @@
 
 #define LN10 2.302585092994045684
 
+/* Iterations the series and the continued fraction may take. Both converge
+ * in O(sqrt(a)) steps near x = a, so a fixed 1000 was wrong past a ~ 5e4
+ * (P(6.4e5, 6.4e5) came out 0.39, not 0.50 — review, 2026-10-28). The twin
+ * (reference.py §14 helpers) uses the same bound. */
+static int igam_iters(double a) { return 1000 + (int)(10.0 * sqrt(a > 0.0 ? a : 0.0)); }
+
 /* Series for the lower regularised gamma P(a, x), valid for x < a + 1. */
 static double gamma_p_series(double a, double x) {
     double ap = a, del = 1.0 / a, sum = del;
-    for (int i = 0; i < 1000; ++i) {
+    const int it = igam_iters(a);
+    for (int i = 0; i < it; ++i) {
         ap += 1.0;
         del *= x / ap;
         sum += del;
@@ -23,7 +30,8 @@ static double gamma_p_series(double a, double x) {
 static double gamma_q_cf_log(double a, double x) {
     const double tiny = 1e-300;
     double b = x + 1.0 - a, c = 1.0 / tiny, d = 1.0 / b, h = d;
-    for (int i = 1; i < 1000; ++i) {
+    const int it = igam_iters(a);
+    for (int i = 1; i < it; ++i) {
         const double an = -(double)i * ((double)i - a);
         b += 2.0;
         d = an * d + b;
@@ -50,6 +58,32 @@ double atk_log_igamc(double a, double x) {
 
 double atk_igamc(double a, double x) {
     return exp(atk_log_igamc(a, x));
+}
+
+/* Both regularised incomplete gammas in log space, each finite far into its
+ * own tail: ln P(a, x) from the series below a + 1, ln Q(a, x) from the
+ * continued fraction above it, the other by log1p. The CFAR's threshold
+ * solver (cfar.c) integrates with these. */
+void atk_log_igam_pq(double a, double x, double *lnp, double *lnq) {
+    if (!(x > 0.0)) { *lnp = -INFINITY; *lnq = 0.0; return; }
+    const double lg = lgamma(a);
+    if (x < a + 1.0) {
+        double ap = a, del = 1.0 / a, sum = del;
+        const int it = igam_iters(a);
+        for (int i = 0; i < it; ++i) {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if (fabs(del) < fabs(sum) * 1e-16) break;
+        }
+        *lnp = log(sum) - x + a * log(x) - lg;
+        const double p = exp(*lnp);
+        *lnq = p < 1.0 ? log1p(-p) : -INFINITY;
+        return;
+    }
+    *lnq = -x + a * log(x) - lg + gamma_q_cf_log(a, x);
+    const double q = exp(*lnq);
+    *lnp = q < 1.0 ? log1p(-q) : -INFINITY;
 }
 
 static double ln_binom_term(double n, double k, double ln_q, double ln_1mq) {

@@ -101,6 +101,7 @@ ATK_INLINE uint64_t atk_bits_get64(const uint64_t *w, size_t p) {
 /* Statistics shared by the detectors (src/stat.c). */
 double atk_igamc(double a, double x);          /* regularised upper incomplete gamma Q(a,x) */
 double atk_log_igamc(double a, double x);      /* ln Q(a,x), finite far into the tail       */
+void   atk_log_igam_pq(double a, double x, double *lnp, double *lnq); /* ln P and ln Q */
 double atk_log10_binom_tail(double n, double c, double ln_q); /* log10 P(Bin(n,q) >= c)      */
 double atk_norm_isf(double p);                 /* z with P(N(0,1) > z) = p                    */
 double atk_gstat(const uint8_t *b, size_t n, int w, double *dof); /* G vs uniform, w-bit words */

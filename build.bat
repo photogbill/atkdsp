@@ -14,8 +14,14 @@ rem  Without CMake, cl.exe is driven directly.
 cd /d "%~dp0"
 if not exist bin mkdir bin
 
+rem  cl.exe on PATH is not enough: INCLUDE and LIB must be set too, or
+rem  every compile fails with "Cannot open include file: 'math.h'"
+rem  (2026-10-29, Bill's PC - cl.exe on PATH, no developer environment).
+rem  vcvars64 sets all three, so it is skipped only when all three are there.
 where cl >nul 2>nul
-if not errorlevel 1 goto :have_cl
+if errorlevel 1 goto :find_vs
+if defined INCLUDE if defined LIB goto :have_cl
+:find_vs
 rem  NOT inside a parenthesised block: the ")" in %ProgramFiles(x86)% closes
 rem  the block early (ATK's install.bat learned this the hard way).
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"

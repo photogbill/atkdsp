@@ -1,0 +1,6 @@
+ring: 512 blocks x 1048576 bytes (512.0 MiB of data), 0 of 4 consumers, 0 committed, 0 torn reads; 600 s at 160
+committed 91553 blocks in 600.00 s (160.0 MB/s), torn reads caught 0
+  fast            read 91553, lost 0 (0.0 %), whole yes, order yes, counts exact yes
+  slow (3x work)  read 91553, lost 0 (0.0 %), whole yes, order yes, counts exact yes
+  stalled         read 512, lost 91041 (99.4 %), whole yes, order yes, counts exact yes
+RING STRESS: ok

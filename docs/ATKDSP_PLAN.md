@@ -10,7 +10,13 @@ ABI 15 (§D1, §D2, §D3, §D5 and the SIB1 housekeeping; README "What was in
 v0.14.0"). 1b — atkdsp v0.15.0 / ABI 16 (§D4, naming the code; README "What
 is in v0.15.0"). Linux: smoke test and the whole suite pass (361 cross-check +
 218 bitstream + 180 code-recognition tests), also under ASan + UBSan. The
-Windows build has not been run yet. Everything else below is still plan; next
+Windows build was first run 2026-10-29, from ATK's new top-level `build.bat`
+(which builds every native module beside ATK in place): v0.16.0 / ABI 17 builds
+with MSVC 19.44, loads through the binding, and `atk.core.dsp_native` takes it.
+Bill's 40 MSPS ring bench (`ring_bench.bat`, 600 s at 160 MB/s, 1 MiB x 512) passed
+the same day: 91,553 blocks committed, 0 torn reads, the fast and slow (3x work)
+consumers lost nothing, the stalled one kept the ring's 512 and lost the rest with
+exact counts. The Windows pytest run is still owed. Everything else below is still plan; next
 in §G is 1c (the bench in ATK, §D6).
 
 **1c is BUILT (2026-10-28)** — in ATK, not here: the Bit Bench workspace
@@ -42,8 +48,7 @@ the ring adds `close`, `peek` / `release` and `describe`, rejects an empty
 block (so `read` returning 0 always means "nothing new"), and its counters
 struct is `atkdsp_ring_counters` (the name `atkdsp_ring_stats` is the
 function). The TDMA timing analyzer is ATK-side Python, as the plan says
-(`ATK\atk\core\tdma.py`). Still open: Bill's 40 MSPS ten-minute ring bench
-(`ring_bench.bat`), a real bladeRF capture for the CFAR acceptance, and the
+(`ATK\atk\core\tdma.py`). Still open: a real bladeRF capture for the CFAR acceptance, and the
 toolkit's `dsp/cfar.py` cross-check (that folder is not connected).
 
 **Cross-check done 2026-10-28 (late), and what it found.** The ATK

@@ -105,6 +105,114 @@ static double def_l10(int d, int R, int w) {
     return 0.6020599913279624 - (double)d * (double)(R - w + d) * LOG10_2;
 }
 
+/* ---- fixed bits (v0.17.0; plan §D4) ------------------------------------------
+ * A payload position that never varies — ASCII's high bit, a framing field —
+ * is constant in every codeword. In the AFFINE space (each row with a
+ * constant-1 column appended at bit N) that is the check (e_p, value), of
+ * weight 1 in the N data bits whatever the value; in the plain null space a
+ * constant 0 is the weight-1 check e_p and a constant 1 is no check at all.
+ * These helpers judge extra structure in the affine space, so "a constant
+ * position" has one shape. The twin: reference.py _quotient, _reduce,
+ * _coset_is_constant. */
+static int vec_topbit(const uint64_t *v, int nw) {
+    for (int q = nw - 1; q >= 0; --q)
+        if (v[q]) { int b = 63; while (!((v[q] >> b) & 1u)) --b; return 64 * q + b; }
+    return -1;
+}
+static int vec_iszero(const uint64_t *v, int nw) {
+    for (int q = 0; q < nw; ++q) if (v[q]) return 0;
+    return 1;
+}
+static int vec_weight(const uint64_t *v, int nw) {
+    int w = 0;
+    for (int q = 0; q < nw; ++q) w += atk_popcount64(v[q]);
+    return w;
+}
+/* v reduced (in place) against a canonical basis, highest pivot first. */
+static void vec_reduce(const uint64_t *base, int db, int nw, uint64_t *v) {
+    for (int i = 0; i < db; ++i) {
+        const uint64_t *bi = base + (size_t)i * nw;
+        const int t = vec_topbit(bi, nw);
+        if (t >= 0 && ((v[t >> 6] >> (t & 63)) & 1u))
+            for (int q = 0; q < nw; ++q) v[q] ^= bi[q];
+    }
+}
+/* R rows of width N (nw_of(N) words) -> the same rows with bit N set, in
+ * nw_of(N + 1) words. */
+static void aug_rows(const uint64_t *rows, int R, int N, uint64_t *out) {
+    const int nw = nw_of(N), nwa = nw_of(N + 1);
+    for (int i = 0; i < R; ++i) {
+        uint64_t *o = out + (size_t)i * nwa;
+        memset(o, 0, (size_t)nwa * sizeof *o);
+        memcpy(o, rows + (size_t)i * nw, (size_t)nw * sizeof *o);
+        o[N >> 6] |= 1ULL << (N & 63);
+    }
+}
+/* A canonical basis of span(Hs) modulo span(H0) (H0 canonical): each Hs
+ * vector reduced against H0, the nonzero remainders canonicalised into out
+ * (ds vectors of nwa words). Returns their count. */
+static int aug_quotient(const uint64_t *H0, int d0, const uint64_t *Hs, int ds, int nwa,
+                        uint64_t *out) {
+    int m = 0;
+    for (int i = 0; i < ds; ++i) {
+        uint64_t *o = out + (size_t)m * nwa;
+        memcpy(o, Hs + (size_t)i * nwa, (size_t)nwa * sizeof *o);
+        vec_reduce(H0, d0, nwa, o);
+        if (!vec_iszero(o, nwa)) ++m;
+    }
+    return m ? atk_gf2_canon(out, m, 64 * nwa) : 0;
+}
+/* True when v + span(H0) holds a vector of weight 1 in the N data bits (any
+ * value of the constant-1 bit N): the extra structure v is a constant
+ * position, not a code check. */
+static int coset_is_constant(const uint64_t *H0, int d0, int N, const uint64_t *v, uint64_t *tmp) {
+    const int nwa = nw_of(N + 1);
+    for (int p = 0; p < N; ++p) {
+        for (int bN = 0; bN < 2; ++bN) {
+            memcpy(tmp, v, (size_t)nwa * sizeof *tmp);
+            tmp[p >> 6] ^= 1ULL << (p & 63);
+            if (bN) tmp[N >> 6] ^= 1ULL << (N & 63);
+            vec_reduce(H0, d0, nwa, tmp);
+            if (vec_iszero(tmp, nwa)) return 1;
+        }
+    }
+    return 0;
+}
+/* The affine null space of the aligned rows at (off, N): R rows -> basis of
+ * nwa words each (canonical). Returns its dimension, or -1 on memory. */
+static int aug_nullspace(const uint64_t *bw, size_t off, int N, int R, uint64_t *basis) {
+    const int nw = nw_of(N), nwa = nw_of(N + 1);
+    uint64_t *rows = (uint64_t *)malloc(((size_t)R + 1) * (size_t)nw * sizeof *rows);
+    uint64_t *ar = (uint64_t *)malloc(((size_t)R + 1) * (size_t)nwa * sizeof *ar);
+    if (!rows || !ar) { free(rows); free(ar); return -1; }
+    atk_gf2_rows(bw, off, N, R, N, rows);
+    aug_rows(rows, R, N, ar);
+    const int d = atk_gf2_nullspace(ar, R, N + 1, basis, N + 1);
+    free(rows); free(ar);
+    return d;
+}
+/* Any of the d checks (nwa words) failing on any of the R augmented rows? */
+static int aug_any_unsat(const uint64_t *ar, int R, int nwa, const uint64_t *H, int d) {
+    for (int i = 0; i < d; ++i)
+        if (atk_gf2_unsat(ar, R, nwa, H + (size_t)i * nwa)) return 1;
+    return 0;
+}
+/* Every vector of the extra structure a stretch shows beyond H0 is a constant
+ * position: 1 when so (or when there is no extra), 0 when some extra is a
+ * code check (noise broke it in the rows H0 came from), -1 on memory. */
+static int extras_are_constant(const uint64_t *H0, int d0, const uint64_t *Hs, int ds, int N) {
+    const int nwa = nw_of(N + 1);
+    uint64_t *ex = (uint64_t *)malloc(((size_t)ds + 1) * (size_t)nwa * sizeof *ex);
+    uint64_t *tmp = (uint64_t *)malloc((size_t)nwa * sizeof *tmp);
+    if (!ex || !tmp) { free(ex); free(tmp); return -1; }
+    const int m = aug_quotient(H0, d0, Hs, ds, nwa, ex);
+    int ok = 1;
+    for (int i = 0; i < m && ok; ++i)
+        if (!coset_is_constant(H0, d0, N, ex + (size_t)i * nwa, tmp)) ok = 0;
+    free(ex); free(tmp);
+    return ok;
+}
+
 /* deficiency of the matrix at width w, offset o (exact, or robust) */
 static int def_at(const uint64_t *bw, size_t n, size_t o, int w, int robust, uint64_t seed,
                   double pfa, double *l10, uint64_t *M, uint64_t *basis, int *complete) {
@@ -192,20 +300,54 @@ static int block_search(const uint64_t *bw, size_t n, int n_lo, int n_hi, double
              * deficiency, so an error among the first rows lowers bd and the
              * all-rows count alike, while a clean stretch elsewhere shows the
              * true value. Any disagreement is noise: a job for the noisy paths */
+            /* A stretch may carry MORE structure than the whole for an
+             * innocent reason — a payload bit constant within it (ASCII's
+             * high bit, a field) — so the extra is judged in the affine
+             * space: a constant position is allowed, a code check the first
+             * rows broke is noise (v0.17.0; before, any difference was noise
+             * and a structured payload failed 1 seed in 20). The same
+             * allowance covers the N + 32 rows the scan used, whose count
+             * then yields to the whole stream's. */
             const size_t fit = (n - (size_t)bo) / (size_t)N;
             const int Rb = (int)(fit < ATK_ID_ROWS ? fit : ATK_ID_ROWS);
+            const int nwa = nw_of(N + 1);
             uint64_t *Mb = (uint64_t *)malloc((size_t)Rb * (size_t)nw_of(N) * sizeof *Mb);
-            if (!Mb) { free(basis); free(M); free(dv); return -1; }
+            uint64_t *Ha = (uint64_t *)malloc(((size_t)N + 1) * (size_t)nwa * sizeof *Ha);
+            uint64_t *Hs = (uint64_t *)malloc(((size_t)N + 1) * (size_t)nwa * sizeof *Hs);
+            if (!Mb || !Ha || !Hs) { free(Mb); free(Ha); free(Hs); free(basis); free(M); free(dv); return -1; }
             atk_gf2_rows(bw, (size_t)bo, N, Rb, N, Mb);
             const int dall = N - atk_gf2_rank(Mb, Rb, N);
-            int same = dall == bd;
+            int same = dall == bd, da = -1, oom = 0;
+            if (!same && dall > 0 && dall < bd) {
+                const int Rs = (int)(fit < (size_t)N + 32 ? fit : (size_t)N + 32);
+                da = aug_nullspace(bw, (size_t)bo, N, Rb, Ha);
+                const int db = aug_nullspace(bw, (size_t)bo, N, Rs, Hs);
+                if (da < 0 || db < 0) oom = 1;
+                else if (db > da) {
+                    const int e = extras_are_constant(Ha, da, Hs, db, N);
+                    if (e < 0) oom = 1;
+                    else if (e) { same = 1; bd = dall; }
+                }
+            }
+            if (same && !oom && da < 0) { da = aug_nullspace(bw, (size_t)bo, N, Rb, Ha); if (da < 0) oom = 1; }
             const size_t R1 = (size_t)N + 32;
-            for (int j = 1; j <= 3 && same && fit >= 2 * R1; ++j) {
+            uint64_t *ar = oom ? NULL : (uint64_t *)malloc((R1 + 1) * (size_t)nwa * sizeof *ar);
+            if (!oom && !ar) oom = 1;
+            for (int j = 1; j <= 3 && same && !oom && fit >= 2 * R1; ++j) {
                 const size_t r0 = (size_t)j * (fit - R1) / 3;
                 atk_gf2_rows(bw, (size_t)bo + r0 * (size_t)N, N, (int)R1, N, Mb);
-                if (N - atk_gf2_rank(Mb, (int)R1, N) != bd) same = 0;
+                aug_rows(Mb, (int)R1, N, ar);
+                if (aug_any_unsat(ar, (int)R1, nwa, Ha, da)) { same = 0; break; }
+                const int ds = atk_gf2_nullspace(ar, (int)R1, N + 1, Hs, N + 1);
+                if (ds < 0) { oom = 1; break; }
+                if (ds > da) {
+                    const int e = extras_are_constant(Ha, da, Hs, ds, N);
+                    if (e < 0) { oom = 1; break; }
+                    if (!e) same = 0;
+                }
             }
-            free(Mb);
+            free(Mb); free(Ha); free(Hs); free(ar);
+            if (oom) { free(basis); free(M); free(dv); return -1; }
             TRACE("exact: w0=%d N=%d bo=%d bd=%d dall=%d same=%d\n", w0, N, bo, bd, dall, same);
             if (!same) break;                            /* noisy */
             f->N = N; f->offset = bo; f->robust = 0; f->w0 = w0; f->d0 = bd; f->complete = 1;
@@ -886,6 +1028,99 @@ static int name_extended(const uint64_t *Gm, int k, int N, char *name, size_t ca
     return done;
 }
 
+/* The d checks in H (canonical, nw words of width N): the single-position
+ * ones are a payload's fixed bits (a position always 0), not the code's,
+ * and left in they refused true codes on short captures as "sliding" or
+ * "fails unlike noise" (plan §D4, 2026-10-28). Compacted out of H into
+ * `fixed` (a mask, nw words); returns the checks kept. Twin: _set_aside_fixed. */
+static int set_aside_fixed(uint64_t *H, int d, int N, uint64_t *fixed) {
+    const int nw = nw_of(N);
+    memset(fixed, 0, (size_t)nw * sizeof *fixed);
+    d = atk_gf2_canon(H, d, N);
+    int kept = 0;
+    for (int r = 0; r < d; ++r) {
+        uint64_t *row = H + (size_t)r * nw;
+        if (vec_weight(row, nw) == 1) { for (int q = 0; q < nw; ++q) fixed[q] |= row[q]; continue; }
+        if (kept != r) memcpy(H + (size_t)kept * nw, row, (size_t)nw * sizeof *row);
+        ++kept;
+    }
+    return kept;
+}
+
+/* dmin over the nonzero codewords of k generators (N <= 64 here, one word). */
+static int gm_dmin(const uint64_t *Gm, int k, int nw, int N) {
+    int best = N + 1;
+    uint64_t cw = 0;
+    for (uint32_t i = 1; i < (1u << k); ++i) {
+        int bit = 0;
+        while (!((i >> bit) & 1u)) ++bit;
+        cw ^= Gm[(size_t)bit * nw];
+        const int w = atk_popcount64(cw);
+        if (w < best) best = w;
+    }
+    return best;
+}
+
+/* The stream cannot say whether a check includes a fixed position (its bit
+ * is always 0 there), so the checks come back without them and a Hamming
+ * code reads as "linear" with a smaller dmin. Every way of putting the fixed
+ * positions back into the d checks is tried, up to 4096: the first that names
+ * a cyclic or extended-cyclic code (not a generic "cyclic (n,k)") is taken;
+ * failing that, for a small code (N <= 32, k <= 12, up to 256 ways) the way
+ * with the largest dmin (the first of equals); else H is left as it is.
+ * Twin: _restore_fixed. Returns 0, or ATKDSP_E_NOMEM. */
+static int restore_fixed(uint64_t *H, int d, int N, const uint64_t *fixed) {
+    const int nw = nw_of(N);
+    int pos[512], np = 0;
+    for (int j = 0; j < N; ++j) if ((fixed[j >> 6] >> (j & 63)) & 1u) pos[np++] = j;
+    if (!np || d <= 0 || d * np > 12) return 0;
+    const int k = N - d, ncell = d * np;
+    const int small = N <= 32 && k <= 12 && ncell <= 8;
+    uint64_t *Hc = (uint64_t *)malloc((size_t)d * (size_t)nw * sizeof *Hc);
+    uint64_t *Gm = (uint64_t *)malloc((size_t)N * (size_t)nw * sizeof *Gm);
+    uint64_t *best = (uint64_t *)malloc((size_t)d * (size_t)nw * sizeof *best);
+    if (!Hc || !Gm || !best) { free(Hc); free(Gm); free(best); return ATKDSP_E_NOMEM; }
+    int best_dmin = -1, have_best = 0;
+    if (small) {
+        const int kk = atk_gf2_nullspace(H, d, N, Gm, N);
+        if (kk == k) { best_dmin = gm_dmin(Gm, k, nw, N); memcpy(best, H, (size_t)d * nw * sizeof *best); have_best = 1; }
+    }
+    for (int combo = 1; combo < (1 << ncell); ++combo) {
+        memcpy(Hc, H, (size_t)d * (size_t)nw * sizeof *Hc);
+        for (int c = 0; c < ncell; ++c)
+            if ((combo >> c) & 1) {
+                const int i = c / np, j = pos[c % np];
+                Hc[(size_t)i * nw + (j >> 6)] ^= 1ULL << (j & 63);
+            }
+        if (atk_gf2_canon(Hc, d, N) != d) continue;
+        const int kk = atk_gf2_nullspace(Hc, d, N, Gm, N);
+        if (kk != k) continue;
+        char nm[48] = "";
+        if (is_cyclic(Gm, k, Hc, d, N)) {
+            poly_t g;
+            int bt = 0, bm = 0;
+            uint32_t bf = 0;
+            cyclic_gen(Gm, k, N, &g);
+            name_cyclic(&g, N, k, nm, sizeof nm, &bt, &bf, &bm);
+        } else {
+            poly_t g;
+            if (!name_extended(Gm, k, N, nm, sizeof nm, &g)) nm[0] = 0;
+        }
+        if (nm[0] && strncmp(nm, "cyclic (", 8) && strncmp(nm, "extended cyclic (", 17)) {
+            memcpy(H, Hc, (size_t)d * (size_t)nw * sizeof *H);
+            free(Hc); free(Gm); free(best);
+            return 0;
+        }
+        if (small) {
+            const int dm = gm_dmin(Gm, k, nw, N);
+            if (dm > best_dmin) { best_dmin = dm; memcpy(best, Hc, (size_t)d * nw * sizeof *best); have_best = 1; }
+        }
+    }
+    if (have_best) memcpy(H, best, (size_t)d * (size_t)nw * sizeof *H);
+    free(Hc); free(Gm); free(best);
+    return 0;
+}
+
 int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi, double pfa,
                          uint64_t seed, atkdsp_blockid *out, uint8_t *G, size_t gcap,
                          uint8_t *gpoly, size_t pcap) {
@@ -1026,6 +1261,11 @@ int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi, double 
         }
     }
     rc = 0;
+    uint64_t fixed[9] = {0};                 /* nw_of(512) = 8 words, +1 */
+    if (d > 0) {
+        d = set_aside_fixed(H, d, N, fixed);
+        out->fixed_bits = vec_weight(fixed, nw);
+    }
     if (d > 0 && !complete) {
         /* checks verified, but no subset was ever clean: the dimension is a
          * lower bound, so the code is not named (plan §D4) */
@@ -1048,6 +1288,10 @@ int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi, double 
         out->rows_used = R;
         set_name(out->name, sizeof out->name, "no code found (n=%d fails unlike noise)", N);
         d = 0;
+    }
+    if (d > 0 && d < N && out->fixed_bits) {
+        const int rr = restore_fixed(H, d, N, fixed);
+        if (rr) { free(bw); free(H); free(Gm); free(rows); return rr; }
     }
     if (d > 0 && d < N) {
         const int k = N - d;
@@ -1197,6 +1441,12 @@ int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi, double 
                     if (rs.agreement == rs.agreement) out->agreement = rs.agreement;
                     break;
                 }
+            }
+            if (out->fixed_bits) {
+                char base[48];
+                memcpy(base, out->name, sizeof base);
+                set_name(out->name, sizeof out->name, "%s, %d fixed bit%s", base, out->fixed_bits,
+                         out->fixed_bits > 1 ? "s" : "");
             }
             if (out->cyclic || out->extended || out->shortened) {
                 const int dg = pdeg(&g);

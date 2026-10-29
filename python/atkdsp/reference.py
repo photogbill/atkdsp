@@ -5375,6 +5375,41 @@ def _unsat(rows, h) -> int:
     return sum(_pop(r & h) & 1 for r in rows)
 
 
+def _quotient(H0, Hs) -> list:
+    """A canonical basis of span(Hs) modulo span(H0): each vector of Hs reduced
+    against H0's canonical basis, the nonzero remainders canonicalised."""
+    base = gf2_canon(list(H0))
+    rem = []
+    for h in Hs:
+        v = h
+        for s_ in base:
+            if (v >> (s_.bit_length() - 1)) & 1:
+                v ^= s_
+        if v:
+            rem.append(v)
+    return gf2_canon(rem) if rem else []
+
+
+def _reduce(base, v):
+    """v reduced against a canonical basis (highest pivot first)."""
+    for s_ in base:
+        if (v >> (s_.bit_length() - 1)) & 1:
+            v ^= s_
+    return v
+
+
+def _coset_is_constant(H0, v, N) -> bool:
+    """True when v + span(H0) holds a vector of weight 1 in the N data bits
+    (any value of the constant-1 bit N): the extra structure v is a constant
+    position, not a code check. v is in the affine space (width N + 1)."""
+    base = gf2_canon(list(H0))
+    for p in range(N):
+        u = v ^ (1 << p)
+        if _reduce(base, u) == 0 or _reduce(base, u ^ (1 << N)) == 0:
+            return True
+    return False
+
+
 def _in_span(basis, h) -> bool:
     for s in basis:
         if (h >> (s.bit_length() - 1)) & 1:
@@ -5623,13 +5658,45 @@ def _block_search(b, n, n_lo, n_hi, pfa, seed, modes):
                         break
                     fit = (n - bo) // N
                     Rb = min(fit, ID_ROWS)
-                    same = N - gf2_rank(_rows(b, bo, N, Rb, N)) == bd
+                    rows_b = _rows(b, bo, N, Rb, N)
+                    dall = N - gf2_rank(rows_b)
+                    same = dall == bd
+                    if not same and 0 < dall < bd:
+                        # the N + 32 rows the scan used carried more than the
+                        # whole: allowed when the extra is constant positions
+                        # (judged below in the affine space), and bd becomes
+                        # the whole stream's count
+                        Hb = gf2_nullspace([r | (1 << N) for r in _rows(b, bo, N, min(N + 32, fit), N)], N + 1)
+                        Ha = gf2_nullspace([r | (1 << N) for r in rows_b], N + 1)
+                        extra = _quotient(Ha, Hb)
+                        if extra and all(_coset_is_constant(Ha, h, N) for h in extra):
+                            same = True
+                            bd = dall
+                    # Exact only if the checks hold on three more stretches
+                    # spread over the stream (noise only lowers a deficiency:
+                    # an error among the first rows lowers bd, a clean stretch
+                    # elsewhere shows the true value). A stretch may carry MORE
+                    # structure than the whole for an innocent reason — a
+                    # payload bit constant in it (ASCII's high bit, a field) —
+                    # so the extra is judged in the affine space (rows with a
+                    # constant-1 column): an extra check of weight 1 is a
+                    # constant position, payload, and allowed; weight 2 or
+                    # more is a code check the first rows broke, noise, and the
+                    # noisy paths take over (v0.17.0; before, any difference
+                    # was noise, and a structured payload failed 1 seed in 20).
+                    H0 = gf2_nullspace([r | (1 << N) for r in rows_b], N + 1) if same else []
                     R1 = N + 32
                     jj = 1
                     while jj <= 3 and same and fit >= 2 * R1:
                         r0 = jj * (fit - R1) // 3
-                        if N - gf2_rank(_rows(b, bo + r0 * N, N, R1, N)) != bd:
+                        rs = [r | (1 << N) for r in _rows(b, bo + r0 * N, N, R1, N)]
+                        if any(_unsat(rs, h) for h in H0):
                             same = False
+                        else:
+                            Hs = gf2_nullspace(rs, N + 1)
+                            extra = _quotient(H0, Hs)
+                            if any(not _coset_is_constant(H0, h, N) for h in extra):
+                                same = False
                         jj += 1
                     if not same:
                         break
@@ -6047,6 +6114,87 @@ def _name_extended(Gm, k, N):
     return None, 0
 
 
+def _set_aside_fixed(H, N):
+    """(H without its single-position checks, the mask of those positions).
+
+    A position the payload never varies — ASCII's high bit, a framing field
+    — is constant in every codeword, and the null space gains the check
+    "that position is 0" (weight 1 in canonical form: its pivot is that
+    position and no other row touches it). The check is the payload's, not
+    the code's, and left in it refused true codes on short captures as
+    "sliding" or "fails unlike noise" (plan §D4, 2026-10-28). Set aside here,
+    before those tests, and reported as fixed bits."""
+    H = gf2_canon(list(H))
+    mask = 0
+    keep = []
+    for h in H:
+        if _pop(h) == 1:
+            mask |= h
+        else:
+            keep.append(h)
+    return keep, mask
+
+
+def _gm_dmin(Gm, N):
+    """The minimum weight over the nonzero codewords of the k generators Gm
+    (Gray-code walk; k <= 12 here)."""
+    best = N + 1
+    cw = 0
+    k = len(Gm)
+    for i in range(1, 1 << k):
+        bit = 0
+        while not (i >> bit) & 1:
+            bit += 1
+        cw ^= Gm[bit]
+        w = _pop(cw)
+        if w < best:
+            best = w
+    return best
+
+
+def _restore_fixed(H, mask, N):
+    """The stream cannot say whether a check includes a fixed position (its
+    bit is always 0 there), so the checks come back without them and a
+    Hamming code reads as "linear" with a smaller dmin. Every way of putting
+    the fixed positions back into the checks is tried, up to 4096: the first
+    that names a cyclic or extended-cyclic code is taken; failing that, for a
+    small code (N <= 32, k <= 12, up to 256 ways) the way with the largest
+    dmin (the first of equals); else H is kept as it is."""
+    d = len(H)
+    pos = [j for j in range(N) if (mask >> j) & 1]
+    if not pos or not H or d * len(pos) > 12:
+        return H
+    k = N - d
+    cells = [(i, j) for i in range(d) for j in pos]
+    best, best_dmin = None, -1
+    small = N <= 32 and k <= 12 and len(cells) <= 8
+    if small:
+        G0 = gf2_nullspace(H, N)
+        best, best_dmin = list(H), (_gm_dmin(G0, N) if len(G0) == k else -1)
+    for combo in range(1, 1 << len(cells)):
+        Hc = list(H)
+        for c, (i, j) in enumerate(cells):
+            if (combo >> c) & 1:
+                Hc[i] ^= 1 << j
+        Hc = gf2_canon(Hc)
+        if len(Hc) != d:
+            continue
+        Gm = gf2_nullspace(Hc, N)
+        if len(Gm) != k:
+            continue
+        if _is_cyclic(Gm, Hc, N):
+            nm = _name_cyclic(_cyclic_gen(Gm, N), N, k, 48)[0]
+        else:
+            nm = _name_extended(Gm, k, N)[0] or ""
+        if nm and not nm.startswith("cyclic (") and not nm.startswith("extended cyclic ("):
+            return Hc                       # a code with a name: Hamming, Golay, BCH ...
+        if small:
+            dm = _gm_dmin(Gm, N)
+            if dm > best_dmin:
+                best, best_dmin = Hc, dm
+    return best if best is not None else H
+
+
 def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: int = 0) -> dict:
     """The twin of atkdsp_block_code_id (header §18); the dict of the
     binding: the atkdsp_blockid fields, 'found', 'G' and 'gpoly'."""
@@ -6057,9 +6205,9 @@ def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: in
     if not pfa > 0:
         pfa = 1e-3
     out = {"n": 0, "k": 0, "offset": 0, "deficiency": 0, "cyclic": 0, "extended": 0, "dmin": 0,
-           "rows_used": 0, "robust": 0, "shortened": 0, "log10_pfa": 0.0, "ber_est": float("nan"),
-           "agreement": float("nan"), "valid_words": float("nan"), "name": "no code found",
-           "found": False, "G": None, "gpoly": None}
+           "rows_used": 0, "robust": 0, "shortened": 0, "fixed_bits": 0, "log10_pfa": 0.0,
+           "ber_est": float("nan"), "agreement": float("nan"), "valid_words": float("nan"),
+           "name": "no code found", "found": False, "G": None, "gpoly": None}
     u, p1, _lc = _stream_unfit(b)
     if u == 1:
         out["name"] = f"no code found (biased: P(1) = {p1:.2f})"
@@ -6130,6 +6278,10 @@ def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: in
                 R = min((n - f["offset"]) // N, ID_ROWS)
                 rows = _rows(b, f["offset"], N, R, N)
                 break
+    fixed_mask = 0
+    if H:
+        H, fixed_mask = _set_aside_fixed(H, N)
+        out["fixed_bits"] = _pop(fixed_mask)
     d = len(H)
     if d > 0 and not complete:
         out.update(n=N, offset=f["offset"], deficiency=d, robust=robust, rows_used=R,
@@ -6149,6 +6301,8 @@ def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: in
     if not (0 < d < N):
         return out
     k = N - d
+    if fixed_mask:
+        H = _restore_fixed(H, fixed_mask, N)
     Gm = gf2_nullspace(H, N)
     if len(Gm) != k:
         return out
@@ -6236,6 +6390,9 @@ def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: in
             if rs["agreement"] == rs["agreement"]:
                 out["agreement"] = rs["agreement"]
             break
+    if out["fixed_bits"]:
+        fb = out["fixed_bits"]
+        out["name"] = f"{out['name']}, {fb} fixed bit{'s' if fb > 1 else ''}"[:47]
     out["found"] = True
     out["G"] = Gb
     if out["cyclic"] or out["extended"] or out["shortened"]:
@@ -6910,7 +7067,65 @@ def cfar_defaults() -> dict:
     """The defaults atkdsp_cfar_defaults() writes."""
     return dict(mode=CFAR_CA, n_ref=16, n_guard=4, k_frames=1, pfa=1e-6, looks=1.0,
                 os_k=0, open_m=2, open_n=3, close_k=3, merge_gap=1, min_bins=1,
-                max_tracks=256)
+                max_tracks=256, rho2=(0.0, 0.0, 0.0, 0.0))
+
+
+CFAR_RHO_MAX = 4
+
+
+def cfar_n_eff(n_ref, rho2=None) -> float:
+    """Equivalent independent cells among 2 n_ref reference cells, n_ref
+    contiguous each side (the sides are too far apart to correlate):
+    N / (1 + 2 P / N), P the sum of rho2[m - 1] over the pairs m bins apart.
+    The mean of N cells with that correlation has the variance of the mean of
+    n_eff independent ones. None / zeros = N."""
+    n_ref = int(n_ref)
+    N = 2.0 * n_ref
+    if n_ref < 1:
+        return 0.0
+    if rho2 is None:
+        return N
+    pairs = 0.0
+    for m in range(1, CFAR_RHO_MAX + 1):
+        if m < n_ref:
+            pairs += 2.0 * (n_ref - m) * float(rho2[m - 1])
+    return N / (1.0 + 2.0 * pairs / N)
+
+
+def cfar_window_rho2(window) -> tuple:
+    """rho2[m - 1] = |sum w^2 e^{-2 pi i m n / n}|^2 / (sum w^2)^2, m = 1..4:
+    the power correlation of neighbouring periodogram bins of white noise
+    through `window`. Rectangular: zeros; Hann: 4/9, 1/36, 0, 0 as n grows.
+    Summed in index order, as the C does."""
+    w = np.asarray(window, dtype=np.float32).astype(np.float64)
+    n = w.size
+    if n < 2:
+        raise ValueError("window needs at least two taps")
+    w2 = w * w
+    s2 = 0.0
+    for v in w2:
+        s2 += v
+    if not s2 > 0.0:
+        raise ValueError("window is all zero")
+    out = []
+    i = np.arange(n, dtype=np.float64)
+    for m in range(1, CFAR_RHO_MAX + 1):
+        ph = -2.0 * _m.pi * m * i / n
+        re = im = 0.0
+        cr, ci = w2 * np.cos(ph), w2 * np.sin(ph)
+        for a, b in zip(cr, ci):
+            re += a
+            im += b
+        out.append((re * re + im * im) / (s2 * s2))
+    return tuple(out)
+
+
+def _rho2_ok(rho2) -> bool:
+    try:
+        vals = [float(v) for v in rho2]
+    except (TypeError, ValueError):
+        return False
+    return len(vals) == CFAR_RHO_MAX and all(0.0 <= v < 1.0 for v in vals)
 
 
 def _cfar_check(nbins, c) -> str:
@@ -6934,6 +7149,8 @@ def _cfar_check(nbins, c) -> str:
         return "close_k 1..1000 and merge_gap 0..nbins"
     if not 1 <= c["min_bins"] <= nbins or not 1 <= c["max_tracks"] <= 65536:
         return "min_bins 1..nbins and max_tracks 1..65536"
+    if not _rho2_ok(c["rho2"]):
+        return "rho2: four correlations, each in [0, 1)"
     return ""
 
 
@@ -6942,13 +7159,15 @@ def _ln_gpdf(s, t):
     return s * _m.log(s) + (s - 1.0) * np.log(t) - s * t - _m.lgamma(s)
 
 
-def _cfar_log_density(mode, t, N, K, k):
-    """ln density of the reference statistic T (noise mean 1 per cell) at t."""
-    n = N // 2
+def _cfar_log_density(mode, t, N, ne, K, k):
+    """ln density of the reference statistic T (noise mean 1 per cell) at t.
+    N is the number of reference cells, ne the effective number (= N for
+    independent cells): CA's T is a gamma of shape ne K, GO / SO's sides
+    ne K / 2; OS keeps the integer N and its rank (see cfar_alpha)."""
     if mode == CFAR_CA:
-        return _ln_gpdf(N * K, t)
+        return _ln_gpdf(ne * K, t)
     if mode in (CFAR_GO, CFAR_SO):
-        s = n * K
+        s = 0.5 * ne * K
         lp, lq = _v_log_igam_pq(s, s * t)
         return _m.log(2.0) + (lp if mode == CFAR_GO else lq) + _ln_gpdf(s, t)
     lp, lq = _v_log_igam_pq(K, K * t)
@@ -6961,13 +7180,12 @@ def _cfar_log_density(mode, t, N, K, k):
     return out
 
 
-def _cfar_log_cdf_sf(mode, t, N, K, k):
+def _cfar_log_cdf_sf(mode, t, N, ne, K, k):
     """(ln P(T <= t), ln P(T > t)) — the tails that bound the integration."""
-    n = N // 2
     if mode == CFAR_CA:
-        return log_igam_pq(N * K, N * K * t)
+        return log_igam_pq(ne * K, ne * K * t)
     if mode in (CFAR_GO, CFAR_SO):
-        s = n * K
+        s = 0.5 * ne * K
         lp, lq = log_igam_pq(s, s * t)
         if mode == CFAR_GO:
             return 2.0 * lp, lq + _m.log1p(_m.exp(lp))
@@ -6978,35 +7196,35 @@ def _cfar_log_cdf_sf(mode, t, N, K, k):
     return cdf, sf
 
 
-def _cfar_grid(mode, N, K, k, pfa):
+def _cfar_grid(mode, N, ne, K, k, pfa):
     """The integration grid: u = ln t over [u_lo, u_hi] and the Simpson-weighted
     density G_j (sum G_j = 1 - the two tails), plus E[T]. The tails cut off
     are each below 1e-9 x pfa, so truncation moves Pfa by < 2e-9 of itself."""
     ln_eps = _m.log(1e-9 * pfa)
     lo, hi = -700.0, 7.0
-    if _cfar_log_cdf_sf(mode, _m.exp(lo), N, K, k)[0] >= ln_eps:
+    if _cfar_log_cdf_sf(mode, _m.exp(lo), N, ne, K, k)[0] >= ln_eps:
         u_lo = lo
     else:
         a, b = lo, hi
         for _ in range(60):
             mid = 0.5 * (a + b)
-            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, K, k)[0] < ln_eps:
+            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, ne, K, k)[0] < ln_eps:
                 a = mid
             else:
                 b = mid
         u_lo = a
-    if _cfar_log_cdf_sf(mode, _m.exp(hi), N, K, k)[1] > ln_eps:
+    if _cfar_log_cdf_sf(mode, _m.exp(hi), N, ne, K, k)[1] > ln_eps:
         u_hi = hi
     else:
         a, b = u_lo, hi
         for _ in range(60):
             mid = 0.5 * (a + b)
-            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, K, k)[1] > ln_eps:
+            if _cfar_log_cdf_sf(mode, _m.exp(mid), N, ne, K, k)[1] > ln_eps:
                 a = mid
             else:
                 b = mid
         u_hi = b
-    s_ref = (N // 2) * K if mode in (CFAR_GO, CFAR_SO) else N * K
+    s_ref = 0.5 * ne * K if mode in (CFAR_GO, CFAR_SO) else ne * K
     h0 = min(0.01, 0.2 / _m.sqrt(s_ref))
     span = u_hi - u_lo
     M = 2 * int(_m.ceil(span / (2.0 * h0)))
@@ -7019,7 +7237,7 @@ def _cfar_grid(mode, N, K, k, pfa):
     w[0] = w[M] = 1.0
     w *= h / 3.0
     with np.errstate(over="ignore", invalid="ignore"):
-        lg = _cfar_log_density(mode, t, N, K, k) + u
+        lg = _cfar_log_density(mode, t, N, ne, K, k) + u
         G = np.where(np.isfinite(lg), np.exp(np.where(np.isfinite(lg), lg, 0.0)), 0.0) * w
     ET = 0.0
     for j in range(M + 1):            # sequential, as the C sums
@@ -7037,17 +7255,10 @@ def _cfar_pfa(t, G, K, alpha):
     return s
 
 
-def cfar_alpha(mode, n_ref, pfa, K=1.0, os_k=0):
-    """The threshold multiplier for `pfa` per cell: (alpha, E[T]). T is the
-    reference statistic in units of the noise mean (CA: the mean of N = 2
-    n_ref cells; GO / SO: the greater / smaller of the two side means; OS:
-    the os_k-th smallest of the N cells); the cell under test is K-look
-    gamma. Pfa(alpha) = integral Q(K, K alpha t) f_T(t) dt, solved for alpha
-    by regula falsi (Illinois) in ln alpha. K = 1 reproduces the closed forms:
-    CA alpha = N (Pfa^(-1/N) - 1); OS Pfa = prod_{i<k} (N-i)/(N-i+alpha)."""
-    N = 2 * int(n_ref)
-    k = int(os_k) or (3 * N + 3) // 4
-    t, G, ET = _cfar_grid(mode, N, float(K), k, float(pfa))
+def _cfar_solve(mode, N, ne, K, k, pfa):
+    """Pfa(alpha) = pfa for one mode at N cells (ne effective): (alpha, E[T]).
+    pfa may sit below 1e-15 here — the OS mapping asks for one."""
+    t, G, ET = _cfar_grid(mode, N, ne, float(K), k, float(pfa))
     lnpfa = _m.log(pfa)
 
     def f(v):
@@ -7079,10 +7290,46 @@ def cfar_alpha(mode, n_ref, pfa, K=1.0, os_k=0):
     return _m.exp(c), ET
 
 
-def cfar_edge_beta(nb, looks):
-    """beta with P(Gamma(nb*looks) / (nb*looks) > beta) = CFAR_EDGE_PFA: the
-    single-frame band test for nb bins. Bisection in ln beta, 100 steps."""
-    s = float(nb) * float(looks)
+def cfar_alpha(mode, n_ref, pfa, K=1.0, os_k=0, rho2=None):
+    """The threshold multiplier for `pfa` per cell: (alpha, E[T]). T is the
+    reference statistic in units of the noise mean (CA: the mean of N = 2
+    n_ref cells; GO / SO: the greater / smaller of the two side means; OS:
+    the os_k-th smallest of the N cells); the cell under test is K-look
+    gamma. Pfa(alpha) = integral Q(K, K alpha t) f_T(t) dt, solved for alpha
+    by regula falsi (Illinois) in ln alpha. K = 1 reproduces the closed forms:
+    CA alpha = N (Pfa^(-1/N) - 1); OS Pfa = prod_{i<k} (N-i)/(N-i+alpha).
+
+    rho2 (four power correlations of bins 1..4 apart, or None) is the
+    window's correlation of neighbouring cells: CA and GO / SO are solved
+    with the equivalent independent count cfar_n_eff(n_ref, rho2) as the
+    gamma shapes; OS is solved at the rate the independent-cell CA formula
+    assigns to the correlated CA threshold (ATK cue_live.py's correction,
+    measured within 8 % of the design rate in every mode)."""
+    if rho2 is not None and not _rho2_ok(rho2):
+        raise ValueError("rho2: four correlations, each in [0, 1)")
+    N = 2 * int(n_ref)
+    k = int(os_k) or (3 * N + 3) // 4
+    ne = cfar_n_eff(n_ref, rho2)
+    if mode != CFAR_OS or ne == float(N):
+        return _cfar_solve(mode, N, ne, K, k, pfa)
+    a_eff, _ = _cfar_solve(CFAR_CA, N, ne, K, 0, pfa)
+    t, G, _ = _cfar_grid(CFAR_CA, N, float(N), float(K), 0, float(pfa))
+    ask = _cfar_pfa(t, G, float(K), a_eff)
+    if not ask > 0.0:
+        ask = 1e-300
+    return _cfar_solve(mode, N, float(N), K, k, ask)
+
+
+def cfar_edge_beta(nb, looks, rho2=None):
+    """beta with P(Gamma(nb_eff*looks) / (nb_eff*looks) > beta) = CFAR_EDGE_PFA:
+    the single-frame band test for nb contiguous bins, nb_eff the equivalent
+    independent bins among them. Bisection in ln beta, 100 steps."""
+    pairs = 0.0
+    if rho2 is not None:
+        for m in range(1, CFAR_RHO_MAX + 1):
+            if m < nb:
+                pairs += (nb - m) * float(rho2[m - 1])
+    s = float(nb) / (1.0 + 2.0 * pairs / float(nb)) * float(looks)
     target = _m.log(CFAR_EDGE_PFA)
     a, b = _m.log(1e-6), _m.log(1e6)
     for _ in range(100):
@@ -7112,7 +7359,10 @@ class Cfar:
                 raise ValueError(f"unknown CFAR option {key!r}")
             c[key] = v
         for key in c:
-            c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
+            if key == "rho2":
+                c[key] = tuple(float(v) for v in c[key]) if _rho2_ok(c[key]) else c[key]
+            else:
+                c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
         why = _cfar_check(int(nbins), c)
         if why:
             raise ValueError(f"CFAR refused: {why}")
@@ -7122,9 +7372,11 @@ class Cfar:
         if c["mode"] == CFAR_OS and c["os_k"] == 0:
             c["os_k"] = (3 * N + 3) // 4
         self.K = c["looks"] * c["k_frames"]
-        self.alpha, self.et = cfar_alpha(c["mode"], c["n_ref"], c["pfa"], self.K, c["os_k"])
+        self.n_eff = cfar_n_eff(c["n_ref"], c["rho2"])
+        self.alpha, self.et = cfar_alpha(c["mode"], c["n_ref"], c["pfa"], self.K, c["os_k"],
+                                         c["rho2"])
         if c["mode"] in (CFAR_GO, CFAR_SO):
-            self.alpha_ca, _ = cfar_alpha(CFAR_CA, c["n_ref"], c["pfa"], self.K)
+            self.alpha_ca, _ = cfar_alpha(CFAR_CA, c["n_ref"], c["pfa"], self.K, 0, c["rho2"])
         else:
             self.alpha_ca = self.alpha
         self._beta = {}
@@ -7201,7 +7453,7 @@ class Cfar:
 
     def _beta_for(self, nb: int) -> float:
         if nb not in self._beta:
-            self._beta[nb] = cfar_edge_beta(nb, self.cfg["looks"])
+            self._beta[nb] = cfar_edge_beta(nb, self.cfg["looks"], self.cfg["rho2"])
         return self._beta[nb]
 
     # -- the per-frame test ---------------------------------------------------
@@ -7482,13 +7734,16 @@ class Cfar:
 
     def describe(self) -> str:
         return cfar_describe(self.nbins, self.cfg, self.alpha, int(self.mask.sum()),
-                             len(self._tracks))
+                             len(self._tracks), self.n_eff)
 
 
-def cfar_describe(nbins, c, alpha, masked, ntracks) -> str:
+def cfar_describe(nbins, c, alpha, masked, ntracks, n_eff=None) -> str:
     mode = CFAR_MODE_NAMES[c["mode"]]
     os_txt = f" (rank {c['os_k']} of {2 * c['n_ref']})" if c["mode"] == CFAR_OS else ""
-    return (f"CFAR {mode}{os_txt}: {c['n_ref']}+{c['n_ref']} reference cells, "
+    eff_txt = ""
+    if n_eff is not None and n_eff != float(2 * c["n_ref"]):
+        eff_txt = f" ({n_eff:.1f} effective, window-correlated)"
+    return (f"CFAR {mode}{os_txt}: {c['n_ref']}+{c['n_ref']} reference cells{eff_txt}, "
             f"{c['n_guard']} guard each side, Pfa {c['pfa']:.3g} per cell per frame, "
             f"K = {c['looks']:g} look(s) x {c['k_frames']} frame(s), alpha {alpha:.4g} "
             f"({10.0 * _m.log10(alpha):.2f} dB); open {c['open_m']} of {c['open_n']}, "
@@ -8105,3 +8360,1357 @@ def ring_describe(st) -> str:
             f"({total / 1048576.0:.1f} MiB of data), {st['active']} of "
             f"{st['max_consumers']} consumers, {st['committed']} committed, "
             f"{st['torn']} torn reads")
+
+
+# ============================================================================
+# PHASE 3 (v0.17.0, ABI 18) — docs/ATKDSP_PLAN.md §B3, §B4, §C3
+# ============================================================================
+# §22 live pulse runs (the twin of src/pulses.c).
+PDW_TRUNCATED, PDW_NO_FREQ, PDW_EDGE_START, PDW_FLUSHED = 1, 2, 4, 8
+
+
+def pulses_defaults() -> dict:
+    """The defaults atkdsp_pulses_defaults() writes."""
+    return dict(fs=1.0, floor=1.0, thresh_db=10.0, hyst_db=0.0, min_samples=4,
+                max_samples=65536)
+
+
+def _pulses_check(c) -> str:
+    if not (c["fs"] > 0.0 and _m.isfinite(c["fs"])):
+        return "fs must be a positive rate"
+    if not (c["floor"] > 0.0 and _m.isfinite(c["floor"])):
+        return "floor must be a positive magnitude (atkdsp_mag_median gives it)"
+    if not 0.0 <= c["thresh_db"] <= 120.0:
+        return "thresh_db 0..120"
+    if not 0.0 <= c["hyst_db"] <= c["thresh_db"]:
+        return "hyst_db 0..thresh_db"
+    if not 1 <= c["min_samples"] <= (1 << 20):
+        return "min_samples 1..2^20"
+    if not 4 <= c["max_samples"] <= (1 << 24):
+        return "max_samples 4..2^24"
+    return ""
+
+
+def mag_of(x) -> np.ndarray:
+    """|x| as the C computes it: sqrt(re^2 + im^2) in double, rounded to float32."""
+    x = np.asarray(x, dtype=np.complex64)
+    re, im = x.real.astype(np.float64), x.imag.astype(np.float64)
+    return np.sqrt(re * re + im * im).astype(np.float32)
+
+
+def mag_median(x) -> float:
+    """pulse.py's noise floor: the median of |x| (numpy's even-count mean of
+    the two middle values, in double), the twin of atkdsp_mag_median."""
+    m = mag_of(x).astype(np.float64)
+    if m.size == 0:
+        raise ValueError("mag_median of nothing")
+    return float(np.median(m))
+
+
+class Pulses:
+    """Twin of atkdsp_pulses (atkdsp.h §22): envelope, threshold with
+    hysteresis, runs carried across blocks, one PDW dict per run with the
+    atkdsp_pdw fields (toa, pw, freq_hz, chirp_hz, slope_hz_s, pa_db,
+    peak_db, energy, flags, start, end, n). With hyst_db = 0 the words are
+    ATK's atk.core.pulse.detect_pulses' for the same floor."""
+
+    def __init__(self, t0: float = 0.0, **cfg):
+        c = pulses_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise ValueError(f"unknown pulses option {key!r}")
+            c[key] = v
+        for key in c:
+            c[key] = int(c[key]) if key in ("min_samples", "max_samples") else float(c[key])
+        why = _pulses_check(c)
+        if why:
+            raise ValueError(f"pulses refused: {why}")
+        if not _m.isfinite(t0):
+            raise ValueError("t0 must be finite")
+        self.cfg = c
+        self.t0 = float(t0)
+        self._thresholds()
+        self.idx = 0
+        self.prev_mag = 0.0
+        self.have_prev = False
+        self.open = False
+        self._st = dict(samples=0, pulses=0, dropped=0, truncated=0, short_runs=0, open=0,
+                        resets=0)
+
+    def _thresholds(self):
+        self.thr_open = self.cfg["floor"] * 10.0 ** (self.cfg["thresh_db"] / 20.0)
+        self.thr_close = self.cfg["floor"] * 10.0 ** ((self.cfg["thresh_db"] - self.cfg["hyst_db"]) / 20.0)
+
+    def reset(self, t0: float = 0.0) -> None:
+        self.t0 = float(t0) if _m.isfinite(t0) else 0.0
+        self.idx = 0
+        self.have_prev = False
+        self.prev_mag = 0.0
+        self.open = False
+        self._st["open"] = 0
+        self._st["resets"] += 1
+
+    def set_floor(self, floor: float) -> None:
+        if not (floor > 0.0 and _m.isfinite(floor)):
+            raise ValueError("floor must be a positive magnitude")
+        self.cfg["floor"] = float(floor)
+        self._thresholds()
+
+    def max(self, n: int) -> int:
+        return int(n) // (self.cfg["min_samples"] + 1) + 1
+
+    def _open_run(self, j_abs: int, md_prev, md_here: float):
+        self.open = True
+        self.start = j_abs
+        self.flags = 0
+        if md_prev is None:
+            self.open_cross = float(j_abs)
+            self.flags |= PDW_EDGE_START
+        else:
+            self.open_cross = (j_abs - 1) + (self.thr_open - md_prev) / (md_here - md_prev)
+        self._buf = []
+        self.nbuf = 0
+        self.nrun = 0
+        self.sum_mag = 0.0
+        self.sum_pow = 0.0
+        self.peak = 0.0
+        self._st["open"] = 1
+
+    def _feed(self, seg, md):
+        room = self.cfg["max_samples"] - self.nbuf
+        if room > 0:
+            take = seg[:room]
+            self._buf.append(take)
+            self.nbuf += take.size
+        if seg.size > room:
+            self.flags |= PDW_TRUNCATED
+        self.nrun += seg.size
+        self.sum_mag += float(np.sum(md))
+        re, im = seg.real.astype(np.float64), seg.imag.astype(np.float64)
+        self.sum_pow += float(np.sum(re * re + im * im))
+        pk = float(md.max()) if md.size else 0.0
+        if pk > self.peak:
+            self.peak = pk
+
+    def _measure(self, close_cross: float) -> dict:
+        fs = self.cfg["fs"]
+        buf = np.concatenate(self._buf) if self._buf else np.zeros(0, np.complex64)
+        n = int(buf.size)
+        w = dict(toa=self.t0 + self.open_cross / fs, pw=(close_cross - self.open_cross) / fs,
+                 freq_hz=0.0, chirp_hz=0.0, slope_hz_s=0.0, pa_db=0.0, peak_db=0.0,
+                 energy=float(np.float32(self.sum_pow)), flags=int(self.flags),
+                 start=int(self.start), end=int(self.start + self.nrun), n=int(self.nrun))
+        mean = self.sum_mag / self.nrun
+        w["pa_db"] = float(np.float32(20.0 * _m.log10(max(mean / self.cfg["floor"], 1e-12))))
+        w["peak_db"] = float(np.float32(20.0 * _m.log10(max(self.peak / self.cfg["floor"], 1e-12))))
+        if n < 4:
+            w["flags"] |= PDW_NO_FREQ
+            return w
+        n_inst = n - 1
+        trim = max(1, n_inst // 10)
+        lo, hi = trim, n_inst - trim
+        if hi - lo < 1:
+            lo, hi = 0, n_inst
+        a, b = buf[lo + 1:hi + 1], buf[lo:hi]
+        pr = a.real * b.real + a.imag * b.imag           # complex64 parts: float32 arithmetic
+        pi = a.imag * b.real - a.real * b.imag
+        f = (np.arctan2(pi, pr).astype(np.float32) * np.float32(fs / (2.0 * _m.pi))).astype(np.float64)
+        m = float(hi - lo)
+        k = np.arange(hi - lo, dtype=np.float64)
+        s1, s2 = float(np.sum(f)), float(np.sum(f * f))
+        mean_f = s1 / m
+        var = max(s2 / m - mean_f * mean_f, 0.0)
+        w["freq_hz"] = mean_f
+        w["chirp_hz"] = 2.77 * _m.sqrt(var)
+        if m >= 3.0:
+            sk, skk, skf = float(np.sum(k)), float(np.sum(k * k)), float(np.sum(k * f))
+            den = m * skk - sk * sk
+            if den > 0.0:
+                w["slope_hz_s"] = (m * skf - sk * s1) / den * fs
+        return w
+
+    def process(self, x, cap=None) -> list:
+        x = np.asarray(x, dtype=np.complex64).ravel()
+        n = int(x.size)
+        mag = mag_of(x)
+        md = mag.astype(np.float64)
+        out = []
+        i = 0
+        while i < n:
+            if not self.open:
+                above = md[i:] > self.thr_open
+                if not above.any():
+                    break
+                j = i + int(np.argmax(above))
+                prev = (md[j - 1] if j > 0 else (self.prev_mag if self.have_prev else None))
+                self._open_run(self.idx + j, prev, md[j])
+                i = j
+            else:
+                below = md[i:] <= self.thr_close
+                j = i + int(np.argmax(below)) if below.any() else n
+                self._feed(x[i:j], md[i:j])
+                if j < n:
+                    m0 = md[j - 1] if j > i else self.prev_mag
+                    close_cross = (self.idx + j - 1) + (m0 - self.thr_close) / (m0 - md[j])
+                    self.open = False
+                    self._st["open"] = 0
+                    if self.nrun < self.cfg["min_samples"]:
+                        self._st["short_runs"] += 1
+                    else:
+                        self._st["pulses"] += 1
+                        if self.flags & PDW_TRUNCATED:
+                            self._st["truncated"] += 1
+                        if cap is None or len(out) < cap:
+                            out.append(self._measure(close_cross))
+                        else:
+                            self._st["dropped"] += 1
+                i = j
+        if n:
+            self.prev_mag = float(md[-1])
+            self.have_prev = True
+        self.idx += n
+        self._st["samples"] += n
+        return out
+
+    def flush(self, cap=None) -> list:
+        if not self.open:
+            return []
+        self.open = False
+        self._st["open"] = 0
+        if self.nrun < self.cfg["min_samples"]:
+            self._st["short_runs"] += 1
+            return []
+        self._st["pulses"] += 1
+        if self.flags & PDW_TRUNCATED:
+            self._st["truncated"] += 1
+        if cap is not None and cap < 1:
+            self._st["dropped"] += 1
+            return []
+        self.flags |= PDW_FLUSHED
+        return [self._measure(float(self.idx - 1))]
+
+    def stats(self) -> dict:
+        return dict(self._st)
+
+    def describe(self) -> str:
+        c = self.cfg
+        return (f"pulses: fs {c['fs']:.6g} Hz, floor {c['floor']:.4g} "
+                f"({20.0 * _m.log10(c['floor']):.1f} dBFS), open at +{c['thresh_db']:.1f} dB, "
+                f"close at +{c['thresh_db'] - c['hyst_db']:.1f} dB, min {c['min_samples']} samples, "
+                f"keep {c['max_samples']}; {self._st['pulses']} pulses, {self._st['dropped']} dropped, "
+                f"{self._st['short_runs']} short, open: {'yes' if self.open else 'no'}")
+
+
+def detect_pdws(x, fs: float, floor: float | None = None, **cfg) -> list:
+    """One call over a whole record: the words of Pulses with the record's own
+    median floor (pulse.detect_pulses' convention) unless one is given."""
+    x = np.asarray(x, dtype=np.complex64).ravel()
+    if floor is None:
+        floor = mag_median(x)
+    p = Pulses(0.0, fs=fs, floor=floor, **cfg)
+    out = p.process(x)
+    out += p.flush()
+    return out
+
+
+# ----------------------------------------------------------------------------
+# §23 cyclic probes (the twin of src/cyclic.c)
+# ----------------------------------------------------------------------------
+NL_ENV2, NL_POW2, NL_POW4, NL_POW8, NL_DM, NL_FDIFF = 0, 1, 2, 3, 4, 5
+NL_NAMES = ("|x|^2", "x^2", "x^4", "x^8", "|x - x[-1]|^2", "(f - f[-1])^2")
+CYC_LINE, CYC_WARMUP = 1, 2
+CP_DETECT, CP_LINE, CP_WARMUP = 1, 2, 4
+CYC_MAX_CAND, CYC_SEG_MIN, CYC_SEG_MAX, CYC_NSEG_MAX = 64, 16, 1 << 16, 4096
+CP_LAG_MAX, CP_CP_MAX = 1 << 16, 1 << 14
+
+
+def cyclic_thresholds(nseg: int, pfa_each: float) -> tuple:
+    """(level_thr, coh_thr): -ln pfa, and sqrt(-ln pfa / (0.785 nseg)) — the
+    Rayleigh-walk coherence bound (src/cyclic.c has the measurement)."""
+    l_ = -_m.log(pfa_each)
+    return l_, (_m.sqrt(l_ / (0.785 * nseg)) if nseg > 0 else 2.0)
+
+
+def hann_periodic(L: int) -> np.ndarray:
+    return 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(L) / L))
+
+
+class _LineAcc:
+    """The last K segments' phasors (global phase) and energies of one line."""
+
+    def __init__(self, omega: float, L: int, K: int):
+        self.omega, self.L, self.K = float(omega), int(L), int(K)
+        self.p = []
+        self.e = []
+
+    def reset(self):
+        self.p, self.e = [], []
+
+    def segment(self, v: np.ndarray, w: np.ndarray, g0: int):
+        """v: the mean-removed input (complex, L), g0 the global index of its
+        first sample."""
+        n = np.arange(self.L, dtype=np.float64)
+        ph = np.exp(-1j * self.omega * n) * np.exp(-1j * self.omega * float(g0))
+        p = complex(np.sum(w * v * ph))
+        e = float(np.sum(np.abs(v) ** 2))
+        self.p.append(p)
+        self.e.append(e)
+        if len(self.p) > self.K:
+            del self.p[0]
+            del self.e[0]
+
+    def read(self, wsum2_over_L: float, t_seg: float) -> dict:
+        K = len(self.p)
+        out = dict(level=0.0, coherence=0.0, delta_hz=0.0, level_aligned=0.0,
+                   coherence_aligned=0.0, nseg=K)
+        if not K:
+            return out
+        p = np.array(self.p)
+        s = complex(np.sum(p))
+        sa = float(np.sum(np.abs(p)))
+        se = float(np.sum(self.e))
+        den = se * wsum2_over_L
+        out["level"] = abs(s) ** 2 / den if den > 0 else 0.0
+        out["coherence"] = abs(s) / sa if sa > 0 else 0.0
+        d = complex(np.sum(p[1:] * np.conj(p[:-1]))) if K >= 2 else 0j
+        if K >= 2 and d != 0:
+            dphi = _m.atan2(d.imag, d.real)
+            out["delta_hz"] = dphi / (2.0 * _m.pi * t_seg)
+            q = complex(np.sum(p * np.exp(-1j * dphi * np.arange(K))))
+            out["level_aligned"] = abs(q) ** 2 / den if den > 0 else 0.0
+            out["coherence_aligned"] = abs(q) / sa if sa > 0 else 0.0
+        else:
+            out["level_aligned"], out["coherence_aligned"] = out["level"], out["coherence"]
+        return out
+
+
+def _nonlin(x: np.ndarray, prev, nonlin: int, hard_limit: int) -> np.ndarray:
+    """The nonlinearity of a segment (prev: the samples before it, up to two,
+    oldest first — an empty list at the start of a stream)."""
+    x = x.astype(np.complex128)
+    if nonlin == NL_ENV2:
+        return (np.abs(x) ** 2).astype(np.complex128)
+    if nonlin == NL_FDIFF:
+        h = len(prev)
+        ext = np.concatenate([np.asarray(prev, np.complex128), x])     # x[n] at ext[n + h]
+        n = np.arange(x.size)
+        def argp(a, b):
+            z = a * np.conj(b)
+            return np.arctan2(z.imag, z.real)
+        f1 = np.zeros(x.size)
+        f0 = np.zeros(x.size)
+        ok1 = n + h >= 1
+        ok0 = n + h >= 2
+        i1 = n + h                                      # ext index of x[n]
+        f1[ok1] = argp(ext[i1[ok1]], ext[i1[ok1] - 1])
+        f0[ok0] = argp(ext[i1[ok0] - 1], ext[i1[ok0] - 2])
+        return ((f1 - f0) ** 2).astype(np.complex128)
+    if nonlin == NL_DM:
+        p = np.concatenate([[x[0] if not prev else complex(prev[-1])], x[:-1]])
+        if hard_limit:
+            mx = np.abs(x)
+            x = np.where(mx > 0, x / np.where(mx > 0, mx, 1.0), 0.0)
+            mp = np.abs(p)
+            p = np.where(mp > 0, p / np.where(mp > 0, mp, 1.0), 0.0)
+        return (np.abs(x - p) ** 2).astype(np.complex128)
+    if hard_limit:
+        mx = np.abs(x)
+        x = np.where(mx > 0, x / np.where(mx > 0, mx, 1.0), 0.0)
+    m = {NL_POW2: 2, NL_POW4: 4, NL_POW8: 8}[nonlin]
+    y = x
+    for _ in range(int(_m.log2(m))):
+        y = y * y
+    return y
+
+
+class Cyclic:
+    """Twin of atkdsp_cyclic (atkdsp.h §23): a line at each candidate symbol
+    rate after its nonlinearity. cands: a list of (rate_hz, nonlin[, hard_limit])."""
+
+    def __init__(self, fs: float, cands, seg_len: int, nseg: int, pfa: float = 1e-3):
+        fs = float(fs)
+        cands = [(float(c[0]), int(c[1]), int(c[2]) if len(c) > 2 else 0) for c in cands]
+        if not (fs > 0 and _m.isfinite(fs)) or not 1 <= len(cands) <= CYC_MAX_CAND:
+            raise ValueError("cyclic: fs > 0 and 1..64 candidates")
+        if not CYC_SEG_MIN <= seg_len <= CYC_SEG_MAX or not 2 <= nseg <= CYC_NSEG_MAX:
+            raise ValueError("cyclic: seg_len 16..65536 and nseg 2..4096")
+        if not 0 < pfa < 0.5:
+            raise ValueError("cyclic: 0 < pfa < 0.5")
+        for r, nl, _h in cands:
+            if not (0 < r < 0.5 * fs) or not 0 <= nl <= 5:
+                raise ValueError("cyclic: 0 < rate_hz < fs / 2 and a known nonlinearity")
+        self.fs, self.cands, self.L, self.K, self.pfa = fs, cands, int(seg_len), int(nseg), float(pfa)
+        self.pfa_each = pfa / len(cands)
+        self.level_thr, self.coh_thr = cyclic_thresholds(nseg, self.pfa_each)
+        if self.coh_thr > 1.0:
+            raise ValueError("cyclic: the coherence test cannot be met at this nseg and pfa — "
+                             "use more segments (16 or more at 1e-3)")
+        self.w = hann_periodic(self.L)
+        self.wsum2 = float(np.sum(self.w * self.w))
+        self.acc = [_LineAcc(2.0 * _m.pi * r / fs, self.L, self.K) for r, _n, _h in cands]
+        self._seg = np.zeros(0, np.complex64)
+        self._prev = []
+        self.idx = 0
+        self._st = dict(samples=0, segments=0, resets=0, segment_fill=0)
+
+    def reset(self):
+        for a in self.acc:
+            a.reset()
+        self._seg = np.zeros(0, np.complex64)
+        self._prev = []
+        self.idx = 0
+        self._st["resets"] += 1
+
+    def _finish(self, seg: np.ndarray):
+        g0 = self.idx
+        for (r, nl, hl), a in zip(self.cands, self.acc):
+            v = _nonlin(seg, self._prev, nl, hl)
+            v = v - np.mean(v)
+            a.segment(v, self.w, g0)
+        self._prev = [complex(seg[-2]), complex(seg[-1])]
+        self.idx += self.L
+        self._st["segments"] += 1
+
+    def process(self, x) -> None:
+        x = np.asarray(x, dtype=np.complex64).ravel()
+        buf = np.concatenate([self._seg, x]) if self._seg.size else x
+        i = 0
+        while buf.size - i >= self.L:
+            self._finish(buf[i:i + self.L])
+            i += self.L
+        self._seg = buf[i:].copy()
+        self._st["samples"] += x.size
+        self._st["segment_fill"] = int(self._seg.size)
+
+    def read(self) -> list:
+        out = []
+        t_seg = self.L / self.fs
+        for a in self.acc:
+            s = a.read(self.wsum2 / self.L, t_seg)
+            s["line_db"] = 10.0 * _m.log10(s["level"]) if s["level"] > 1e-30 else -300.0
+            s["level_thr"], s["coh_thr"] = self.level_thr, self.coh_thr
+            flags = 0
+            if s["nseg"] < self.K:
+                flags |= CYC_WARMUP
+            elif s["level"] >= self.level_thr and s["coherence"] >= self.coh_thr:
+                flags |= CYC_LINE
+            s["flags"] = flags
+            out.append(s)
+        return out
+
+    def stats(self) -> dict:
+        return dict(self._st)
+
+    def describe(self) -> str:
+        head = (f"cyclic: fs {self.fs:.6g} Hz, {len(self.cands)} candidate(s), segments of {self.L} "
+                f"samples ({self.L / self.fs:.4g} s) x {self.K} ({self.L * self.K / self.fs:.4g} s), "
+                f"Pfa {self.pfa_each:.3g} each -> level >= {self.level_thr:.2f} and coherence >= "
+                f"{self.coh_thr:.3f}; {self._st['segments']} segments in:")
+        parts = [f" {r:.6g} Bd {NL_NAMES[nl]}{' (limited)' if hl and nl else ''}" for r, nl, hl in self.cands]
+        return head + ",".join(parts)
+
+
+class CpProbe:
+    """Twin of atkdsp_cp_probe (atkdsp.h §23). cands: (lag, cp[, period])."""
+
+    def __init__(self, fs: float, cands, seg_len: int, nseg: int, pfa: float = 1e-3):
+        fs = float(fs)
+        cands = [(int(c[0]), int(c[1]), int(c[2]) if len(c) > 2 else 0) for c in cands]
+        if not (fs > 0 and _m.isfinite(fs)) or not 1 <= len(cands) <= CYC_MAX_CAND:
+            raise ValueError("cp_probe: fs > 0 and 1..64 candidates")
+        if not CYC_SEG_MIN <= seg_len <= CYC_SEG_MAX or not 2 <= nseg <= CYC_NSEG_MAX:
+            raise ValueError("cp_probe: seg_len 16..65536 and nseg 2..4096")
+        if not 0 < pfa < 0.5:
+            raise ValueError("cp_probe: 0 < pfa < 0.5")
+        for lag, cp, per in cands:
+            if not 1 <= lag <= CP_LAG_MAX or not 0 <= cp <= CP_CP_MAX or not 0 <= per <= CP_LAG_MAX + CP_CP_MAX:
+                raise ValueError("cp_probe: lag 1..65536, cp 0..16384, period 0..81920")
+            if cp and (per or lag + cp) < 2:
+                raise ValueError("cp_probe: period >= 2")
+        self.fs, self.cands, self.L, self.K, self.pfa = fs, cands, int(seg_len), int(nseg), float(pfa)
+        self.pfa_each = pfa / len(cands)
+        self.level_thr, self.coh_thr = cyclic_thresholds(nseg, self.pfa_each)
+        if self.coh_thr > 1.0 and any(cp for _lag, cp, _p in cands):
+            raise ValueError("cp_probe: the coherence test cannot be met at this nseg and pfa — "
+                             "use more segments (16 or more at 1e-3)")
+        self.hist = max(lag + cp for lag, cp, _p in cands)
+        self.w = hann_periodic(self.L)
+        self.wsum2 = float(np.sum(self.w * self.w))
+        self.acc = [_LineAcc(2.0 * _m.pi / (per or lag + cp), self.L, self.K) for lag, cp, per in cands]
+        self.r = [0j] * len(cands)
+        self.e = [0.0] * len(cands)
+        self.npairs = [0.0] * len(cands)
+        self._hist = np.zeros(self.hist, np.complex64)
+        self._seg = np.zeros(0, np.complex64)
+        self.idx = 0
+        self._st = dict(samples=0, segments=0, resets=0, segment_fill=0)
+
+    def reset(self):
+        for a in self.acc:
+            a.reset()
+        self.r = [0j] * len(self.cands)
+        self.e = [0.0] * len(self.cands)
+        self.npairs = [0.0] * len(self.cands)
+        self._hist = np.zeros(self.hist, np.complex64)
+        self._seg = np.zeros(0, np.complex64)
+        self.idx = 0
+        self._st["resets"] += 1
+
+    def _finish(self, seg: np.ndarray):
+        H, L = self.hist, self.L
+        b = np.concatenate([self._hist, seg]).astype(np.complex128)
+        g = self.idx                                 # global index of b[H]
+        for i, ((N, W, _per), a) in enumerate(zip(self.cands, self.acc)):
+            m = np.arange(H - W, H + L)
+            older = m - N
+            valid = (g + (m - H) - N) >= 0
+            y = np.where(valid, b[m] * np.conj(b[np.maximum(older, 0)]), 0j)
+            inseg = m >= H
+            self.r[i] += complex(np.sum(y[inseg]))
+            ee = 0.5 * (np.abs(b[m]) ** 2 + np.abs(b[np.maximum(older, 0)]) ** 2)
+            self.e[i] += float(np.sum(np.where(valid & inseg, ee, 0.0)))
+            self.npairs[i] += float(np.sum(valid & inseg))
+            if not W:
+                continue
+            # z[H + n] = sum of y over j = n + 1 .. n + W (y[j] at m = H - W + j)
+            cs = np.concatenate([[0j], np.cumsum(y)])
+            n = np.arange(L)
+            z = cs[n + W + 1] - cs[n + 1]
+            v = np.abs(z).astype(np.complex128)
+            v = v - np.mean(v)
+            a.segment(v, self.w, g)
+        self._hist = b[L:L + H].astype(np.complex64) if H else self._hist
+        self.idx += L
+        self._st["segments"] += 1
+
+    def process(self, x) -> None:
+        x = np.asarray(x, dtype=np.complex64).ravel()
+        buf = np.concatenate([self._seg, x]) if self._seg.size else x
+        i = 0
+        while buf.size - i >= self.L:
+            self._finish(buf[i:i + self.L])
+            i += self.L
+        self._seg = buf[i:].copy()
+        self._st["samples"] += x.size
+        self._st["segment_fill"] = int(self._seg.size)
+
+    def read(self) -> list:
+        out = []
+        t_seg = self.L / self.fs
+        for i, ((N, W, _per), a) in enumerate(zip(self.cands, self.acc)):
+            r = dict(score=0.0, score_thr=2.0, npairs=self.npairs[i], line_level=0.0,
+                     line_coherence=0.0, line_coh_thr=0.0, line_delta_hz=0.0, nseg=0, flags=0)
+            if self.e[i] > 0:
+                r["score"] = abs(self.r[i]) / self.e[i]
+            if self.npairs[i] > 0:
+                r["score_thr"] = _m.sqrt(-_m.log(self.pfa_each) / self.npairs[i])
+                if r["score"] >= r["score_thr"]:
+                    r["flags"] |= CP_DETECT
+            if W:
+                s = a.read(self.wsum2 / self.L, t_seg)
+                r["line_level"], r["line_coherence"] = s["level"], s["coherence"]
+                r["line_delta_hz"], r["line_coh_thr"] = s["delta_hz"], self.coh_thr
+                r["nseg"] = s["nseg"]
+                if s["nseg"] < self.K:
+                    r["flags"] |= CP_WARMUP
+                elif s["coherence"] >= self.coh_thr:
+                    r["flags"] |= CP_LINE
+            out.append(r)
+        return out
+
+    def stats(self) -> dict:
+        return dict(self._st)
+
+    def describe(self) -> str:
+        head = (f"cp_probe: fs {self.fs:.6g} Hz, {len(self.cands)} candidate(s), segments of {self.L} "
+                f"samples x {self.K}, Pfa {self.pfa_each:.3g} each (coherence >= {self.coh_thr:.3f}); "
+                f"{self._st['segments']} segments in:")
+        parts = []
+        for lag, cp, per in self.cands:
+            P = per or lag + cp
+            parts.append(f" lag {lag}, cp {cp}, period {P}" if cp else f" lag {lag}")
+        return head + ",".join(parts)
+
+
+# ----------------------------------------------------------------------------
+# §24 analog radio IDs (the twin of src/tone_id.c) — tables and config first
+# ----------------------------------------------------------------------------
+CTCSS_TONES = (67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4, 100.0, 103.5,
+               107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5, 141.3, 146.2, 151.4, 156.7,
+               159.8, 162.2, 165.5, 167.9, 171.3, 173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8,
+               196.6, 199.5, 203.5, 206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1)
+DCS_TURNOFF_HZ = 134.4
+DCS_RATE = 134.4
+DCS_POLY = 0xC75
+DCS_CODES = tuple(int(s, 8) for s in (
+    "023 025 026 031 032 036 043 047 051 053 054 065 071 072 073 074 114 115 116 122 125 131 132 "
+    "134 143 145 152 155 156 162 165 172 174 205 212 223 225 226 243 244 245 246 251 252 255 261 "
+    "263 265 266 271 274 306 311 315 325 331 332 343 346 351 356 364 365 371 411 412 413 423 431 "
+    "432 445 446 452 454 455 462 464 465 466 503 506 516 523 526 532 546 565 606 612 624 627 631 "
+    "632 654 662 664 703 712 723 731 732 734 743 754").split())
+DTMF_LOW = (697.0, 770.0, 852.0, 941.0)
+DTMF_HIGH = (1209.0, 1336.0, 1477.0, 1633.0)
+DTMF_KEYS = "123A456B789C*0#D"
+TONE_CTCSS, TONE_DCS, TONE_DTMF, TONE_TONE = 1, 2, 3, 4
+TONE_START, TONE_END = 1, 2
+TONE_F_REVERSE_BURST, TONE_F_TURNOFF, TONE_F_NONSTANDARD, TONE_F_CORRECTED, TONE_F_FLUSHED = 1, 2, 4, 8, 16
+TONE_EN_CTCSS, TONE_EN_DCS, TONE_EN_DTMF, TONE_EN_TONE, TONE_EN_ALL = 1, 2, 4, 8, 15
+
+
+def tone_id_defaults() -> dict:
+    return dict(fs=8000.0, enable=TONE_EN_ALL, dcs_max_errors=1, ctcss_min_snr_db=10.0,
+                dtmf_min_dbfs=-45.0, tone_min_dbfs=-45.0, tone_min_snr_db=10.0)
+
+
+def _tone_id_check(c) -> str:
+    if not 6000.0 <= c["fs"] <= 96000.0:
+        return "fs 6000..96000"
+    if not 1 <= c["enable"] <= TONE_EN_ALL:
+        return "enable: a mask of CTCSS | DCS | DTMF | TONE"
+    if not 0 <= c["dcs_max_errors"] <= 3:
+        return "dcs_max_errors 0..3"
+    if not 0.0 <= c["ctcss_min_snr_db"] <= 60.0:
+        return "ctcss_min_snr_db 0..60"
+    if not -120.0 <= c["dtmf_min_dbfs"] <= 0.0 or not -120.0 <= c["tone_min_dbfs"] <= 0.0:
+        return "dtmf_min_dbfs and tone_min_dbfs -120..0"
+    if not 0.0 <= c["tone_min_snr_db"] <= 60.0:
+        return "tone_min_snr_db 0..60"
+    return ""
+
+
+def _golay_syndrome(w: int, nbits: int) -> int:
+    c = w
+    for _ in range(nbits):
+        if c & 1:
+            c ^= DCS_POLY
+        c >>= 1
+    return c & 0x7FF
+
+
+def dcs_encode(octal: int) -> int:
+    """The 23-bit Golay(23,12) word of a DCS code: the 9 code bits, the fixed
+    1,0,0 (bits 9..11), the 11 check bits of generator 0xC75; bit 0 first."""
+    data = 0o4000 | (int(octal) & 0x1FF)
+    return (_golay_syndrome(data, 12) << 12) | data
+
+
+_DCS_TAB = None
+
+
+def _dcs_table():
+    global _DCS_TAB
+    if _DCS_TAB is None:
+        tab = [0] * 2048
+        for a in range(23):
+            tab[_golay_syndrome(1 << a, 23)] = 1 << a
+            for b in range(a + 1, 23):
+                tab[_golay_syndrome((1 << a) | (1 << b), 23)] = (1 << a) | (1 << b)
+                for c in range(b + 1, 23):
+                    e = (1 << a) | (1 << b) | (1 << c)
+                    tab[_golay_syndrome(e, 23)] = e
+        _DCS_TAB = tab
+    return _DCS_TAB
+
+
+def _dcs_read(w: int) -> int:
+    if (w & 0xE00) != 0x800:
+        return -1
+    code = w & 0x1FF
+    return code if code in DCS_CODES else -1
+
+
+def dcs_decode(word: int, max_errors: int = 1) -> tuple:
+    """(corrections, code, alias) — the normal reading and the inverted one
+    (always another standard code: the cyclic Golay code's complement
+    property), or (-1, -1, -1)."""
+    word &= 0x7FFFFF
+    s = _golay_syndrome(word, 23)
+    e = _dcs_table()[s] if s else 0
+    nerr = bin(e).count("1")
+    if (s and not e) or nerr > max_errors:
+        return -1, -1, -1
+    w = word ^ e
+    c = a = -1
+    for k in range(23):
+        r = ((w << k) | (w >> (23 - k))) & 0x7FFFFF
+        c = _dcs_read(r)
+        if c >= 0:
+            break
+    wi = ~w & 0x7FFFFF
+    for k in range(23):
+        r = ((wi << k) | (wi >> (23 - k))) & 0x7FFFFF
+        a = _dcs_read(r)
+        if a >= 0:
+            break
+    return (nerr, c, a) if c >= 0 else (-1, -1, -1)
+
+
+# ----------------------------------------------------------------------------
+# §24 the detector (twin of src/tone_id.c's atkdsp_tone_id)
+# ----------------------------------------------------------------------------
+def _wrap_pi(x: float) -> float:
+    while x > _m.pi:
+        x -= 2.0 * _m.pi
+    while x < -_m.pi:
+        x += 2.0 * _m.pi
+    return x
+
+
+def _median(a) -> float:
+    a = sorted(a)
+    n = len(a)
+    return a[n // 2] if n & 1 else 0.5 * (a[n // 2 - 1] + a[n // 2])
+
+
+class _Dft:
+    """DFTs of a windowed real frame at fixed frequencies (the C's Goertzel)."""
+
+    def __init__(self, freqs, fs, L):
+        n = np.arange(L, dtype=np.float64)
+        self.ph = [np.exp(-2j * np.pi * f / fs * n) for f in freqs]
+
+    def __call__(self, v):
+        return [complex(np.sum(v * p)) for p in self.ph]
+
+
+class ToneId:
+    """Twin of atkdsp_tone_id (atkdsp.h §24): CTCSS, DCS, DTMF and tracked
+    tones on demodulated audio, as START / END event dicts."""
+
+    def __init__(self, t0: float = 0.0, **cfg):
+        c = tone_id_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise ValueError(f"unknown tone_id option {key!r}")
+            c[key] = v
+        for key in c:
+            c[key] = int(c[key]) if key in ("enable", "dcs_max_errors") else float(c[key])
+        why = _tone_id_check(c)
+        if why:
+            raise ValueError(f"tone_id refused: {why}")
+        if not _m.isfinite(t0):
+            raise ValueError("t0 must be finite")
+        self.cfg = c
+        fs = c["fs"]
+        self.fs, self.t0 = fs, float(t0)
+        # the sub-audio chain
+        self.decim = int(_m.floor(fs / 1000.0))
+        self.fs_sub = fs / self.decim
+        self.lp = design_lowpass(270.0, 330.0, 60.0, fs).astype(np.float32)
+        self.lp_n = int(self.lp.size)
+        # CTCSS
+        self.cs_L = int(_m.floor(0.1 * self.fs_sub + 0.5))
+        self.cs_w = hann_periodic(self.cs_L)
+        self.cs_wsum = float(np.sum(self.cs_w))
+        self.cs_freqs = list(CTCSS_TONES) + [DCS_TURNOFF_HZ]
+        self.cs_dft = _Dft(self.cs_freqs, self.fs_sub, self.cs_L)
+        # DCS
+        self.dcs_M = int(_m.floor(1.0 * self.fs_sub + 0.5))
+        self.dcs_step = int(_m.floor(0.25 * self.fs_sub + 0.5))
+        self.dcs_alpha = 1.0 / (2.0 * self.fs_sub)
+        # DTMF
+        self.dt_W = int(_m.floor(0.02 * fs + 0.5))
+        self.dt_H = int(_m.floor(0.01 * fs + 0.5))
+        self.dt_w = hann_periodic(self.dt_W)
+        self.dt_wsum = float(np.sum(self.dt_w))
+        self.dt_wsum2 = float(np.sum(self.dt_w * self.dt_w))
+        freqs = list(DTMF_LOW) + list(DTMF_HIGH) + [2 * f for f in DTMF_LOW] + [2 * f for f in DTMF_HIGH]
+        self.dt_dft = _Dft(freqs, fs, self.dt_W)
+        # the tone tracker
+        self.tk_W = int(_m.floor(0.02 * fs + 0.5))
+        self.tk_H = self.dt_H
+        nf = 1
+        while nf < self.tk_W:
+            nf <<= 1
+        self.tk_nfft = nf
+        self.tk_w = hann_periodic(self.tk_W)
+        self.tk_wsum = float(np.sum(self.tk_w))
+        self._st = dict(samples=0, events=0, dropped=0, ctcss=0, dcs=0, dtmf=0, tones=0, resets=0)
+        self._zero_state()
+
+    def _zero_state(self):
+        self.idx = 0
+        self.sub_idx = 0
+        self._lp_hist = np.zeros(self.lp_n, np.float32)
+        self._lp_pos = 0
+        self._lp_phase = 0
+        self._cs_seg = []
+        self._cs_prev = None
+        self.cs_segs = 0
+        self.cs_state = 0
+        self.cs_count = self.cs_miss = 0
+        self.cs_f_sum = self.cs_lvl_sum = self.cs_snr_sum = self.cs_f_last = 0.0
+        self.cs_seg0 = self.cs_seg_last = 0
+        self.cs_reverse = self.cs_turnoff = 0
+        self.cs_bin = -1
+        self.cs_resid_prev = 0.0
+        self.turnoff_seg = 0
+        self._dcs_ring = np.zeros(self.dcs_M, np.float32)
+        self._dcs_head = 0
+        self._dcs_filled = 0
+        self._dcs_dc = 0.0
+        self._dcs_count = 0
+        self.dcs_state = 0
+        self.dcs_code = self.dcs_alias = -1
+        self.dcs_miss = self.dcs_corrected = 0
+        self.dcs_t0_sub = self.dcs_tlast_sub = 0
+        self._dt_buf = np.zeros(self.dt_W, np.float32)
+        self._dt_pos = 0
+        self._dt_prev = None
+        self.dt_state, self.dt_key, self.dt_count, self.dt_miss = 0, -1, 0, 0
+        self.dt_f1_sum = self.dt_f2_sum = self.dt_lvl_sum = self.dt_snr_sum = 0.0
+        self.dt_frame0 = self.dt_frame_last = 0
+        self._tk_buf = np.zeros(self.tk_W, np.float32)
+        self._tk_pos = 0
+        self.tk_state, self.tk_count = 0, 0
+        self.tk_f_run = self.tk_f_sum = self.tk_lvl_sum = self.tk_snr_sum = 0.0
+        self.tk_frame0 = self.tk_frame_last = 0
+
+    def reset(self, t0: float = 0.0):
+        self.t0 = float(t0) if _m.isfinite(t0) else 0.0
+        self._zero_state()
+        self._st["resets"] += 1
+
+    def events_max(self, n: int) -> int:
+        frames = n // self.dt_H + 2
+        segs = n // (self.cs_L * self.decim) + 2
+        srch = n // (self.dcs_step * self.decim) + 2
+        return 4 * frames + 2 * segs + 2 * srch
+
+    # -- output -------------------------------------------------------------
+    def _emit(self, kind, type_, t0, t1, f1, f2, level_db, snr_db, code, alias, flags):
+        self._st["events"] += 1
+        if self._cap is not None and len(self._out) >= self._cap:
+            self._st["dropped"] += 1
+            return
+        if kind == TONE_CTCSS:
+            text = f"CTCSS {f1:.1f}"
+        elif kind == TONE_DCS:
+            text = f"DCS {code:03o}N"
+        elif kind == TONE_DTMF:
+            text = f"DTMF {chr(code)}"
+        else:
+            text = f"TONE {f1:.0f}"
+        self._out.append(dict(kind=kind, type=type_, t0=float(t0), t1=float(t1), freq_hz=float(f1),
+                              freq2_hz=float(f2), level_db=float(np.float32(level_db)),
+                              snr_db=float(np.float32(snr_db)), code=int(code), alias=int(alias),
+                              flags=int(flags), text=text[:15]))
+
+    def _in_time(self, in_idx) -> float:
+        return self.t0 + float(in_idx) / self.fs
+
+    def _sub_time(self, m) -> float:
+        in_idx = (float(m) + 1.0) * self.decim - 1.0 - 0.5 * (self.lp_n - 1)
+        return self.t0 + in_idx / self.fs
+
+    def _cs_seg_time(self, seg) -> float:
+        return self._sub_time(float(seg) * self.cs_L)
+
+    # -- CTCSS --------------------------------------------------------------
+    def _cs_end(self, end_seg, flags):
+        f = self.cs_f_sum / self.cs_count
+        code, best = -1, 1.0
+        for i, ft in enumerate(CTCSS_TONES):
+            d = abs(f - ft)
+            if d < best:
+                best, code = d, i
+        if code < 0:
+            flags |= TONE_F_NONSTANDARD
+        if self.cs_reverse:
+            flags |= TONE_F_REVERSE_BURST
+        if self.cs_turnoff or (self.turnoff_seg and self.cs_seg_last <= self.turnoff_seg - 1 <= self.cs_seg_last + 5):
+            flags |= TONE_F_TURNOFF
+        self._emit(TONE_CTCSS, TONE_END, self._cs_seg_time(self.cs_seg0), self._cs_seg_time(end_seg), f, 0.0,
+                   self.cs_lvl_sum / self.cs_count, self.cs_snr_sum / self.cs_count, code, -1, flags)
+        self.cs_state = 0
+        self.cs_count = self.cs_miss = 0
+        self.cs_reverse = self.cs_turnoff = 0
+        self.cs_resid_prev = 0.0
+
+    def _cs_start_pending(self, f, lvl, snr, seg, peak):
+        self.cs_state = 1
+        self.cs_count = 1
+        self.cs_f_sum, self.cs_lvl_sum, self.cs_snr_sum = f, lvl, snr
+        self.cs_seg0 = self.cs_seg_last = seg
+        self.cs_f_last = f
+        self.cs_bin = peak
+
+    def _cs_segment(self, seg_samples):
+        L = self.cs_L
+        x = np.asarray(seg_samples, np.float64)
+        v = (x - np.mean(x)) * self.cs_w
+        p = self.cs_dft(v)
+        mag2 = [abs(z) ** 2 for z in p]
+        peak = int(np.argmax(mag2))
+        pm = mag2[peak]
+        others = [mag2[i] for i in range(len(mag2)) if i < peak - 2 or i > peak + 2]
+        floor_ = _median(others)
+        snr_db = 10.0 * _m.log10((pm + 1e-30) / (floor_ + 1e-30))
+        level_db = 20.0 * _m.log10(2.0 * _m.sqrt(pm) / self.cs_wsum + 1e-30)
+        t_seg = L / self.fs_sub
+        fpk = self.cs_freqs[peak]
+        near = sum(mag2[i] for i, fi in enumerate(self.cs_freqs) if abs(fi - fpk) <= 12.0)
+        total = sum(mag2[i] for i, fi in enumerate(self.cs_freqs) if abs(fi - fpk) <= 40.0)
+        line = total > 0.0 and near >= 0.7 * total
+        f_meas, have = 0.0, False
+        if line and snr_db >= self.cfg["ctcss_min_snr_db"] and self._cs_prev is not None:
+            q = self._cs_prev[peak]
+            d = p[peak] * q.conjugate()
+            adv = _wrap_pi(_m.atan2(d.imag, d.real) - 2.0 * _m.pi * fpk * t_seg)
+            f_meas = fpk + adv / (2.0 * _m.pi * t_seg)
+            have = True
+        seg = self.cs_segs
+        turnoff = have and peak == len(CTCSS_TONES) and abs(f_meas - DCS_TURNOFF_HZ) <= 1.0
+        if have and peak == len(CTCSS_TONES):
+            have = False
+        if turnoff:
+            self.turnoff_seg = seg + 1
+        if self.dcs_state == 1 and self.cs_state != 2:
+            have = False
+        if self.cs_state == 2:
+            if turnoff:
+                self.cs_turnoff = 1
+            f_run = self.cs_f_sum / self.cs_count
+            if have and abs(f_meas - f_run) <= 1.5 and abs(f_meas - self.cs_f_last) <= 0.75:
+                q = self._cs_prev[peak]
+                d = p[peak] * q.conjugate()
+                resid = _wrap_pi(_m.atan2(d.imag, d.real) - 2.0 * _m.pi * f_run * t_seg)
+                if abs(resid) > 0.5 * _m.pi or abs(_wrap_pi(resid + self.cs_resid_prev)) > 0.5 * _m.pi:
+                    self.cs_reverse = 1
+                self.cs_resid_prev = resid
+                self.cs_count += 1
+                self.cs_f_sum += f_meas
+                self.cs_lvl_sum += level_db
+                self.cs_snr_sum += snr_db
+                self.cs_seg_last = seg
+                self.cs_miss = 0
+                self.cs_f_last = f_meas
+            elif have and abs(f_meas - f_run) <= 12.0:
+                self.cs_reverse = 1
+                self.cs_f_last = f_run
+                self.cs_miss += 1
+                if self.cs_miss >= 3:
+                    self._cs_end(self.cs_seg_last + 1, 0)
+            else:
+                self.cs_miss += 1
+                if self.cs_miss >= 3 or (have and abs(f_meas - f_run) > 12.0):
+                    self._cs_end(self.cs_seg_last + 1, 0)
+                    if have:
+                        self._cs_start_pending(f_meas, level_db, snr_db, seg, peak)
+        elif self.cs_state == 1:
+            if have and abs(f_meas - self.cs_f_last) <= 0.75:
+                self.cs_count += 1
+                self.cs_f_sum += f_meas
+                self.cs_lvl_sum += level_db
+                self.cs_snr_sum += snr_db
+                self.cs_seg_last = seg
+                self.cs_f_last = f_meas
+                if self.cs_count >= 3:
+                    self.cs_state = 2
+                    f = self.cs_f_sum / self.cs_count
+                    code, best = -1, 1.0
+                    for i, ft in enumerate(CTCSS_TONES):
+                        dd = abs(f - ft)
+                        if dd < best:
+                            best, code = dd, i
+                    self._emit(TONE_CTCSS, TONE_START, self._cs_seg_time(self.cs_seg0), float("nan"), f, 0.0,
+                               self.cs_lvl_sum / self.cs_count, self.cs_snr_sum / self.cs_count, code, -1,
+                               TONE_F_NONSTANDARD if code < 0 else 0)
+                    self._st["ctcss"] += 1
+            elif have:
+                self._cs_start_pending(f_meas, level_db, snr_db, seg, peak)
+            else:
+                self.cs_state, self.cs_count = 0, 0
+        elif have:
+            self._cs_start_pending(f_meas, level_db, snr_db, seg, peak)
+        self._cs_prev = p
+        self.cs_segs += 1
+
+    # -- DCS ----------------------------------------------------------------
+    def _dcs_end(self, flags):
+        if self.dcs_corrected:
+            flags |= TONE_F_CORRECTED
+        if self.turnoff_seg:
+            t_off = self._cs_seg_time(self.turnoff_seg - 1)
+            t_last = self._sub_time(self.dcs_tlast_sub)
+            if t_last - 0.15 <= t_off <= t_last + 0.5:
+                flags |= TONE_F_TURNOFF
+        if self.dcs_code not in DCS_CODES:
+            flags |= TONE_F_NONSTANDARD
+        self._emit(TONE_DCS, TONE_END, self._sub_time(self.dcs_t0_sub), self._sub_time(self.dcs_tlast_sub),
+                   DCS_RATE, 0.0, 0.0, 0.0, self.dcs_code, self.dcs_alias, flags)
+        self.dcs_state = 0
+        self.dcs_code = self.dcs_alias = -1
+        self.dcs_miss = self.dcs_corrected = 0
+
+    def _dcs_search(self):
+        M = self.dcs_M
+        if self.cs_state == 2 and self.dcs_state == 0:
+            return
+        sps = self.fs_sub / DCS_RATE
+        avail = min(self._dcs_filled, M)
+        if avail < 2.5 * 23.0 * sps:
+            return
+        n = int(avail)
+        start = (self._dcs_head - n + M) % M
+        ring = np.concatenate([self._dcs_ring, self._dcs_ring])[start:start + n].astype(np.float64)
+        best = (0, -1, -1, 0, 0, 0)        # run, code, alias, corr, first_bit, phase
+        for ph in range(8):
+            off = ph / 8.0 * sps
+            bits = []
+            nb = 0
+            while True:
+                a = int(_m.floor(off + nb * sps + 0.5))
+                b = int(_m.floor(off + (nb + 1) * sps + 0.5))
+                if b > n or nb >= 2048:
+                    break
+                bits.append(1 if float(np.sum(ring[a:b])) > 0.0 else 0)
+                nb += 1
+            if nb < 46:
+                continue
+            for al in range(23):
+                nwords = (nb - al) // 23
+                if nwords < 2:
+                    continue
+                run, code, alias, corr = 0, -1, -1, 0
+                for wi in range(nwords - 1, -1, -1):
+                    b0 = al + wi * 23
+                    w = 0
+                    for i in range(23):
+                        if bits[b0 + i]:
+                            w |= 1 << i
+                    rc, c_, a_ = dcs_decode(w, self.cfg["dcs_max_errors"])
+                    if rc < 0 or c_ < 0:
+                        break
+                    if run == 0:
+                        code, alias = c_, a_
+                    elif c_ != code:
+                        break
+                    if rc > 0:
+                        corr = 1
+                    run += 1
+                if run > best[0] or (run == best[0] and run > 0 and corr < best[3]):
+                    best = (run, code, alias, corr, al + (nwords - run) * 23, ph)
+        run, code, alias, corr, first_bit, ph = best
+        if run >= 2:
+            base = float(self.sub_idx - avail) + ph / 8.0 * sps
+            first = base + first_bit * sps
+            last = base + (first_bit + run * 23) * sps
+            if self.dcs_state == 1 and code != self.dcs_code:
+                self._dcs_end(0)
+            if self.dcs_state == 0:
+                self.dcs_state = 1
+                self.dcs_code, self.dcs_alias = code, alias
+                self.dcs_t0_sub = int(first if first > 0.0 else 0.0)
+                if self._sub_time(self.dcs_t0_sub) < self.t0:
+                    self.dcs_t0_sub = int(_m.ceil(0.5 * (self.lp_n - 1) / self.decim))
+                self.dcs_corrected = corr
+                self._emit(TONE_DCS, TONE_START, self._sub_time(self.dcs_t0_sub), float("nan"), DCS_RATE, 0.0,
+                           0.0, 0.0, code, alias,
+                           (TONE_F_CORRECTED if corr else 0) | (0 if code in DCS_CODES else TONE_F_NONSTANDARD))
+                self._st["dcs"] += 1
+            if corr:
+                self.dcs_corrected = 1
+            self.dcs_tlast_sub = int(last)
+            self.dcs_miss = 0
+        elif self.dcs_state == 1:
+            self.dcs_miss += 1
+            if self.dcs_miss >= 2:
+                self._dcs_end(0)
+
+    def _dcs_push(self, y: float):
+        self._dcs_dc += self.dcs_alpha * (y - self._dcs_dc)
+        self._dcs_ring[self._dcs_head] = np.float32(y - self._dcs_dc)
+        self._dcs_head = (self._dcs_head + 1) % self.dcs_M
+        self._dcs_filled += 1
+        self._dcs_count += 1
+        if self._dcs_count >= self.dcs_step:
+            self._dcs_count = 0
+            self._dcs_search()
+
+    # -- DTMF ---------------------------------------------------------------
+    def _dt_end(self, end_frame, flags):
+        self._emit(TONE_DTMF, TONE_END, self._in_time(self.dt_frame0), self._in_time(end_frame + self.dt_W),
+                   self.dt_f1_sum / self.dt_count, self.dt_f2_sum / self.dt_count,
+                   self.dt_lvl_sum / self.dt_count, self.dt_snr_sum / self.dt_count,
+                   ord(DTMF_KEYS[self.dt_key]), -1, flags)
+        self.dt_state, self.dt_key, self.dt_count, self.dt_miss = 0, -1, 0, 0
+
+    def _dt_frame(self, frame, v):
+        W = self.dt_W
+        v = v * self.dt_w
+        e = float(np.sum(v * v))
+        p = self.dt_dft(v)
+        m2 = [abs(z) ** 2 for z in p]
+        lo = int(np.argmax(m2[0:4]))
+        hi = 4 + int(np.argmax(m2[4:8]))
+        a_lo = 2.0 * _m.sqrt(m2[lo]) / self.dt_wsum
+        a_hi = 2.0 * _m.sqrt(m2[hi]) / self.dt_wsum
+        lvl_lo = 20.0 * _m.log10(a_lo + 1e-30)
+        lvl_hi = 20.0 * _m.log10(a_hi + 1e-30)
+        key, f1, f2, snr = -1, 0.0, 0.0, 0.0
+        t_hop = self.dt_H / self.fs
+        if lvl_lo >= self.cfg["dtmf_min_dbfs"] and lvl_hi >= self.cfg["dtmf_min_dbfs"] and self._dt_prev is not None:
+            norm = self.dt_wsum * self.dt_wsum / (2.0 * self.dt_wsum2)
+            share = (m2[lo] + m2[hi]) / (e * norm + 1e-30)
+            twist = lvl_hi - lvl_lo
+            lo_harm_clear = abs(2.0 * DTMF_LOW[lo] - DTMF_HIGH[hi - 4]) > 150.0
+            harm_ok = (not lo_harm_clear or m2[lo + 8] < 0.01 * m2[lo]) and m2[hi + 8] < 0.01 * m2[hi]
+            fm = []
+            for b, nom in ((lo, DTMF_LOW[lo]), (hi, DTMF_HIGH[hi - 4])):
+                d = p[b] * self._dt_prev[b].conjugate()
+                adv = _wrap_pi(_m.atan2(d.imag, d.real) - 2.0 * _m.pi * nom * t_hop)
+                fm.append(nom + adv / (2.0 * _m.pi * t_hop))
+            freq_ok = (abs(fm[0] - DTMF_LOW[lo]) <= 0.015 * DTMF_LOW[lo]
+                       and abs(fm[1] - DTMF_HIGH[hi - 4]) <= 0.015 * DTMF_HIGH[hi - 4])
+            if share >= 0.6 and abs(twist) <= 8.0 and harm_ok and freq_ok:
+                key = lo * 4 + (hi - 4)
+                f1, f2 = fm
+                rest = sum(m2[i] for i in range(8) if i != lo and i != hi)
+                snr = 10.0 * _m.log10((m2[lo] + m2[hi]) / (rest / 3.0 + 1e-30))
+        lvl = min(lvl_lo, lvl_hi)
+        if self.dt_state == 2:
+            if key == self.dt_key:
+                self.dt_count += 1
+                self.dt_f1_sum += f1
+                self.dt_f2_sum += f2
+                self.dt_lvl_sum += lvl
+                self.dt_snr_sum += snr
+                self.dt_frame_last = frame
+                self.dt_miss = 0
+            elif key < 0 and self.dt_miss == 0:
+                self.dt_miss = 1
+            else:
+                newkey = key
+                self._dt_end(self.dt_frame_last, 0)
+                if newkey >= 0:
+                    self.dt_state, self.dt_key, self.dt_count = 1, newkey, 1
+                    self.dt_f1_sum, self.dt_f2_sum, self.dt_lvl_sum, self.dt_snr_sum = f1, f2, lvl, snr
+                    self.dt_frame0 = self.dt_frame_last = frame
+        elif self.dt_state == 1:
+            if key == self.dt_key:
+                self.dt_count += 1
+                self.dt_f1_sum += f1
+                self.dt_f2_sum += f2
+                self.dt_lvl_sum += lvl
+                self.dt_snr_sum += snr
+                self.dt_frame_last = frame
+                if self.dt_count >= 3:
+                    self.dt_state = 2
+                    self._emit(TONE_DTMF, TONE_START, self._in_time(self.dt_frame0), float("nan"),
+                               self.dt_f1_sum / self.dt_count, self.dt_f2_sum / self.dt_count,
+                               self.dt_lvl_sum / self.dt_count, self.dt_snr_sum / self.dt_count,
+                               ord(DTMF_KEYS[self.dt_key]), -1, 0)
+                    self._st["dtmf"] += 1
+            elif key >= 0:
+                self.dt_key, self.dt_count = key, 1
+                self.dt_f1_sum, self.dt_f2_sum, self.dt_lvl_sum, self.dt_snr_sum = f1, f2, lvl, snr
+                self.dt_frame0 = self.dt_frame_last = frame
+            else:
+                self.dt_state, self.dt_key, self.dt_count = 0, -1, 0
+        elif key >= 0:
+            self.dt_state, self.dt_key, self.dt_count = 1, key, 1
+            self.dt_f1_sum, self.dt_f2_sum, self.dt_lvl_sum, self.dt_snr_sum = f1, f2, lvl, snr
+            self.dt_frame0 = self.dt_frame_last = frame
+        self._dt_prev = p[:8]
+
+    # -- the tone tracker ---------------------------------------------------
+    def _tk_end(self, end_frame, flags):
+        self._emit(TONE_TONE, TONE_END, self._in_time(self.tk_frame0), self._in_time(end_frame + self.tk_W),
+                   self.tk_f_sum / self.tk_count, 0.0, self.tk_lvl_sum / self.tk_count,
+                   self.tk_snr_sum / self.tk_count, -1, -1, flags)
+        self.tk_state, self.tk_count = 0, 0
+
+    def _tk_frame(self, frame, v):
+        N = self.tk_nfft
+        fr = np.zeros(N, np.float32)
+        fr[:self.tk_W] = (v * self.tk_w).astype(np.float32)
+        X = np.fft.fft(fr.astype(np.complex64))
+        bin_hz = self.fs / N
+        k0 = max(2, int(_m.ceil(250.0 / bin_hz)))
+        k1 = min(int(_m.floor(3500.0 / bin_hz)), N // 2 - 2)
+        m2 = np.abs(X[:N // 2 + 1].astype(np.complex128)) ** 2
+        band = float(np.sum(m2[k0:k1 + 1]))
+        peak = k0 + int(np.argmax(m2[k0:k1 + 1]))
+        f, lvl, snr, have = 0.0, -200.0, 0.0, False
+        if band > 0.0 and k0 < peak < k1:
+            la, lb, lc = (0.5 * _m.log(m2[peak - 1] + 1e-300), 0.5 * _m.log(m2[peak] + 1e-300),
+                          0.5 * _m.log(m2[peak + 1] + 1e-300))
+            den = la - 2.0 * lb + lc
+            d = 0.5 * (la - lc) / den if den != 0.0 else 0.0
+            lpk = lb - 0.25 * (la - lc) * d
+            f = (peak + d) * bin_hz
+            lvl = 20.0 * _m.log10(2.0 * _m.exp(lpk) / self.tk_wsum + 1e-30)
+            share = float(np.sum(m2[max(k0, peak - 2):min(k1, peak + 2) + 1])) / band
+            others = [m2[k] for k in range(k0, k1 + 1) if k < peak - 3 or k > peak + 3]
+            fl = _median(others) if others else 0.0
+            snr = 10.0 * _m.log10((m2[peak] + 1e-30) / (fl + 1e-30))
+            have = share >= 0.6 and lvl >= self.cfg["tone_min_dbfs"] and snr >= self.cfg["tone_min_snr_db"]
+        if self.tk_state == 2:
+            tol = max(0.015 * self.tk_f_run, 10.0)
+            if have and abs(f - self.tk_f_run) <= tol:
+                self.tk_count += 1
+                self.tk_f_sum += f
+                self.tk_lvl_sum += lvl
+                self.tk_snr_sum += snr
+                self.tk_f_run = self.tk_f_sum / self.tk_count
+                self.tk_frame_last = frame
+            else:
+                self._tk_end(self.tk_frame_last, 0)
+                if have:
+                    self.tk_state, self.tk_count = 1, 1
+                    self.tk_f_run = self.tk_f_sum = f
+                    self.tk_lvl_sum, self.tk_snr_sum = lvl, snr
+                    self.tk_frame0 = self.tk_frame_last = frame
+        elif self.tk_state == 1:
+            tol = max(0.015 * self.tk_f_run, 10.0)
+            if have and abs(f - self.tk_f_run) <= tol:
+                self.tk_count += 1
+                self.tk_f_sum += f
+                self.tk_lvl_sum += lvl
+                self.tk_snr_sum += snr
+                self.tk_f_run = self.tk_f_sum / self.tk_count
+                self.tk_frame_last = frame
+                self.tk_state = 2
+                self._emit(TONE_TONE, TONE_START, self._in_time(self.tk_frame0), float("nan"), self.tk_f_run,
+                           0.0, self.tk_lvl_sum / self.tk_count, self.tk_snr_sum / self.tk_count, -1, -1, 0)
+                self._st["tones"] += 1
+            elif have:
+                self.tk_count = 1
+                self.tk_f_run = self.tk_f_sum = f
+                self.tk_lvl_sum, self.tk_snr_sum = lvl, snr
+                self.tk_frame0 = self.tk_frame_last = frame
+            else:
+                self.tk_state, self.tk_count = 0, 0
+        elif have:
+            self.tk_state, self.tk_count = 1, 1
+            self.tk_f_run = self.tk_f_sum = f
+            self.tk_lvl_sum, self.tk_snr_sum = lvl, snr
+            self.tk_frame0 = self.tk_frame_last = frame
+
+    # -- process ------------------------------------------------------------
+    def process(self, x, cap=None) -> list:
+        x = np.asarray(x, dtype=np.float32).ravel()
+        self._out, self._cap = [], cap
+        en = self.cfg["enable"]
+        sub = en & (TONE_EN_CTCSS | TONE_EN_DCS)
+        lp = self.lp.astype(np.float64)
+        for s in x:
+            if en & TONE_EN_DTMF:
+                self._dt_buf[self._dt_pos] = s
+                self._dt_pos = (self._dt_pos + 1) % self.dt_W
+            if en & TONE_EN_TONE:
+                self._tk_buf[self._tk_pos] = s
+                self._tk_pos = (self._tk_pos + 1) % self.tk_W
+            self.idx += 1
+            if self.idx % self.dt_H == 0:
+                if (en & TONE_EN_DTMF) and self.idx >= self.dt_W:
+                    v = np.concatenate([self._dt_buf[self._dt_pos:], self._dt_buf[:self._dt_pos]]).astype(np.float64)
+                    self._dt_frame(self.idx - self.dt_W, v)
+                if (en & TONE_EN_TONE) and self.idx >= self.tk_W:
+                    v = np.concatenate([self._tk_buf[self._tk_pos:], self._tk_buf[:self._tk_pos]]).astype(np.float64)
+                    self._tk_frame(self.idx - self.tk_W, v)
+            if sub:
+                self._lp_hist[self._lp_pos] = s
+                self._lp_pos = (self._lp_pos + 1) % self.lp_n
+                self._lp_phase += 1
+                if self._lp_phase == self.decim:
+                    self._lp_phase = 0
+                    # y = sum_k h[k] x[n - k]: the newest input first
+                    hist = np.concatenate([self._lp_hist[:self._lp_pos][::-1], self._lp_hist[self._lp_pos:][::-1]])
+                    y = float(np.dot(lp, hist.astype(np.float64)))
+                    self.sub_idx += 1
+                    if en & TONE_EN_CTCSS:
+                        self._cs_seg.append(np.float32(y))
+                        if len(self._cs_seg) == self.cs_L:
+                            self._cs_segment(self._cs_seg)
+                            self._cs_seg = []
+                    if en & TONE_EN_DCS:
+                        self._dcs_push(float(np.float32(y)))
+        self._st["samples"] += int(x.size)
+        out, self._out, self._cap = self._out, [], None
+        return out
+
+    def flush(self) -> list:
+        self._out, self._cap = [], None
+        if self.cs_state == 2:
+            self._cs_end(self.cs_seg_last + 1, TONE_F_FLUSHED)
+        self.cs_state, self.cs_count = 0, 0
+        if self.dcs_state == 1:
+            self._dcs_end(TONE_F_FLUSHED)
+        if self.dt_state == 2:
+            self._dt_end(self.dt_frame_last, TONE_F_FLUSHED)
+        self.dt_state, self.dt_key, self.dt_count = 0, -1, 0
+        if self.tk_state == 2:
+            self._tk_end(self.tk_frame_last, TONE_F_FLUSHED)
+        self.tk_state, self.tk_count = 0, 0
+        out, self._out = self._out, []
+        return out
+
+    def stats(self) -> dict:
+        return dict(self._st)
+
+    def describe(self) -> str:
+        c = self.cfg
+        en = c["enable"]
+        enabled = ((("CTCSS " if en & TONE_EN_CTCSS else "") + ("DCS " if en & TONE_EN_DCS else "")
+                    + ("DTMF " if en & TONE_EN_DTMF else "") + ("TONE" if en & TONE_EN_TONE else "")))
+        return (f"tone_id: fs {self.fs:.6g} Hz; sub-audio /{self.decim} to {self.fs_sub:.6g} Hz ({self.lp_n} taps), "
+                f"CTCSS {self.cs_L}-sample segments ({self.cs_L / self.fs_sub:.3g} s) SNR >= {c['ctcss_min_snr_db']:.1f} dB, "
+                f"DCS 134.4 Bd over {self.dcs_M} samples every {self.dcs_step}, max {c['dcs_max_errors']} error(s); "
+                f"DTMF {self.dt_W}/{self.dt_H} samples >= {c['dtmf_min_dbfs']:.1f} dBFS; tones {self.tk_W}/{self.tk_H} "
+                f"samples FFT {self.tk_nfft} >= {c['tone_min_dbfs']:.1f} dBFS SNR >= {c['tone_min_snr_db']:.1f} dB; "
+                f"enabled {enabled}; {self._st['events']} events ({self._st['dropped']} dropped)")
+
+
+# ----------------------------------------------------------------------------
+# §24 selcall tables — matched to the tone tracker's measured tones
+# ----------------------------------------------------------------------------
+#: Five-tone selective-calling tone plans (Hz per digit), from the public
+#: references (ETSI / EIA / ZVEI documents as reproduced in open decoders).
+#: The digit tones 0..9 are the well-established ones; the letter tones
+#: (A..F: group, repeat, reset ...) vary between vendors and revisions —
+#: verify against a known radio before trusting a letter. Quick Call II
+#: (Motorola two-tone sequential) has no table here: it is matched by tone
+#: FREQUENCY against the agency's own plan, which is what the tracker reports.
+SELCALL_TABLES = {
+    "ZVEI1": {"0": 2400, "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530, "6": 1670, "7": 1830,
+              "8": 2000, "9": 2200, "A": 2800, "B": 810, "C": 970, "D": 885, "E": 2600, "F": 680},
+    "ZVEI2": {"0": 2400, "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530, "6": 1670, "7": 1830,
+              "8": 2000, "9": 2200, "A": 885, "B": 810, "C": 740, "D": 680, "E": 970, "F": 2600},
+    "ZVEI3": {"0": 2200, "1": 970, "2": 1060, "3": 1160, "4": 1270, "5": 1400, "6": 1530, "7": 1670,
+              "8": 1830, "9": 2000, "A": 885, "B": 810, "C": 740, "D": 680, "E": 2400, "F": 2600},
+    "CCIR": {"0": 1981, "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446, "6": 1540, "7": 1640,
+             "8": 1747, "9": 1860, "A": 2400, "B": 930, "C": 2247, "D": 991, "E": 2110, "F": 1055},
+    "EEA": {"0": 1981, "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446, "6": 1540, "7": 1640,
+            "8": 1747, "9": 1860, "A": 1055, "B": 930, "C": 2400, "D": 991, "E": 2110, "F": 2247},
+    "EIA": {"0": 600, "1": 741, "2": 882, "3": 1023, "4": 1164, "5": 1305, "6": 1446, "7": 1587,
+            "8": 1728, "9": 1869, "A": 2151, "B": 2433, "C": 2010, "D": 2292, "E": 459, "F": 1091},
+}
+#: Nominal tone lengths (s), for a caller that wants to check the cadence.
+SELCALL_TONE_S = {"ZVEI1": 0.070, "ZVEI2": 0.070, "ZVEI3": 0.070, "CCIR": 0.100, "EEA": 0.040, "EIA": 0.033}
+
+
+def selcall_match(freqs, tol: float = 0.015, durations=None) -> tuple:
+    """(table, digits, misses): the tone plan whose digits fit the measured
+    tone frequencies best (each within `tol` of a digit's tone; a tone no
+    digit fits is '?'). CCIR and EEA share their digit tones and differ in
+    cadence (100 vs 40 ms), so a tie is broken by the tones' durations when
+    given, else by the order listed. (None, '', n) when no table fits a
+    single tone."""
+    freqs = list(freqs)
+    best = (None, "", len(freqs), float("inf"))
+    for name, table in SELCALL_TABLES.items():
+        digits, misses = [], 0
+        for f in freqs:
+            d = min(table, key=lambda k: abs(table[k] - f))
+            if abs(table[d] - f) <= tol * table[d]:
+                digits.append(d)
+            else:
+                digits.append("?")
+                misses += 1
+        dur_err = (abs(float(np.mean(durations)) - SELCALL_TONE_S[name]) if durations is not None and len(durations)
+                   else float("inf"))
+        if misses < best[2] or (misses == best[2] and dur_err < best[3]):
+            best = (name, "".join(digits), misses, dur_err)
+    return best[:3]

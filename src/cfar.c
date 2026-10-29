@@ -26,13 +26,18 @@ static double ln_gpdf(double s, double t) {
     return s * log(s) + (s - 1.0) * log(t) - s * t - lgamma(s);
 }
 
-/* ln density of T at t (noise mean 1 per cell). */
-static double log_density(int mode, double t, int N, double K, int k) {
-    const int n = N / 2;
+/* ln density of T at t (noise mean 1 per cell). N is the number of reference
+ * cells; ne the EFFECTIVE number (= N for independent cells; smaller when the
+ * window correlates neighbouring bins, atkdsp_cfar_n_eff). CA's mean of N
+ * correlated cells is treated as the mean of ne independent ones (a gamma of
+ * shape ne K, exact in its first two moments); GO / SO use one side's ne / 2.
+ * OS keeps the integer N and rank k: its correction is a mapping of the rate
+ * (see solve_alpha), not a fractional order statistic. */
+static double log_density(int mode, double t, int N, double ne, double K, int k) {
     double lp, lq;
-    if (mode == ATKDSP_CFAR_CA) return ln_gpdf(N * K, t);
+    if (mode == ATKDSP_CFAR_CA) return ln_gpdf(ne * K, t);
     if (mode == ATKDSP_CFAR_GO || mode == ATKDSP_CFAR_SO) {
-        const double s = n * K;
+        const double s = 0.5 * ne * K;
         atk_log_igam_pq(s, s * t, &lp, &lq);
         return log(2.0) + (mode == ATKDSP_CFAR_GO ? lp : lq) + ln_gpdf(s, t);
     }
@@ -45,12 +50,12 @@ static double log_density(int mode, double t, int N, double K, int k) {
 }
 
 /* ln P(T <= t) and ln P(T > t). */
-static void log_cdf_sf(int mode, double t, int N, double K, int k, double *cdf, double *sf) {
-    const int n = N / 2;
+static void log_cdf_sf(int mode, double t, int N, double ne, double K, int k,
+                       double *cdf, double *sf) {
     double lp, lq;
-    if (mode == ATKDSP_CFAR_CA) { atk_log_igam_pq(N * K, N * K * t, cdf, sf); return; }
+    if (mode == ATKDSP_CFAR_CA) { atk_log_igam_pq(ne * K, ne * K * t, cdf, sf); return; }
     if (mode == ATKDSP_CFAR_GO || mode == ATKDSP_CFAR_SO) {
-        const double s = n * K;
+        const double s = 0.5 * ne * K;
         atk_log_igam_pq(s, s * t, &lp, &lq);
         if (mode == ATKDSP_CFAR_GO) { *cdf = 2.0 * lp; *sf = lq + log1p(exp(lp)); }
         else                        { *cdf = lp + log1p(exp(lq)); *sf = 2.0 * lq; }
@@ -64,33 +69,33 @@ static void log_cdf_sf(int mode, double t, int N, double K, int k, double *cdf, 
 
 typedef struct { double *t, *G; int M; double et; } cfar_grid;
 
-static int build_grid(int mode, int N, double K, int k, double pfa, cfar_grid *g) {
+static int build_grid(int mode, int N, double ne, double K, int k, double pfa, cfar_grid *g) {
     const double ln_eps = log(1e-9 * pfa);
     const double lo = -700.0, hi = 7.0;
     double cdf, sf, u_lo, u_hi;
-    log_cdf_sf(mode, exp(lo), N, K, k, &cdf, &sf);
+    log_cdf_sf(mode, exp(lo), N, ne, K, k, &cdf, &sf);
     if (cdf >= ln_eps) u_lo = lo;
     else {
         double a = lo, b = hi;
         for (int i = 0; i < 60; ++i) {
             const double mid = 0.5 * (a + b);
-            log_cdf_sf(mode, exp(mid), N, K, k, &cdf, &sf);
+            log_cdf_sf(mode, exp(mid), N, ne, K, k, &cdf, &sf);
             if (cdf < ln_eps) a = mid; else b = mid;
         }
         u_lo = a;
     }
-    log_cdf_sf(mode, exp(hi), N, K, k, &cdf, &sf);
+    log_cdf_sf(mode, exp(hi), N, ne, K, k, &cdf, &sf);
     if (sf > ln_eps) u_hi = hi;
     else {
         double a = u_lo, b = hi;
         for (int i = 0; i < 60; ++i) {
             const double mid = 0.5 * (a + b);
-            log_cdf_sf(mode, exp(mid), N, K, k, &cdf, &sf);
+            log_cdf_sf(mode, exp(mid), N, ne, K, k, &cdf, &sf);
             if (sf > ln_eps) a = mid; else b = mid;
         }
         u_hi = b;
     }
-    const double s_ref = (mode == ATKDSP_CFAR_GO || mode == ATKDSP_CFAR_SO) ? (N / 2) * K : N * K;
+    const double s_ref = (mode == ATKDSP_CFAR_GO || mode == ATKDSP_CFAR_SO) ? 0.5 * ne * K : ne * K;
     double h0 = 0.2 / sqrt(s_ref);
     if (h0 > 0.01) h0 = 0.01;
     const double span = u_hi - u_lo;
@@ -108,7 +113,7 @@ static int build_grid(int mode, int N, double K, int k, double pfa, cfar_grid *g
         const double t = exp(u);
         double w = (j == 0 || j == M) ? 1.0 : ((j & 1) ? 4.0 : 2.0);
         w *= h / 3.0;
-        const double lg = log_density(mode, t, N, K, k) + u;
+        const double lg = log_density(mode, t, N, ne, K, k) + u;
         g->t[j] = t;
         g->G[j] = isfinite(lg) ? exp(lg) * w : 0.0;
     }
@@ -133,26 +138,65 @@ static double root_f(const cfar_grid *g, double K, double v, double lnpfa) {
     return log(p) - lnpfa;
 }
 
-int atkdsp_cfar_alpha(int mode, int n_ref, double pfa, double looks, int os_k,
-                      double *alpha, double *et) {
-    if (mode < 0 || mode > 3 || n_ref < 1 || n_ref > 256 || !(pfa >= 1e-15 && pfa <= 0.5)
-        || !(looks >= 0.25 && looks <= 64e6) || !alpha)
-        return ATKDSP_E_ARG;
-    const int N = 2 * n_ref;
-    const int k = os_k ? os_k : (3 * N + 3) / 4;
-    if (mode == ATKDSP_CFAR_OS && (k < 1 || k > N)) return ATKDSP_E_ARG;
+/* Equivalent independent cells among 2 n_ref reference cells, n_ref contiguous
+ * each side (the two sides are too far apart to correlate): N / (1 + 2 P / N),
+ * P the sum over the pairs of rho2[m - 1] for the pairs m bins apart. The
+ * variance of the mean of N cells with that correlation equals the variance
+ * of the mean of n_eff independent ones. NULL / zeros = N. */
+double atkdsp_cfar_n_eff(int n_ref, const double *rho2) {
+    const double N = 2.0 * (double)n_ref;
+    if (n_ref < 1) return 0.0;
+    if (!rho2) return N;
+    double pairs = 0.0;
+    for (int m = 1; m <= ATKDSP_CFAR_RHO_MAX && m < n_ref; ++m)
+        pairs += 2.0 * (double)(n_ref - m) * rho2[m - 1];
+    return N / (1.0 + 2.0 * pairs / N);
+}
+
+/* |sum_n w[n]^2 e^{-2 pi i m n / n}|^2 / (sum w^2)^2 for m = 1..4: the power
+ * correlation of neighbouring periodogram bins of white noise through this
+ * window. A rectangular window gives zeros; Hann 4/9, 1/36, 0, 0 as n grows. */
+int atkdsp_cfar_window_rho2(const float *window, size_t n, double *rho2) {
+    if (!window || !rho2 || n < 2) return ATKDSP_E_ARG;
+    double s2 = 0.0;
+    for (size_t i = 0; i < n; ++i) s2 += (double)window[i] * (double)window[i];
+    if (!(s2 > 0.0)) return ATKDSP_E_ARG;
+    for (int m = 1; m <= ATKDSP_CFAR_RHO_MAX; ++m) {
+        double re = 0.0, im = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double w2 = (double)window[i] * (double)window[i];
+            const double ph = -2.0 * ATK_PI * (double)m * (double)i / (double)n;
+            re += w2 * cos(ph);
+            im += w2 * sin(ph);
+        }
+        rho2[m - 1] = (re * re + im * im) / (s2 * s2);
+    }
+    return ATKDSP_OK;
+}
+
+static int rho2_ok(const double *rho2) {
+    if (!rho2) return 1;
+    for (int m = 0; m < ATKDSP_CFAR_RHO_MAX; ++m)
+        if (!(rho2[m] >= 0.0 && rho2[m] < 1.0)) return 0;   /* NaN fails too */
+    return 1;
+}
+
+/* Solve Pfa(alpha) = pfa for one mode at N cells (ne effective). pfa may sit
+ * below the ABI's 1e-15 here: the OS mapping asks for one. */
+static int solve_alpha(int mode, int N, double ne, double K, int k, double pfa,
+                       double *alpha, double *et) {
     cfar_grid g;
-    const int rc = build_grid(mode, N, looks, k, pfa, &g);
+    const int rc = build_grid(mode, N, ne, K, k, pfa, &g);
     if (rc) return rc;
     const double lnpfa = log(pfa);
     double a = log(1e-3), b = log(1e18);
-    double fa = root_f(&g, looks, a, lnpfa), fb = root_f(&g, looks, b, lnpfa);
+    double fa = root_f(&g, K, a, lnpfa), fb = root_f(&g, K, b, lnpfa);
     if (!(fa > 0.0 && fb < 0.0)) { free(g.t); free(g.G); return ATKDSP_E_ARG; }
     int side = 0, have_prev = 0;
     double c = a, prev = 0.0;
     for (int it = 0; it < 300; ++it) {
         c = (a * fb - b * fa) / (fb - fa);
-        const double fc = root_f(&g, looks, c, lnpfa);
+        const double fc = root_f(&g, K, c, lnpfa);
         if (fc == 0.0) break;
         if (fc > 0.0) {
             a = c; fa = fc;
@@ -172,9 +216,46 @@ int atkdsp_cfar_alpha(int mode, int n_ref, double pfa, double looks, int os_k,
     return ATKDSP_OK;
 }
 
-/* beta with P(Gamma(nb looks) / (nb looks) > beta) = ATKDSP_CFAR_EDGE_PFA. */
-static double edge_beta(int nb, double looks) {
-    const double s = (double)nb * looks;
+/* Pfa the N-independent-cell CA test has at a given alpha. */
+static int ca_pfa_at(int N, double K, double alpha, double pfa_hint, double *pfa) {
+    cfar_grid g;
+    const int rc = build_grid(ATKDSP_CFAR_CA, N, (double)N, K, 0, pfa_hint, &g);
+    if (rc) return rc;
+    *pfa = grid_pfa(&g, K, alpha);
+    free(g.t); free(g.G);
+    return ATKDSP_OK;
+}
+
+int atkdsp_cfar_alpha(int mode, int n_ref, double pfa, double looks, int os_k,
+                      const double *rho2, double *alpha, double *et) {
+    if (mode < 0 || mode > 3 || n_ref < 1 || n_ref > 256 || !(pfa >= 1e-15 && pfa <= 0.5)
+        || !(looks >= 0.25 && looks <= 64e6) || !alpha || !rho2_ok(rho2))
+        return ATKDSP_E_ARG;
+    const int N = 2 * n_ref;
+    const int k = os_k ? os_k : (3 * N + 3) / 4;
+    if (mode == ATKDSP_CFAR_OS && (k < 1 || k > N)) return ATKDSP_E_ARG;
+    const double ne = atkdsp_cfar_n_eff(n_ref, rho2);
+    if (mode != ATKDSP_CFAR_OS || ne == (double)N)
+        return solve_alpha(mode, N, ne, looks, k, pfa, alpha, et);
+    /* OS with correlated cells: the rate the independent-cell CA formula maps
+     * to the threshold the correlated one needs (ATK cue_live.py's measured
+     * correction, within 8 % of the design rate in all four modes); the order
+     * statistic is then solved at that rate with its integer N and rank. */
+    double a_eff, ask;
+    int rc = solve_alpha(ATKDSP_CFAR_CA, N, ne, looks, 0, pfa, &a_eff, NULL);
+    if (rc) return rc;
+    rc = ca_pfa_at(N, looks, a_eff, pfa, &ask);
+    if (rc) return rc;
+    if (!(ask > 0.0)) ask = 1e-300;
+    return solve_alpha(mode, N, (double)N, looks, k, ask, alpha, et);
+}
+
+/* beta with P(Gamma(nb_eff looks) / (nb_eff looks) > beta) = ATKDSP_CFAR_EDGE_PFA,
+ * nb_eff the equivalent independent bins among nb contiguous ones. */
+static double edge_beta(int nb, double looks, const double *rho2) {
+    double pairs = 0.0;
+    for (int m = 1; m <= ATKDSP_CFAR_RHO_MAX && m < nb; ++m) pairs += (double)(nb - m) * rho2[m - 1];
+    const double s = (double)nb / (1.0 + 2.0 * pairs / (double)nb) * looks;
     const double target = log(ATKDSP_CFAR_EDGE_PFA);
     double a = log(1e-6), b = log(1e6);
     for (int i = 0; i < 100; ++i) {
@@ -215,6 +296,7 @@ struct atkdsp_cfar {
     atkdsp_cfar_config cfg;
     size_t nbins;
     int N;
+    double n_eff;
     double K, alpha, alpha_ca, et;
     uint8_t *mask, *ok, *sided, *hits;
     int32_t *idx;
@@ -253,6 +335,7 @@ static int config_ok(size_t nbins, const atkdsp_cfar_config *c) {
         || (size_t)c->merge_gap > nbins) return 0;
     if (c->min_bins < 1 || (size_t)c->min_bins > nbins
         || c->max_tracks < 1 || c->max_tracks > 65536) return 0;
+    if (!rho2_ok(c->rho2)) return 0;
     return 1;
 }
 
@@ -306,11 +389,12 @@ atkdsp_cfar *atkdsp_cfar_create(size_t nbins, const atkdsp_cfar_config *cfg) {
     c->N = 2 * cfg->n_ref;
     if (c->cfg.mode == ATKDSP_CFAR_OS && c->cfg.os_k == 0) c->cfg.os_k = (3 * c->N + 3) / 4;
     c->K = c->cfg.looks * (double)c->cfg.k_frames;
+    c->n_eff = atkdsp_cfar_n_eff(c->cfg.n_ref, c->cfg.rho2);
     if (atkdsp_cfar_alpha(c->cfg.mode, c->cfg.n_ref, c->cfg.pfa, c->K, c->cfg.os_k,
-                          &c->alpha, &c->et) != ATKDSP_OK) { free(c); return NULL; }
+                          c->cfg.rho2, &c->alpha, &c->et) != ATKDSP_OK) { free(c); return NULL; }
     if (c->cfg.mode == ATKDSP_CFAR_GO || c->cfg.mode == ATKDSP_CFAR_SO) {
         if (atkdsp_cfar_alpha(ATKDSP_CFAR_CA, c->cfg.n_ref, c->cfg.pfa, c->K, 0,
-                              &c->alpha_ca, NULL) != ATKDSP_OK) { free(c); return NULL; }
+                              c->cfg.rho2, &c->alpha_ca, NULL) != ATKDSP_OK) { free(c); return NULL; }
     } else {
         c->alpha_ca = c->alpha;
     }
@@ -380,7 +464,7 @@ static double select_kth_d(double *a, long n, long k) {
 }
 
 static double beta_for(atkdsp_cfar *c, int nb) {
-    if (isnan(c->beta[nb])) c->beta[nb] = edge_beta(nb, c->cfg.looks);
+    if (isnan(c->beta[nb])) c->beta[nb] = edge_beta(nb, c->cfg.looks, c->cfg.rho2);
     return c->beta[nb];
 }
 
@@ -710,17 +794,20 @@ int atkdsp_cfar_describe(const atkdsp_cfar *c, char *buf, size_t cap) {
     char os_txt[48] = "";
     if (c->cfg.mode == ATKDSP_CFAR_OS)
         snprintf(os_txt, sizeof os_txt, " (rank %d of %d)", c->cfg.os_k, c->N);
+    char eff_txt[64] = "";
+    if (c->n_eff != (double)c->N)
+        snprintf(eff_txt, sizeof eff_txt, " (%.1f effective, window-correlated)", c->n_eff);
     size_t masked = 0;
     for (size_t i = 0; i < c->nbins; ++i) masked += c->mask[i] != 0;
     snprintf(buf, cap,
-             "CFAR %s%s: %d+%d reference cells, %d guard each side, Pfa %.3g per cell per "
+             "CFAR %s%s: %d+%d reference cells%s, %d guard each side, Pfa %.3g per cell per "
              "frame, K = %g look(s) x %d frame(s), alpha %.4g (%.2f dB); open %d of %d, "
              "close after %d misses, merge gap %d, min %d bin(s); %zu bins, %zu masked, "
              "tracks %d/%d",
-             names[c->cfg.mode], os_txt, c->cfg.n_ref, c->cfg.n_ref, c->cfg.n_guard, c->cfg.pfa,
-             c->cfg.looks, c->cfg.k_frames, c->alpha, 10.0 * log10(c->alpha), c->cfg.open_m,
-             c->cfg.open_n, c->cfg.close_k, c->cfg.merge_gap, c->cfg.min_bins, c->nbins, masked,
-             c->ntracks, c->cfg.max_tracks);
+             names[c->cfg.mode], os_txt, c->cfg.n_ref, c->cfg.n_ref, eff_txt, c->cfg.n_guard,
+             c->cfg.pfa, c->cfg.looks, c->cfg.k_frames, c->alpha, 10.0 * log10(c->alpha),
+             c->cfg.open_m, c->cfg.open_n, c->cfg.close_k, c->cfg.merge_gap, c->cfg.min_bins,
+             c->nbins, masked, c->ntracks, c->cfg.max_tracks);
     return ATKDSP_OK;
 }
 

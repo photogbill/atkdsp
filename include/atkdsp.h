@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 17
-#define ATKDSP_VERSION_STRING "0.16.0"
+#define ATKDSP_ABI_VERSION 18
+#define ATKDSP_VERSION_STRING "0.17.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -102,6 +102,14 @@ extern "C" {
  * in caller memory (one producer, up to 16 consumers, a seqlock per block,
  * attachable from another process). ATKDSP_E_OVERRUN (-6) and
  * ATKDSP_E_EMPTY (-7) are new. */
+/* 17 -> 18: phase 3 (§22-24; docs/ATKDSP_PLAN.md §B3, §B4, §C3) — live pulse
+ * runs (radar PDWs, atkdsp_pulses), the cyclic probes (atkdsp_cyclic: a line
+ * at a candidate symbol rate; atkdsp_cp_probe: OFDM's cyclic prefix), the
+ * analog radio IDs (atkdsp_tone_id: CTCSS, DCS, DTMF, tracked tones) — and
+ * two corrections riding along: atkdsp_cfar_config gained rho2 (the
+ * window's bin correlation; atkdsp_cfar_alpha takes it, and atkdsp_cfar_n_eff
+ * / atkdsp_cfar_window_rho2 are new), and atkdsp_blockid gained fixed_bits
+ * (a payload's constant positions, set aside before a code is named). */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -1488,12 +1496,16 @@ typedef struct {
     int    rows_used;         /* aligned codewords examined                   */
     int    robust;            /* how: 0 exact, 1 robust search, 2 cyclic roots */
     int    shortened;         /* shortened cyclic: mother length - n, else 0  */
+    int    fixed_bits;        /* positions constant in every codeword (v0.17.0): the
+                                 payload's, set aside before naming; the name
+                                 ends ", N fixed bit(s)"                       */
+    int    reserved;
     double log10_pfa;         /* chance random bits show this structure       */
     double ber_est;           /* channel BER from the checks' failures        */
     double agreement;         /* decode -> re-encode, fraction of bits kept   */
     double valid_words;       /* fraction of codewords with a zero syndrome   */
     char   name[48];
-} atkdsp_blockid;             /* 120 bytes */
+} atkdsp_blockid;             /* 128 bytes */
 ATKDSP_API int atkdsp_block_code_id(const uint8_t *b, size_t n, int n_lo, int n_hi,
                                     double pfa, uint64_t seed, atkdsp_blockid *out,
                                     uint8_t *G, size_t gcap, uint8_t *gpoly, size_t pcap);
@@ -1700,6 +1712,22 @@ ATKDSP_API int atkdsp_interleaver_id(const uint8_t *b, size_t n, int n_lo, int n
  *            window); MASK_ADJ (a masked bin within merge_gap + 1); FLUSHED
  *            (closed by atkdsp_cfar_flush).
  *
+ * CORRELATED CELLS (v0.17.0). The threshold above assumes independent
+ * reference cells. A window makes neighbouring periodogram bins correlated
+ * (Hann: power correlation 4/9 one bin apart, 1/36 two apart), so 32 Hann
+ * cells carry about 17 cells' evidence and the stated Pfa was exceeded —
+ * measured 1.6x at 1e-5 and 1.7x at 1e-6 on ATK's live frames (the ATK
+ * Diffusion Toolkit's finding, 2026-10-28). cfg.rho2 carries the window's
+ * correlation (atkdsp_cfar_window_rho2 computes it), and the solver uses the
+ * equivalent number of independent cells, n_eff (atkdsp_cfar_n_eff): CA's T
+ * is a gamma of shape n_eff K, GO / SO's sides n_eff K / 2, and OS is solved
+ * at the rate the independent-cell CA formula maps to the correlated
+ * threshold (ATK cue_live.py's correction, measured within 8 % of the design
+ * rate in every mode). The single-frame band test (CFAR_EDGE_PFA) uses the
+ * same equivalent count over the band's bins. E[T] (noise_db) is left at the
+ * independent-cell value: the mean is unbiased either way. Zeros, the
+ * default, reproduce v0.16.0 exactly.
+ *
  * The plan's create(nbins, mode, n_ref, ...) became a config struct:
  * thirteen parameters, and the next one does not reorder a call. */
 #define ATKDSP_CFAR_CA 0
@@ -1715,6 +1743,7 @@ ATKDSP_API int atkdsp_interleaver_id(const uint8_t *b, size_t n, int n_lo, int n
 #define ATKDSP_CFAR_MASK_ADJ  8u
 #define ATKDSP_CFAR_FLUSHED  16u
 #define ATKDSP_CFAR_EDGE_PFA 1e-3
+#define ATKDSP_CFAR_RHO_MAX  4
 
 typedef struct {
     int32_t mode;        /* ATKDSP_CFAR_CA (default) / OS / GO / SO          */
@@ -1730,8 +1759,11 @@ typedef struct {
     int32_t merge_gap;   /* non-hit bins inside one detection (1)            */
     int32_t min_bins;    /* narrower blobs ignored (1)                       */
     int32_t max_tracks;  /* pending + open at once, 1..65536 (256)           */
-    int32_t reserved[3];
-} atkdsp_cfar_config;    /* 72 bytes */
+    int32_t reserved;
+    double  rho2[4];     /* power correlation of bins 1..4 apart, each in
+                            [0, 1); zeros = independent cells (the default).
+                            atkdsp_cfar_window_rho2 fills it for a window.  */
+} atkdsp_cfar_config;    /* 104 bytes */
 
 typedef struct {
     double   t0, t1;     /* seconds; t1 NaN until CLOSE                      */
@@ -1756,9 +1788,20 @@ typedef struct {
 typedef struct atkdsp_cfar atkdsp_cfar;
 ATKDSP_API void         atkdsp_cfar_defaults(atkdsp_cfar_config *cfg);
 /* The solver alone: alpha for (mode, n_ref, pfa) with `looks` total looks
- * (K) and the OS rank; *et (may be NULL) = E[T] in units of the noise mean. */
+ * (K), the OS rank, and the window's bin correlation (rho2: 4 doubles, or
+ * NULL for independent cells); *et (may be NULL) = E[T] in units of the
+ * noise mean. */
 ATKDSP_API int          atkdsp_cfar_alpha(int mode, int n_ref, double pfa, double looks,
-                                          int os_k, double *alpha, double *et);
+                                          int os_k, const double *rho2,
+                                          double *alpha, double *et);
+/* The equivalent number of independent cells among 2 n_ref correlated ones
+ * (n_ref contiguous each side): N / (1 + 2 P / N), P the sum of rho2 over
+ * the pairs. 0 for n_ref < 1. */
+ATKDSP_API double       atkdsp_cfar_n_eff(int n_ref, const double *rho2);
+/* rho2[m - 1] = |sum w^2 e^{-2 pi i m n / n}|^2 / (sum w^2)^2, m = 1..4: the
+ * power correlation of neighbouring periodogram bins of white noise through
+ * `window` (n taps). Rectangular: zeros. Hann: 4/9, 1/36, 0, 0 as n grows. */
+ATKDSP_API int          atkdsp_cfar_window_rho2(const float *window, size_t n, double *rho2);
 /* NULL on an invalid configuration (the binding prints the ranges above). */
 ATKDSP_API atkdsp_cfar *atkdsp_cfar_create(size_t nbins, const atkdsp_cfar_config *cfg);
 ATKDSP_API void         atkdsp_cfar_destroy(atkdsp_cfar *c);
@@ -1974,6 +2017,392 @@ ATKDSP_API int          atkdsp_ring_stats(const atkdsp_ring *r, atkdsp_ring_coun
 /* "ring: 256 blocks x 1048576 bytes (256.0 MiB of data), 3 of 16 consumers,
  * 1234 committed, 0 torn reads" */
 ATKDSP_API int          atkdsp_ring_describe(const atkdsp_ring *r, char *buf, size_t cap);
+
+/* ---- 22. Live pulse runs: radar PDWs (§B3, v0.17.0) -----------------------
+ * Envelope -> threshold with hysteresis -> runs, carried across block edges
+ * so a pulse split by a boundary is one pulse; one pulse descriptor word per
+ * run. The streaming form of ATK's atk.core.pulse.detect_pulses, and with
+ * hyst_db = 0 the same PDWs: the same floor, the same 10 dB rule, the same
+ * flank trimming and 2.77 sigma chirp span. The twin is
+ * python/atkdsp/reference.py §22 (class Pulses).
+ *
+ * THE FLOOR IS THE CALLER'S. pulse.py takes the MEDIAN of |x| over the
+ * record (a mean is dragged up by the pulses it is meant to find); a
+ * streaming kernel cannot take a median of what it has not seen without
+ * making its answer depend on how the stream was chunked (header rule 3).
+ * So the floor is a parameter: measure it with atkdsp_mag_median on a quiet
+ * or representative stretch (the same median), set it at create and again
+ * with atkdsp_pulses_set_floor whenever the band or gain changes. With a
+ * Rayleigh envelope (complex Gaussian noise of power sigma^2) the median is
+ * 1.1774 sigma, so the default 10 dB threshold sits at 3.72 sigma and a
+ * noise sample crosses it with probability exp(-3.72^2 / 2) = 9.8e-4; the
+ * default four in a row, 1e-12 per sample — noise alone yields nothing.
+ *
+ * THE RUN. A run opens at the first sample with |x| > floor 10^(thresh/20)
+ * and closes at the first sample at or below floor 10^((thresh - hyst)/20)
+ * (hyst_db 0: the closing level is the opening one, pulse.py's rule; a few
+ * dB keeps one noisy dip from splitting a pulse). Runs shorter than
+ * min_samples are dropped as noise spikes (counted). The run's samples are
+ * kept (max_samples at most, allocated at create — rule 2) and the word is
+ * measured when it closes:
+ *   toa       seconds (t0 at create / reset + the opening crossing / fs); the
+ *             crossing is placed by linear interpolation of |x| between the
+ *             sample below the threshold and the first above it (sub-sample);
+ *             a run open at the stream's first sample starts there (EDGE_START)
+ *   pw        seconds, from that crossing to the closing one (interpolated
+ *             the same way at the closing level)
+ *   pa_db     mean |x| over the run, dB re the floor (pulse.py amplitude_db);
+ *             peak_db the largest sample
+ *   freq_hz   the mean instantaneous frequency arg(x[n] x*[n-1]) fs / 2 pi
+ *             over the run's CORE (the n - 1 readings inside the run with
+ *             max(1, (n - 1) / 10) trimmed off each end; a run too short to
+ *             trim keeps them all); 0 with NO_FREQ when n < 4
+ *   chirp_hz  2.77 x the standard deviation of that frequency over the core
+ *             (a linear sweep's instantaneous frequency is uniform over its
+ *             span, so span / sqrt 12 x 2.77 = the span); 0 when n < 4
+ *   slope_hz_s the least-squares slope of the core frequency against time
+ *             (sign = sweep direction); 0 when the core has under 3 readings
+ *   energy    sum |x|^2 over the run (float)
+ *   start/end the run's sample indices [start, end), end exclusive; n = its
+ *             length. A run longer than max_samples is measured on its first
+ *             max_samples (TRUNCATED), its pw and n from where it really
+ *             closed.
+ * A pulse still open when the stream ends is closed by atkdsp_pulses_flush
+ * (FLUSHED; its closing crossing is the last sample).
+ *
+ * OUTPUT CAP. process writes at most cap words; a run that closes with the
+ * buffer full is counted (counters.dropped), the state carries on — the same
+ * stance as pulse.py's "too many candidates": a threshold in the noise is
+ * the caller's to raise, and the kernel says how many it dropped.
+ * atkdsp_pulses_max(n) is the most one call of n samples can close. */
+#define ATKDSP_PDW_TRUNCATED  1u
+#define ATKDSP_PDW_NO_FREQ    2u
+#define ATKDSP_PDW_EDGE_START 4u
+#define ATKDSP_PDW_FLUSHED    8u
+
+typedef struct {
+    double  fs;           /* sample rate, Hz (> 0)                           */
+    double  floor;        /* noise floor, linear magnitude (> 0)              */
+    double  thresh_db;    /* open above floor x 10^(thresh/20), 0..120 (10)  */
+    double  hyst_db;      /* close below floor x 10^((thresh - hyst)/20),
+                             0..thresh (0)                                    */
+    int32_t min_samples;  /* shorter runs are noise spikes, 1..2^20 (4)      */
+    int32_t max_samples;  /* samples kept per run, 4..2^24 (65536)           */
+    int32_t reserved[2];
+} atkdsp_pulses_config;   /* 48 bytes */
+
+typedef struct {
+    double   toa, pw;
+    double   freq_hz, chirp_hz, slope_hz_s;
+    float    pa_db, peak_db, energy;
+    uint32_t flags;
+    uint64_t start, end;
+    int32_t  n;
+    int32_t  reserved;
+} atkdsp_pdw;             /* 80 bytes */
+
+typedef struct {
+    uint64_t samples, pulses, dropped, truncated, short_runs;
+    uint64_t open;        /* 1 while a run is open                            */
+    uint64_t resets;
+} atkdsp_pulses_counters; /* 56 bytes */
+
+typedef struct atkdsp_pulses atkdsp_pulses;
+ATKDSP_API void           atkdsp_pulses_defaults(atkdsp_pulses_config *cfg);
+/* NULL on an invalid configuration (the binding prints the ranges). t0 is
+ * the time of the first sample, seconds. */
+ATKDSP_API atkdsp_pulses *atkdsp_pulses_create(const atkdsp_pulses_config *cfg, double t0);
+ATKDSP_API void           atkdsp_pulses_destroy(atkdsp_pulses *p);
+/* Forget the open run and the sample count; the next sample is at t0. */
+ATKDSP_API void           atkdsp_pulses_reset(atkdsp_pulses *p, double t0);
+/* A new floor (> 0), from the next sample on; the thresholds follow. */
+ATKDSP_API int            atkdsp_pulses_set_floor(atkdsp_pulses *p, double floor);
+ATKDSP_API size_t         atkdsp_pulses_max(const atkdsp_pulses *p, size_t n);
+ATKDSP_API ptrdiff_t      atkdsp_pulses_process(atkdsp_pulses *p, const atkdsp_cf32 *x, size_t n,
+                                                atkdsp_pdw *out, size_t cap);
+ATKDSP_API ptrdiff_t      atkdsp_pulses_flush(atkdsp_pulses *p, atkdsp_pdw *out, size_t cap);
+/* "pulses: fs 30 MSPS, floor 0.0123 (-38.2 dBFS), open at +10.0 dB, close at
+ * +10.0 dB, min 4 samples, keep 65536; 12345 pulses, 0 dropped, open: no" */
+ATKDSP_API int            atkdsp_pulses_describe(const atkdsp_pulses *p, char *buf, size_t cap);
+ATKDSP_API int            atkdsp_pulses_stats(const atkdsp_pulses *p, atkdsp_pulses_counters *st);
+/* The median of |x| over n samples (n even: the mean of the two middle
+ * values, numpy's median) — pulse.py's noise floor, for the config above.
+ * A one-shot helper that allocates n floats; not a processing call. */
+ATKDSP_API int            atkdsp_mag_median(const atkdsp_cf32 *x, size_t n, double *median);
+
+/* ---- 23. Cyclic probes (§B4, v0.17.0) ------------------------------------
+ * Two probes for what a waterfall caption, channel_gate's symbol-rate hint
+ * and the DSSS chip search need: is there a spectral LINE at a candidate
+ * symbol rate after a nonlinearity (atkdsp_cyclic), and does a cyclic
+ * prefix correlate the signal with itself at a candidate FFT length, and at
+ * what prefix length (atkdsp_cp_probe). The model, the thresholds and their
+ * measurements are in src/cyclic.c; the twin is reference.py §23.
+ *
+ * Both cut the stream into segments of seg_len samples on the global index
+ * (never on the caller's blocks) and keep the last nseg segments' phasors,
+ * so a read answers for the last nseg x seg_len / fs seconds and the same
+ * stream chunked differently reads the same. A candidate's verdict needs
+ * nseg >= 16 at Pfa 1e-3 (the coherence test cannot be met below that, and
+ * create refuses); Pfa is divided by the number of candidates (a search).
+ *
+ * atkdsp_cyclic — per candidate (rate_hz, nonlinearity, hard limit): the
+ * nonlinearity of the segment, mean removed, Hann-windowed, its DFT at the
+ * rate; over the last nseg segments
+ *   level            |sum p_k|^2 over the input energy (unit mean for white
+ *                    input: a line of level T is noise with probability e^-T)
+ *   coherence        |sum p_k| / sum |p_k| (1 for a line; a hump — a
+ *                    continuum, however strong — has random phases)
+ *   line_db          10 log10 level
+ *   delta_hz         the line's offset from the candidate rate, from the
+ *                    segment-to-segment phase; level_aligned /
+ *                    coherence_aligned with the phasors derotated by it (a
+ *                    rate a few hundred ppm off still reads; these have one
+ *                    degree of freedom fitted, so they carry no threshold)
+ *   level_thr, coh_thr  the derived thresholds (atkdsp_cyclic_thresholds);
+ *                    LINE when level and coherence both pass; WARMUP until
+ *                    nseg segments are in.
+ * Nonlinearities: ENV2 |x|^2 (the clock line of any shaped linear
+ * modulation — the default), POW2 / POW4 / POW8 x^m (hard_limit divides
+ * by |x| first, siga's way — and a carrier must be centred for them, since
+ * x^m puts the clock lines at m fc +- k/T), DM |x[n] - x[n-1]|^2 (the energy
+ * of the sample-to-sample change: PSK phase steps, shaped FSK), FDIFF
+ * (f[n] - f[n-1])^2 with f = arg(x[n] conj x[n-1]) (the instantaneous
+ * frequency's own transitions: FSK, MSK, GMSK — siga's frequency-transition
+ * line). Candidate rates must sit below fs / 2; the nonlinearity's
+ * own bandwidth is the caller's to provide (feed a channel a few times
+ * wider than the signal).
+ *
+ * atkdsp_cp_probe — per candidate (lag N in samples = the FFT length at this
+ * sample rate, cp W = a prefix length to confirm (0 = detection only),
+ * period P = the symbol period in samples, 0 = N + W):
+ *   score, npairs    |sum x[m] conj x[m-N]| / mean energy over every pair
+ *                    since reset; score_thr = sqrt(-ln(Pfa/ncand) / npairs)
+ *                    (Rayleigh for white noise); DETECT when above. OFDM
+ *                    with prefix fraction rho at SNR g scores ~ rho g/(1+g):
+ *                    LTE normal CP ~0.07, Wi-Fi 0.2, DVB-T 1/4 0.2 at high SNR
+ *   line_*           the symbol-rate line of |z[m]|, z the lag product
+ *                    summed over the last W samples (it peaks once a symbol
+ *                    when the window covers the prefix): the coherence is
+ *                    the test (LINE confirms the prefix length and period),
+ *                    the level is relative (|z| of noise is coloured over W)
+ * A carrier correlates at EVERY lag (a tone is its own shifted copy), so a
+ * band with a strong CW in it scores at all candidates alike: the prefix
+ * signature is the lag whose score stands above its neighbours', or the
+ * line stage, which a tone does not pass.
+ * The caller picks the sample rate: N must be an integer at it (LTE at
+ * 1.92 / 7.68 / 30.72 MSPS: 128 / 512 / 2048; Wi-Fi at 20 MSPS: 64; DVB-T 2k
+ * at 64/7 MHz: 2048). LTE's normal prefix alternates 160 / 144 samples
+ * (at 2048), so its symbol-rate line is smeared: give the slot period
+ * (15360 samples, 2 kHz) as the period instead. */
+#define ATKDSP_NL_ENV2 0
+#define ATKDSP_NL_POW2 1
+#define ATKDSP_NL_POW4 2
+#define ATKDSP_NL_POW8 3
+#define ATKDSP_NL_DM   4
+#define ATKDSP_NL_FDIFF 5
+#define ATKDSP_CYC_LINE   1u
+#define ATKDSP_CYC_WARMUP 2u
+#define ATKDSP_CP_DETECT  1u
+#define ATKDSP_CP_LINE    2u
+#define ATKDSP_CP_WARMUP  4u
+
+typedef struct {
+    double  rate_hz;          /* candidate symbol rate, 0 < rate < fs / 2     */
+    int32_t nonlin;           /* ATKDSP_NL_*                                   */
+    int32_t hard_limit;       /* divide by |x| first (POW* and DM)             */
+} atkdsp_cyc_cand;            /* 16 bytes */
+
+typedef struct {
+    double   level, coherence, line_db, delta_hz, level_aligned, coherence_aligned;
+    double   level_thr, coh_thr;
+    int32_t  nseg;            /* segments held (<= nseg)                       */
+    uint32_t flags;           /* ATKDSP_CYC_LINE, ATKDSP_CYC_WARMUP            */
+} atkdsp_cyc_result;          /* 72 bytes */
+
+typedef struct {
+    int32_t lag;              /* N: the FFT length in samples, 1..65536        */
+    int32_t cp;               /* W: prefix length to confirm, 0..16384 (0 = none) */
+    int32_t period;           /* symbol period in samples (0 = lag + cp)       */
+    int32_t reserved;
+} atkdsp_cp_cand;             /* 16 bytes */
+
+typedef struct {
+    double   score, score_thr, npairs;
+    double   line_level, line_coherence, line_coh_thr, line_delta_hz;
+    int32_t  nseg;
+    uint32_t flags;           /* ATKDSP_CP_DETECT, _LINE, _WARMUP              */
+} atkdsp_cp_result;           /* 64 bytes */
+
+typedef struct {
+    uint64_t samples, segments, resets, segment_fill;
+} atkdsp_cyclic_counters;     /* 32 bytes */
+
+typedef struct atkdsp_cyclic atkdsp_cyclic;
+typedef struct atkdsp_cp_probe atkdsp_cp_probe;
+/* level_thr = -ln pfa_each; coh_thr = sqrt(-ln pfa_each / (0.785 nseg)) —
+ * the derivation and its measurement are in src/cyclic.c. */
+ATKDSP_API void             atkdsp_cyclic_thresholds(int nseg, double pfa_each, double *level_thr,
+                                                     double *coh_thr);
+/* seg_len 16..65536 samples, nseg 2..4096 (16 or more for Pfa <= 1e-3),
+ * 1..64 candidates, 0 < pfa < 0.5 for the whole search. NULL when refused. */
+ATKDSP_API atkdsp_cyclic   *atkdsp_cyclic_create(double fs, const atkdsp_cyc_cand *cands, int ncand,
+                                                 int seg_len, int nseg, double pfa);
+ATKDSP_API void             atkdsp_cyclic_destroy(atkdsp_cyclic *c);
+ATKDSP_API void             atkdsp_cyclic_reset(atkdsp_cyclic *c);
+ATKDSP_API int              atkdsp_cyclic_process(atkdsp_cyclic *c, const atkdsp_cf32 *x, size_t n);
+/* ncand results; returns the segments held. */
+ATKDSP_API int              atkdsp_cyclic_read(const atkdsp_cyclic *c, atkdsp_cyc_result *out);
+/* "cyclic: fs 48000 Hz, 3 candidate(s), segments of 960 samples (0.02 s) x
+ * 50 (1 s), Pfa 0.000333 each -> level >= 8.01 and coherence >= 0.452; 123
+ * segments in: 4800 Bd |x|^2, 2400 Bd |x|^2, 4800 Bd x conj x[-1]" */
+ATKDSP_API int              atkdsp_cyclic_describe(const atkdsp_cyclic *c, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_cyclic_stats(const atkdsp_cyclic *c, atkdsp_cyclic_counters *st);
+
+ATKDSP_API atkdsp_cp_probe *atkdsp_cp_probe_create(double fs, const atkdsp_cp_cand *cands, int ncand,
+                                                   int seg_len, int nseg, double pfa);
+ATKDSP_API void             atkdsp_cp_probe_destroy(atkdsp_cp_probe *p);
+ATKDSP_API void             atkdsp_cp_probe_reset(atkdsp_cp_probe *p);
+ATKDSP_API int              atkdsp_cp_probe_process(atkdsp_cp_probe *p, const atkdsp_cf32 *x, size_t n);
+ATKDSP_API int              atkdsp_cp_probe_read(const atkdsp_cp_probe *p, atkdsp_cp_result *out);
+ATKDSP_API int              atkdsp_cp_probe_describe(const atkdsp_cp_probe *p, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_cp_probe_stats(const atkdsp_cp_probe *p, atkdsp_cyclic_counters *st);
+
+/* ---- 24. Analog radio IDs (§C3, v0.17.0) -----------------------------------
+ * The identifiers an analog FM handset carries in the clear, decoded from
+ * its demodulated audio (one handle per channel, real float samples, any
+ * rate 6..96 kHz): CTCSS, DCS, DTMF, and a tone tracker that measures the
+ * tones of 5-tone selcall and two-tone sequential paging — tables are
+ * matched on the Python side (reference.SELCALL_TABLES), so an unlisted
+ * tone plan still reports its frequencies. MDC-1200 and FleetSync are not
+ * here (phase 3b: their framing is reverse-engineered and needs real
+ * recordings before an ID is trusted). Model and measurements in
+ * src/tone_id.c; the twin is reference.py §24 (class ToneId).
+ *
+ * The output is one stream of events, each a START when an ID is confirmed
+ * and an END when it stops (t1, the duration, and the averages are on the
+ * END; t1 is NaN on a START):
+ *   CTCSS   the sub-audio band (a 300 Hz low-pass, decimated to ~1 kHz),
+ *           100 ms Hann segments, a DFT bank at the 50 standard tones; the
+ *           tone is the strongest bin refined by the segment-to-segment
+ *           phase (the measured frequency, to ~0.1 Hz over half a second,
+ *           is reported, and a radio's error from the table is a fingerprint
+ *           feature); `code` = the table index (0..49) of the nearest standard
+ *           tone within 1 Hz, else -1; confirmed after 2 segments, ended
+ *           after 2 without it. The REVERSE_BURST flag on the END marks the
+ *           Motorola squelch-tail phase reversal (a >90 degree step in the
+ *           tone's phase while it is still there); the TURNOFF flag marks a
+ *           DCS turn-off tone (134.4 Hz) seen in the same band.
+ *   DCS     the same band: a slow DC tracker (the code has long runs), the
+ *           sign integrated over each 134.4 Bd bit at eight timing phases
+ *           over the last second, every 23-bit window checked against the
+ *           Golay(23,12) code of generator 0xC75 (x^11+x^10+x^6+x^5+x^4+x^2+1,
+ *           the DCS polynomial) with the fixed marker bits and the standard
+ *           table; dcs_max_errors bit corrections accepted (Golay corrects 3;
+ *           1 by default keeps false IDs down). `code` is the octal number
+ *           read in NORMAL polarity; THE INVERTED READING IS ALWAYS THERE TOO —
+ *           a DCS word is a cyclic Golay codeword, and every standard code
+ *           inverted is another standard code shifted (023 normal is 047
+ *           inverted, bit for bit; the two readings cannot be told apart from
+ *           the air) — so `alias` carries the inverted reading, and an
+ *           operator who knows the system's convention picks. The marker and
+ *           the table resolve every same-polarity shift (none collide among
+ *           the 104 standard codes; the tests plant every one and require it
+ *           back as itself). Confirmed after two consecutive valid words.
+ *   DTMF    10 ms frames at the full rate, DFTs at the 8 tones and their
+ *           second harmonics (voice has harmonics, DTMF does not: a second
+ *           harmonic within 20 dB of its fundamental is talk-off); the
+ *           strongest low and high tones must hold at least 60 % of the
+ *           frame's energy, their twist within 8 dB, and each frequency
+ *           within 1.5 % (ITU-T Q.24 operate; beyond 3.5 % is refused,
+ *           between is treated as refused) measured from the frame-to-frame
+ *           phase; a digit needs 4 frames (40 ms), a pause 4 frames; a
+ *           single dropped frame inside a digit is forgiven (Q.24 allows a
+ *           10 ms interruption). `code` is the key character ('0'..'9',
+ *           'A'..'D', '*', '#').
+ *   TONE    the voice band 250..3500 Hz, 20 ms Hann windows every 10 ms,
+ *           an FFT, the peak bin refined by parabolic interpolation (about
+ *           a hertz); a frame holds a tone when the peak's +-2 bins carry
+ *           60 % of the band's energy and it is above tone_min_dbfs; frames
+ *           within 1.5 % (or 10 Hz) of each other run together; two frames
+ *           make a tone. Selcall (ZVEI, CCIR, EEA, EIA) and Quick Call II
+ *           tables live in the Python layer, matched to the measured tones.
+ * level_db is the tone's amplitude in dBFS (a full-scale sine is 0), snr_db
+ * its power over the band's floor (the median of the other bins).
+ * Events are written into the caller's array per call, at most
+ * atkdsp_tone_id_events_max(n) for n samples; a call with a smaller cap
+ * drops the overflow and counts it (counters.dropped). */
+#define ATKDSP_TONE_CTCSS 1
+#define ATKDSP_TONE_DCS   2
+#define ATKDSP_TONE_DTMF  3
+#define ATKDSP_TONE_TONE  4
+#define ATKDSP_TONE_START 1
+#define ATKDSP_TONE_END   2
+#define ATKDSP_TONE_F_REVERSE_BURST 1u   /* CTCSS END: the squelch-tail phase reversal */
+#define ATKDSP_TONE_F_TURNOFF       2u   /* CTCSS END: a DCS turn-off tone followed     */
+#define ATKDSP_TONE_F_NONSTANDARD   4u   /* CTCSS: no standard tone within 1 Hz; DCS: the
+                                            code is not in the standard table            */
+#define ATKDSP_TONE_F_CORRECTED     8u   /* DCS: a bit error was corrected               */
+#define ATKDSP_TONE_F_FLUSHED      16u   /* END by atkdsp_tone_id_flush                  */
+#define ATKDSP_TONE_EN_CTCSS 1
+#define ATKDSP_TONE_EN_DCS   2
+#define ATKDSP_TONE_EN_DTMF  4
+#define ATKDSP_TONE_EN_TONE  8
+#define ATKDSP_TONE_EN_ALL   15
+
+typedef struct {
+    double  fs;               /* audio sample rate, 6000..96000               */
+    int32_t enable;           /* ATKDSP_TONE_EN_* mask (all)                  */
+    int32_t dcs_max_errors;   /* Golay corrections accepted, 0..3 (1)         */
+    double  ctcss_min_snr_db; /* tone over the sub-audio floor (10)           */
+    double  dtmf_min_dbfs;    /* a digit's weaker tone, at least (-45)        */
+    double  tone_min_dbfs;    /* a tracked tone, at least (-45)               */
+    double  tone_min_snr_db;  /* a tracked tone over the voice band (10)      */
+    int32_t reserved[2];
+} atkdsp_tone_config;         /* 48 bytes */
+
+typedef struct {
+    double   t0, t1;          /* seconds; t1 NaN on a START                   */
+    double   freq_hz;         /* measured (CTCSS, TONE, DTMF: the low tone)   */
+    double   freq2_hz;        /* DTMF: the high tone; else 0                  */
+    float    level_db, snr_db;
+    int32_t  kind, type;      /* ATKDSP_TONE_* kind; START / END              */
+    int32_t  code;            /* CTCSS: table index or -1; DCS: octal code;
+                                 DTMF: the key character; TONE: -1            */
+    int32_t  alias;           /* DCS: the inverted reading (octal); else -1   */
+    uint32_t flags;
+    uint32_t reserved;
+    char     text[16];        /* "CTCSS 127.3", "DCS 023N", "DTMF 7", "TONE 1250" */
+} atkdsp_tone_event;          /* 80 bytes */
+
+typedef struct {
+    uint64_t samples, events, dropped;
+    uint64_t ctcss, dcs, dtmf, tones;   /* STARTs by kind                     */
+    uint64_t resets;
+} atkdsp_tone_counters;       /* 64 bytes */
+
+typedef struct atkdsp_tone_id atkdsp_tone_id;
+ATKDSP_API void            atkdsp_tone_id_defaults(atkdsp_tone_config *cfg);
+ATKDSP_API atkdsp_tone_id *atkdsp_tone_id_create(const atkdsp_tone_config *cfg, double t0);
+ATKDSP_API void            atkdsp_tone_id_destroy(atkdsp_tone_id *h);
+ATKDSP_API void            atkdsp_tone_id_reset(atkdsp_tone_id *h, double t0);
+ATKDSP_API size_t          atkdsp_tone_id_events_max(const atkdsp_tone_id *h, size_t n);
+ATKDSP_API ptrdiff_t       atkdsp_tone_id_process(atkdsp_tone_id *h, const float *x, size_t n,
+                                                  atkdsp_tone_event *ev, size_t cap);
+/* END every open ID now (FLUSHED). cap >= 4 always suffices. */
+ATKDSP_API ptrdiff_t       atkdsp_tone_id_flush(atkdsp_tone_id *h, atkdsp_tone_event *ev, size_t cap);
+ATKDSP_API int             atkdsp_tone_id_describe(const atkdsp_tone_id *h, char *buf, size_t cap);
+ATKDSP_API int             atkdsp_tone_id_stats(const atkdsp_tone_id *h, atkdsp_tone_counters *st);
+/* The tables, for callers: the 50 CTCSS tones (Hz) and the 104 standard
+ * DCS codes (octal numbers as integers, e.g. 023 -> 19). */
+ATKDSP_API int             atkdsp_ctcss_tone(int index, double *hz);
+ATKDSP_API int             atkdsp_dcs_code(int index, int *octal);
+/* The Golay(23,12) word a DCS code is sent as (bit 0 first on the air), and
+ * its decode: *code the octal number read in normal polarity, *alias the
+ * inverted reading, both -1 when the word (after up to max_errors
+ * corrections) is not a standard code. Returns the corrections made, or
+ * ATKDSP_E_DECODE. */
+ATKDSP_API uint32_t        atkdsp_dcs_encode(int octal);
+ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int *code, int *alias);
 
 #ifdef __cplusplus
 }

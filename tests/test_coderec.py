@@ -705,3 +705,99 @@ def test_equivalent_interleaver_is_reported():
     x = interleave(block_stream(H74, 6000, gen(18), skip=0), 3, 14)[5:]
     res = atkdsp.interleaver_id(x, 8, 512)
     assert (res["rows"], res["cols"], res["period"], res["inner_width"]) == (3, 7, 21, 7)
+
+
+# ============================================================================
+# fixed bits — a structured payload inside a block code (v0.17.0, plan §D4)
+# ============================================================================
+# The Bit Bench's harness found it: text under Hamming(7,4) gave the null
+# space single-position checks (the payload's fixed bits — ASCII's high bit)
+# and then refused the stream as "sliding" or "fails unlike noise" at 28 kbit,
+# 1 seed in 20 at 42 kbit. Now the exact search allows a constant position
+# as extra structure in a stretch, the single-position checks are set aside
+# and reported, and the checks are restored to a named code where that
+# names one.
+LETTERS = np.frombuffer(b"abcdefghijklmnopqrstuvwxyz ", np.uint8)
+
+
+def ascii_bits(r, nchars):
+    by = LETTERS[r.integers(0, LETTERS.size, nchars)]
+    return np.unpackbits(by[:, None], axis=1, bitorder="little").ravel()
+
+
+def hamming_cyclic_encode(nibbles):
+    out = []
+    for m in nibbles:
+        w = 0
+        for i in range(4):
+            if m[i]:
+                w ^= 0b1011 << i
+        out.append([(w >> j) & 1 for j in range(7)])
+    return np.array(out, np.uint8).ravel()
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_text_under_a_systematic_hamming_code_is_named_with_its_fixed_bit(seed):
+    """Two codewords per character at n_lo = 14: the high bit of ASCII is a
+    fixed 0 in every block; k and dmin come out as Hamming's."""
+    r = gen(100 + seed)
+    G = atkdsp.SMALL_CODES["hamming(7,4)"]()
+    coded = ((ascii_bits(r, 6000).reshape(-1, 4) @ G) & 1).astype(np.uint8).ravel()[:28000]
+    t = ref.block_code_id(coded, 14, 32, 1e-3, 1)
+    assert t["found"] and (t["n"], t["k"], t["fixed_bits"], t["dmin"]) == (14, 8, 1, 3), t["name"]
+    assert t["name"].endswith(", 1 fixed bit") and t["agreement"] == 1.0
+    assert_same(atkdsp.block_code_id(coded, 14, 32, 1e-3, 1), t)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_a_three_bit_payload_under_cyclic_hamming_is_hamming_with_a_fixed_bit(seed):
+    r = gen(200 + seed)
+    nib = np.zeros((6000, 4), np.uint8)
+    nib[:, :3] = r.integers(0, 2, (6000, 3))
+    coded = hamming_cyclic_encode(nib)[:28000]
+    t = ref.block_code_id(coded, 4, 32, 1e-3, 1)
+    assert t["name"] == "Hamming(7,4), 1 fixed bit" and t["cyclic"] == 1 and t["dmin"] == 3
+    assert t["fixed_bits"] == 1 and t["agreement"] == 1.0
+    assert_same(atkdsp.block_code_id(coded, 4, 32, 1e-3, 1), t)
+
+
+def test_text_under_hamming_behind_an_interleaver_decodes_by_the_chain():
+    """The harness case end to end: interleaver_id finds the block, the
+    de-interleaved stream names the code with its fixed bit, and the text
+    comes back through the generator handed over (a systematic encoder, so
+    the payload sits at known positions)."""
+    r = gen(300)
+    text = LETTERS[r.integers(0, LETTERS.size, 8000)]
+    nib = np.unpackbits(text[:, None], axis=1, bitorder="little").reshape(-1, 4)
+    Gs = systematic(atkdsp.SMALL_CODES["hamming(7,4)"]())
+    coded = ((nib @ Gs) & 1).astype(np.uint8).ravel()
+    x = interleave(coded, 16, 7)[:42000]
+    il = atkdsp.interleaver_id(x, 8, 512)
+    assert il["found"] and (il["rows"], il["cols"]) == (16, 7)
+    y = ref._deinterleave(ref._bits(x), il["offset"], (x.size - il["offset"]) // il["period"],
+                          il["period"], il["rows"])
+    res = atkdsp.block_code_id(y, 14, 32, 1e-3, 1)
+    assert res["found"] and res["fixed_bits"] == 1 and res["agreement"] == 1.0, res["name"]
+    assert res["name"].endswith(", 1 fixed bit")
+    # the bench decodes with the generator handed back; the payload is where
+    # the systematic encoder put it (columns 0..3 of each 7-bit word)
+    bc = ref.BlockCode(res["G"])
+    words = np.asarray(y[res["offset"]:res["offset"] + 14 * 300]).reshape(-1, 14)
+    got = []
+    for w in words:
+        corrected, _data, cc = bc.decode(w)
+        assert cc == 0
+        got.append(np.concatenate([corrected[0:4], corrected[7:11]]))
+    chars = np.packbits(np.array(got, np.uint8), axis=1, bitorder="little").ravel()
+    assert bytes(chars) in bytes(text)
+
+
+def test_random_payloads_report_no_fixed_bits():
+    r = gen(400)
+    G = atkdsp.SMALL_CODES["hamming(7,4)"]()
+    coded = block_stream(G, 4000, r)
+    t = ref.block_code_id(coded, 4, 32, 1e-3, 1)
+    assert t["found"] and t["fixed_bits"] == 0 and "fixed" not in t["name"]
+    c = atkdsp.block_code_id(coded, 4, 32, 1e-3, 1)
+    assert c["fixed_bits"] == 0
+    assert_same(c, t)

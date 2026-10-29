@@ -38,7 +38,7 @@ include/atkdsp.h        THE ABI. Read its header comment first.
 src/                    C99 kernels, one file per group (convert, nco, fir,
                         resample, fft, demod, display, detect, ddc, lte*,
                         fsk, dmr_sync, the bitstream files, cfar, burst,
-                        ring)
+                        ring, pulses, cyclic, tone_id)
 vendor/pocketfft/       Martin Reinecke's pocketfft (C, BSD-3) — the only
                         third-party code, used through src/fft.c and, for
                         the burst word's spectra, src/burst.c
@@ -47,6 +47,7 @@ python/atkdsp/          __init__.py  the ctypes binding
 tests/test_smoke.c      C-only proof the DLL is sane (no Python needed)
 tests/test_cross_check.py  every kernel vs its twin, in uneven blocks
 tests/test_detection.py    CFAR, the burst word, the ring (v0.16.0)
+tests/test_phase3.py       pulse runs, the cyclic probes, the analog IDs (v0.17.0)
 tests/test_ring_stress.c   the ring under threads; ring_bench.bat runs it
                         as Bill's 40 MSPS bench
 bench/                  the measurement above
@@ -88,7 +89,56 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.16.0 (ABI 17)
+## What is in v0.17.0 (ABI 18)
+
+**Phase 3 — "small, high value"** of `docs/ATKDSP_PLAN.md` (§B3, §B4, §C3),
+and two corrections phase 2 left owed. Header §22–24, twins in
+`reference.py` §22–24, 73 tests in `tests/test_phase3.py` plus 22 in
+`test_detection.py` and 11 in `test_coderec.py` for the corrections (954 in
+all), smoke lines for every kernel. Built and checked here on Linux; the Windows run is
+`build.bat /only atkdsp /test` from ATK.
+
+| | what | how |
+|---|---|---|
+| **pulse runs** | `atkdsp_pulses_*` | envelope → threshold with hysteresis → runs carried across block edges, one PDW per run: sub-sample TOA and PW (the crossings interpolated), PA, peak, energy, the mean instantaneous frequency and 2.77 σ chirp span over the run's core (flanks trimmed 10 %), a least-squares sweep slope. **Word for word `atk.core.pulse.detect_pulses`** for the same floor and `hyst_db = 0` (the oracle is copied into the test); the floor is the caller's (`atkdsp_mag_median`, the same median), because a streaming median would make the answer depend on the chunking. A run beyond `max_samples` is measured on its first `max_samples` and timed from its real edges (TRUNCATED); an open run is closed by `flush` (FLUSHED); an overflowing output buffer drops and counts (`dropped`), never loses state |
+| **cyclic line** | `atkdsp_cyclic_*` | a spectral line at each candidate symbol rate after a nonlinearity — \|x\|² (shaped linear modulations), x², x⁴, x⁸ (hard-limited or not; centre the carrier), \|x[n] − x[n−1]\|² (phase steps, shaped FSK), (f[n] − f[n−1])² (frequency transitions: rectangular FSK, MSK). Segments cut on the global index, mean removed, Hann, a Goertzel at the rate; over the last `nseg` segments: **level** (unit mean for white input), **coherence** \|Σp\| / Σ\|p\| (siga's line-versus-hump test: a hump's phasors have random phases), the line's **offset** from the candidate (the segment-to-segment phase) and the aligned statistics. Thresholds derived — level −ln Pfa, coherence √(−ln Pfa / 0.785 K) — then **measured** (below): conservative, and create refuses a K at which the coherence test cannot be met |
+| **cyclic prefix** | `atkdsp_cp_probe_*` | per candidate FFT length N: the lag-N correlation over every pair since reset, \|ΣR\| / ΣE, with the Rayleigh threshold √(−ln Pfa / M); per prefix length W: the symbol-rate line of \|z\|, z the lag product summed over the last W samples (it peaks once a symbol when the window sits on the prefix) — the coherence confirms W and the period (LTE's mixed 160/144 prefix: give the slot period) |
+| **analog IDs** | `atkdsp_tone_id_*` | one handle per audio channel: **CTCSS** (a 270/330 Hz Kaiser low-pass decimated to ~1 kHz, 100 ms Hann segments, a DFT bank at the 50 tones; the measured frequency from the segment-to-segment phase, to 0.1 Hz; a line-share test and a 3-segment confirmation that voice pitch does not pass; the squelch-tail **reverse burst** flagged from the phase step; the DCS turn-off tone), **DCS** (134.4 Bd, eight timing phases over the last second, every 23-bit alignment against the Golay(23,12) code of generator 0xC75 with the marker bits and the 104-code table; `dcs_max_errors` corrections; the **inverted alias** reported — 023 normal IS 047 inverted, bit for bit, and no decoder can tell them apart), **DTMF** (20 ms frames every 10 ms, DFTs at the 8 tones and their second harmonics; Q.24: 1.5 % frequency from the frame-to-frame phase, 8 dB twist, 60 % energy share, harmonic talk-off, 40 ms on, a 10 ms dropout forgiven), a **tone tracker** (20 ms FFT frames, parabolic peak, ~1 Hz) with the ZVEI / CCIR / EEA / EIA tables and a matcher in `reference.py` (Quick Call II is matched by frequency against an agency's plan). CTCSS and DCS suppress each other's starts: a radio sends one or the other, and a tone's sign pattern at 134.4 Bd is periodic enough to pass Golay |
+| **CFAR `rho2`** | `atkdsp_cfar_config.rho2`, `atkdsp_cfar_n_eff`, `atkdsp_cfar_window_rho2` | the window's bin-to-bin power correlation (Hann: 4/9, 1/36), so the solver uses the equivalent independent cell count — CA and GO/SO as gamma shapes, OS through the rate the independent-cell CA formula maps to (ATK `cue_live.py`'s correction, now in the kernel); the band test too. Zeros reproduce v0.16.0 exactly |
+| **fixed bits** | `atkdsp_blockid.fixed_bits` | a payload position that never varies (ASCII's high bit) put single-position checks into the null space and refused true codes on short captures — and the exact search's stretch test read a bit constant *within* a stretch as noise (the 1-in-20). Extras are now judged in the affine space (a constant position is allowed, a broken code check is noise), the single-position checks are set aside and reported, and the checks are put back into a named code where that names one (else the largest dmin for a small code) |
+
+Measured (Linux, gcc; `tests/test_phase3.py`, `test_detection.py`, `test_coderec.py`):
+
+| check | result |
+|---|---|
+| pulse words against `pulse.detect_pulses` on a 400 k-sample radar scene (CW and 2 MHz chirps at 20 dB) | **every word equal**: start / end exact, TOA within a sample, PA within 1e-3 dB, frequency and chirp within 1e-6 fs — on C and on the twin |
+| a pulse straddling a block boundary | reported once, identical to 1e-9, at chunk sizes 1, 7, 239–241, 999, 4096, 8192 |
+| noise alone, 2 M samples at the default 10 dB / 4 samples | nothing; with `min_samples = 1` the crossings appear at 9.8e-4 per sample, the Rayleigh rate the header derives |
+| QPSK / RRC at 4800 Bd, 10 dB | the clock line at 4800 through \|x\|², the DM energy and x⁴; nothing at 2400, 1200, 3600; the rate within 2.5 Hz |
+| 4FSK at 4800 Bd | rectangular pulses: FDIFF finds it from 15 dB (and the 9600 harmonic, as any clock line has); shaped pulses: DM finds it from 15 dB — the two transition nonlinearities cover each other |
+| noise, and FM with wandering tones | no line; the LINE rate on 60 candidates × 300 trials of noise at Pfa 0.005 each sits inside the binomial band and above a quarter of the mean (the bounds are conservative, as derived) |
+| OFDM 64/16 (Wi-Fi-like) at 20 MSPS, 10 dB and **0 dB** | DETECT at lag 64 with score ≈ 0.2 g/(1+g) within 15 %, the prefix and period confirmed (coherence > 0.95); the wrong prefix or period not; lags 32, 128, 256, 2048 nothing; noise nothing; the score's rate on 64 lags of noise is the Rayleigh rate |
+| every CTCSS tone under 300–3000 Hz voice, 3 s | **50 of 50** read as itself, 0.2 Hz, held for the transmission; a 105.0 Hz tone reported non-standard at 105.0 |
+| the reverse burst (120°, 180°, 240°) | flagged on the END; a plain end not; an 8 s clean tone not |
+| every DCS code under voice, at every bit phase | **104 of 104** as itself with its alias; 023 inverted reads 047 / alias 023; a flipped bit per word corrected and flagged at `max_errors` 1, never at 0; the turn-off tone flagged |
+| every DTMF key at 50 / 50 ms | all 16, frequencies within 2 Hz; a 6 dB twist and 1 % detune accepted; 12 dB twist, 3.5 % detune, a 25 ms digit and voice at full level refused |
+| ZVEI-1 (70 ms), CCIR (100 ms), EEA (40 ms) sequences | every tone within 1.5 Hz and 20 ms, matched to its table and digits |
+| voice, noise, silence alone | no ID of any kind |
+| C against the twin, uneven blocks | pulses to 1e-9; probes to 1e-7; tone_id event for event at 8, 22.05 and 48 kHz (times to 1e-9, frequencies to 1e-6) |
+| CFAR with the Hann `rho2` on Hann-windowed noise, CA / OS / GO / SO at 1e-3 | inside the binomial 99 % interval; the uncorrected threshold fires > 1.25× too often |
+| text under Hamming(7,4) at 28 kbit (two codewords per character) | 20 seeds of 20 named "linear (14,8), 1 fixed bit", dmin 3; a 3-bit payload under cyclic Hamming names "Hamming(7,4), 1 fixed bit"; the interleaved harness case decodes back to the text |
+| sanitizers | the smoke test and the whole suite clean under ASan + UBSan |
+
+**Honest limits.** CTCSS under a voice whose fundamental is below 300 Hz at
+full level (a radio's audio high-pass removes it, a sound-card feed may
+not) breaks up and restarts. DCS polarity is not decidable from the air.
+The tone tracker reports what it measures; letter tones in the selcall
+tables vary by vendor. MDC-1200 and FleetSync are phase 3b: their framing
+is reverse-engineered, and real recordings come before trust. The cyclic
+line's thresholds are the Rayleigh-walk bound, conservative by a few tens
+of percent at K = 16–50 (measured in `src/cyclic.c`).
+
+## What was in v0.16.0 (ABI 17)
 
 **The detection track** — phase 2 of `docs/ATKDSP_PLAN.md` (§B1, §B2, §A3):
 the detector cued DF, Bug Sniffer and Drone Discovery wait on, the record it

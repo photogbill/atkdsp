@@ -50,7 +50,10 @@ __all__ = [
 #: 16 adds naming the code (§18): rank scan, block / conv / RS / interleaver id.
 #: 17 adds the detection track (§19-21): CFAR + burst tracker, the burst
 #:    descriptor word, the ring buffer; ATKDSP_E_OVERRUN and ATKDSP_E_EMPTY.
-ABI_VERSION = 17
+#: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
+#:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
+#:    window's bin correlation) and block_code_id's fixed_bits.
+ABI_VERSION = 18
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -2152,6 +2155,7 @@ class _BlockId(C.Structure):
     _fields_ = [("n", C.c_int), ("k", C.c_int), ("offset", C.c_int), ("deficiency", C.c_int),
                 ("cyclic", C.c_int), ("extended", C.c_int), ("dmin", C.c_int),
                 ("rows_used", C.c_int), ("robust", C.c_int), ("shortened", C.c_int),
+                ("fixed_bits", C.c_int), ("reserved", C.c_int),
                 ("log10_pfa", C.c_double), ("ber_est", C.c_double), ("agreement", C.c_double),
                 ("valid_words", C.c_double), ("name", C.c_char * 48)]
 
@@ -2233,6 +2237,7 @@ def block_code_id(b, n_lo: int = 4, n_hi: int = 256, pfa: float = 1e-3, seed: in
                                           int(seed), C.byref(s), _u8p(G), G.size, _u8p(gp), gp.size),
               "block_code_id", n=b.size, n_lo=n_lo, n_hi=n_hi)
     d = _struct_dict(s)
+    d.pop("reserved", None)
     d["found"] = bool(rc)
     d["G"] = G[:s.k * s.n].reshape(s.k, s.n).copy() if rc else None
     nz = np.flatnonzero(gp)                     # g(0) = 1: the last coefficient is set
@@ -2322,7 +2327,7 @@ class _CfarConfig(C.Structure):
                 ("k_frames", C.c_int32), ("pfa", C.c_double), ("looks", C.c_double),
                 ("os_k", C.c_int32), ("open_m", C.c_int32), ("open_n", C.c_int32),
                 ("close_k", C.c_int32), ("merge_gap", C.c_int32), ("min_bins", C.c_int32),
-                ("max_tracks", C.c_int32), ("reserved", C.c_int32 * 3)]
+                ("max_tracks", C.c_int32), ("reserved", C.c_int32), ("rho2", C.c_double * 4)]
 
 
 class _CfarEvent(C.Structure):
@@ -2344,8 +2349,12 @@ def _bind_cfar(lib) -> None:
     vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
     lib.atkdsp_cfar_defaults.argtypes = [P(_CfarConfig)]
     lib.atkdsp_cfar_defaults.restype = None
-    lib.atkdsp_cfar_alpha.argtypes = [i, i, d, d, i, P(d), P(d)]
+    lib.atkdsp_cfar_alpha.argtypes = [i, i, d, d, i, P(d), P(d), P(d)]
     lib.atkdsp_cfar_alpha.restype = i
+    lib.atkdsp_cfar_n_eff.argtypes = [i, P(d)]
+    lib.atkdsp_cfar_n_eff.restype = d
+    lib.atkdsp_cfar_window_rho2.argtypes = [P(C.c_float), sz, P(d)]
+    lib.atkdsp_cfar_window_rho2.restype = i
     lib.atkdsp_cfar_create.argtypes = [sz, P(_CfarConfig)]
     lib.atkdsp_cfar_create.restype = vp
     lib.atkdsp_cfar_destroy.argtypes = [vp]
@@ -2373,15 +2382,41 @@ def _bind_cfar(lib) -> None:
 _BIND_EXTRA.append(_bind_cfar)
 
 
-def cfar_alpha(mode, n_ref: int, pfa: float, looks: float = 1.0, os_k: int = 0) -> tuple:
+def _rho2_arg(rho2):
+    """A (c_double * 4) for the C, or None for independent cells."""
+    if rho2 is None:
+        return None
+    vals = [float(v) for v in rho2]
+    if len(vals) != 4:
+        raise AtkDspError("rho2 needs four correlations (bins 1..4 apart)")
+    return (C.c_double * 4)(*vals)
+
+
+def cfar_alpha(mode, n_ref: int, pfa: float, looks: float = 1.0, os_k: int = 0,
+               rho2=None) -> tuple:
     """(alpha, E[T]) — the CFAR threshold multiplier solved for `pfa` per cell
-    (atkdsp.h §19); the twin is reference.cfar_alpha."""
+    (atkdsp.h §19), with the window's bin correlation `rho2` (four values, or
+    None for independent cells); the twin is reference.cfar_alpha."""
     mode = CFAR_MODES.get(mode, mode) if isinstance(mode, str) else int(mode)
     a, et = C.c_double(), C.c_double()
     _dchk(load().atkdsp_cfar_alpha(int(mode), int(n_ref), float(pfa), float(looks), int(os_k),
-                                    C.byref(a), C.byref(et)),
-          "cfar_alpha", mode=mode, n_ref=n_ref, pfa=pfa, looks=looks, os_k=os_k)
+                                    _rho2_arg(rho2), C.byref(a), C.byref(et)),
+          "cfar_alpha", mode=mode, n_ref=n_ref, pfa=pfa, looks=looks, os_k=os_k, rho2=rho2)
     return a.value, et.value
+
+
+def cfar_n_eff(n_ref: int, rho2=None) -> float:
+    """Equivalent independent cells among 2 n_ref correlated ones (atkdsp.h §19)."""
+    return float(load().atkdsp_cfar_n_eff(int(n_ref), _rho2_arg(rho2)))
+
+
+def cfar_window_rho2(window) -> tuple:
+    """The power correlation of bins 1..4 apart through `window` (atkdsp.h §19):
+    pass it as a Cfar's rho2 so the stated Pfa holds on windowed frames."""
+    w = _f32(window, "window")
+    out = (C.c_double * 4)()
+    _check(load().atkdsp_cfar_window_rho2(_fp(w), w.size, out), "cfar_window_rho2")
+    return tuple(float(v) for v in out)
 
 
 def _cfar_event_dict(e) -> dict:
@@ -2409,14 +2444,21 @@ class Cfar:
                 raise AtkDspError(f"unknown CFAR option {key!r}; known: {sorted(c)}")
             c[key] = CFAR_MODES.get(v, v) if key == "mode" and isinstance(v, str) else v
         for key in c:
-            c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
+            if key == "rho2":
+                c[key] = (tuple(float(v) for v in c[key]) if _ref._rho2_ok(c[key])
+                          else c[key])
+            else:
+                c[key] = float(c[key]) if key in ("pfa", "looks") else int(c[key])
         why = _ref._cfar_check(int(nbins), c)
         if why:
             raise AtkDspError(f"cfar_create({nbins} bins, {c}) refused — {why}")
         self.nbins = int(nbins)
         k = _CfarConfig()
         for key, v in c.items():
-            setattr(k, key, v)
+            if key == "rho2":
+                k.rho2 = (C.c_double * 4)(*v)
+            else:
+                setattr(k, key, v)
         self._h = self._lib.atkdsp_cfar_create(self.nbins, C.byref(k))
         if not self._h:
             raise AtkDspError(f"cfar_create({nbins} bins, {c}) refused — the threshold "
@@ -2427,6 +2469,8 @@ class Cfar:
         self._lib.atkdsp_cfar_info(self._h, C.byref(a), C.byref(ac), C.byref(et), C.byref(rc))
         self.alpha, self.alpha_ca, self.et = a.value, ac.value, et.value
         self.cfg = {n: getattr(rc, n) for n, _t in _CfarConfig._fields_ if n != "reserved"}
+        self.cfg["rho2"] = tuple(float(v) for v in rc.rho2)
+        self.n_eff = cfar_n_eff(self.cfg["n_ref"], self.cfg["rho2"])
         _det_log.info("cfar created: %s", self.describe())
 
     def __del__(self):
@@ -2839,3 +2883,503 @@ def _shm_open(name):
 
 __all__ += ["RING_MAX_CONSUMERS", "RING_RETUNE", "RING_OVERFLOW", "RING_CAL", "ring_bytes",
             "Ring"]
+
+
+# ============================================================================
+# PHASE 3 (v0.17.0, ABI 18) — §22 pulse runs, §23 cyclic probes, §24 tone IDs
+# ============================================================================
+_p3_log = _logging.getLogger("atkdsp.phase3")
+PDW_TRUNCATED, PDW_NO_FREQ, PDW_EDGE_START, PDW_FLUSHED = 1, 2, 4, 8
+
+
+class _PulsesConfig(C.Structure):
+    _fields_ = [("fs", C.c_double), ("floor", C.c_double), ("thresh_db", C.c_double),
+                ("hyst_db", C.c_double), ("min_samples", C.c_int32), ("max_samples", C.c_int32),
+                ("reserved", C.c_int32 * 2)]
+
+
+class _Pdw(C.Structure):
+    _fields_ = [("toa", C.c_double), ("pw", C.c_double), ("freq_hz", C.c_double),
+                ("chirp_hz", C.c_double), ("slope_hz_s", C.c_double), ("pa_db", C.c_float),
+                ("peak_db", C.c_float), ("energy", C.c_float), ("flags", C.c_uint32),
+                ("start", C.c_uint64), ("end", C.c_uint64), ("n", C.c_int32),
+                ("reserved", C.c_int32)]
+
+
+class _PulsesCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in
+                ("samples", "pulses", "dropped", "truncated", "short_runs", "open", "resets")]
+
+
+def _bind_pulses(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
+    lib.atkdsp_pulses_defaults.argtypes = [P(_PulsesConfig)]
+    lib.atkdsp_pulses_defaults.restype = None
+    lib.atkdsp_pulses_create.argtypes = [P(_PulsesConfig), d]
+    lib.atkdsp_pulses_create.restype = vp
+    lib.atkdsp_pulses_destroy.argtypes = [vp]
+    lib.atkdsp_pulses_destroy.restype = None
+    lib.atkdsp_pulses_reset.argtypes = [vp, d]
+    lib.atkdsp_pulses_reset.restype = None
+    lib.atkdsp_pulses_set_floor.argtypes = [vp, d]
+    lib.atkdsp_pulses_set_floor.restype = i
+    lib.atkdsp_pulses_max.argtypes = [vp, sz]
+    lib.atkdsp_pulses_max.restype = sz
+    lib.atkdsp_pulses_process.argtypes = [vp, P(_Cf32), sz, P(_Pdw), sz]
+    lib.atkdsp_pulses_process.restype = C.c_ssize_t
+    lib.atkdsp_pulses_flush.argtypes = [vp, P(_Pdw), sz]
+    lib.atkdsp_pulses_flush.restype = C.c_ssize_t
+    lib.atkdsp_pulses_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_pulses_describe.restype = i
+    lib.atkdsp_pulses_stats.argtypes = [vp, P(_PulsesCounters)]
+    lib.atkdsp_pulses_stats.restype = i
+    lib.atkdsp_mag_median.argtypes = [P(_Cf32), sz, P(d)]
+    lib.atkdsp_mag_median.restype = i
+
+
+_BIND_EXTRA.append(_bind_pulses)
+
+
+def _pdw_dict(w) -> dict:
+    return {"toa": float(w.toa), "pw": float(w.pw), "freq_hz": float(w.freq_hz),
+            "chirp_hz": float(w.chirp_hz), "slope_hz_s": float(w.slope_hz_s),
+            "pa_db": float(w.pa_db), "peak_db": float(w.peak_db), "energy": float(w.energy),
+            "flags": int(w.flags), "start": int(w.start), "end": int(w.end), "n": int(w.n)}
+
+
+def mag_median(x) -> float:
+    """The median of |x| — pulse.py's noise floor (atkdsp.h §22)."""
+    a = _cf32(x)
+    out = C.c_double()
+    _check(load().atkdsp_mag_median(_cfp(a), a.size, C.byref(out)), "mag_median")
+    return out.value
+
+
+class Pulses:
+    """Live pulse runs -> PDWs (atkdsp.h §22). Options are the
+    atkdsp_pulses_config fields as keywords; process() returns one dict per
+    closed pulse with the twin's keys (reference.Pulses); flush() closes an
+    open one at the end of a stream. The twin is ATK's fallback."""
+
+    _kind = "pulses"
+
+    def __init__(self, t0: float = 0.0, **cfg):
+        self._lib = load()
+        c = _ref.pulses_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise AtkDspError(f"unknown pulses option {key!r}; known: {sorted(c)}")
+            c[key] = v
+        for key in c:
+            c[key] = int(c[key]) if key in ("min_samples", "max_samples") else float(c[key])
+        why = _ref._pulses_check(c)
+        if why:
+            raise AtkDspError(f"pulses_create({c}) refused — {why}")
+        k = _PulsesConfig()
+        for key, v in c.items():
+            setattr(k, key, v)
+        self._h = self._lib.atkdsp_pulses_create(C.byref(k), float(t0))
+        if not self._h:
+            raise AtkDspError(f"pulses_create({c}) refused")
+        self.cfg = dict(c)
+        self._buf = None
+        self._ncalls = 0
+        _p3_log.info("pulses created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_pulses_destroy(h)
+
+    def reset(self, t0: float = 0.0) -> None:
+        self._lib.atkdsp_pulses_reset(self._h, float(t0))
+
+    def set_floor(self, floor: float) -> None:
+        _check(self._lib.atkdsp_pulses_set_floor(self._h, float(floor)), "pulses_set_floor")
+        self.cfg["floor"] = float(floor)
+
+    def max(self, n: int) -> int:
+        return int(self._lib.atkdsp_pulses_max(self._h, int(n)))
+
+    def process(self, x, cap: int | None = None) -> list:
+        a = _cf32(x)
+        if cap is None:
+            cap = self.max(a.size)
+        if self._buf is None or len(self._buf) < cap:
+            self._buf = (_Pdw * int(cap))()
+        got = _check(self._lib.atkdsp_pulses_process(self._h, _cfp(a), a.size, self._buf, int(cap)),
+                     "pulses_process")
+        self._ncalls += 1
+        if self._ncalls % 1000 == 0:
+            _p3_log.debug("pulses: %s", self.stats())
+        return [_pdw_dict(self._buf[i]) for i in range(got)]
+
+    def flush(self, cap: int = 1) -> list:
+        buf = (_Pdw * max(1, int(cap)))()
+        got = _check(self._lib.atkdsp_pulses_flush(self._h, buf, int(cap)), "pulses_flush")
+        return [_pdw_dict(buf[i]) for i in range(got)]
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_pulses_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _PulsesCounters()
+        self._lib.atkdsp_pulses_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+def detect_pdws(x, fs: float, floor: float | None = None, **cfg) -> list:
+    """One call over a whole record with its own median floor unless one is
+    given: pulse.detect_pulses' words, natively (the twin: reference.detect_pdws)."""
+    a = _cf32(x)
+    if floor is None:
+        floor = mag_median(a)
+    p = Pulses(0.0, fs=fs, floor=floor, **cfg)
+    out = p.process(a, cap=p.max(a.size))
+    out += p.flush()
+    return out
+
+
+__all__ += ["PDW_TRUNCATED", "PDW_NO_FREQ", "PDW_EDGE_START", "PDW_FLUSHED", "mag_median",
+            "Pulses", "detect_pdws"]
+
+
+# -- §23 cyclic probes ---------------------------------------------------------
+NL_ENV2, NL_POW2, NL_POW4, NL_POW8, NL_DM, NL_FDIFF = 0, 1, 2, 3, 4, 5
+NL_NAMES = {"env2": 0, "pow2": 1, "pow4": 2, "pow8": 3, "dm": 4, "fdiff": 5}
+CYC_LINE, CYC_WARMUP = 1, 2
+CP_DETECT, CP_LINE, CP_WARMUP = 1, 2, 4
+
+
+class _CycCand(C.Structure):
+    _fields_ = [("rate_hz", C.c_double), ("nonlin", C.c_int32), ("hard_limit", C.c_int32)]
+
+
+class _CycResult(C.Structure):
+    _fields_ = [("level", C.c_double), ("coherence", C.c_double), ("line_db", C.c_double),
+                ("delta_hz", C.c_double), ("level_aligned", C.c_double),
+                ("coherence_aligned", C.c_double), ("level_thr", C.c_double),
+                ("coh_thr", C.c_double), ("nseg", C.c_int32), ("flags", C.c_uint32)]
+
+
+class _CpCand(C.Structure):
+    _fields_ = [("lag", C.c_int32), ("cp", C.c_int32), ("period", C.c_int32), ("reserved", C.c_int32)]
+
+
+class _CpResult(C.Structure):
+    _fields_ = [("score", C.c_double), ("score_thr", C.c_double), ("npairs", C.c_double),
+                ("line_level", C.c_double), ("line_coherence", C.c_double),
+                ("line_coh_thr", C.c_double), ("line_delta_hz", C.c_double),
+                ("nseg", C.c_int32), ("flags", C.c_uint32)]
+
+
+class _CyclicCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in ("samples", "segments", "resets", "segment_fill")]
+
+
+def _bind_cyclic(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
+    lib.atkdsp_cyclic_thresholds.argtypes = [i, d, P(d), P(d)]
+    lib.atkdsp_cyclic_thresholds.restype = None
+    lib.atkdsp_cyclic_create.argtypes = [d, P(_CycCand), i, i, i, d]
+    lib.atkdsp_cyclic_create.restype = vp
+    lib.atkdsp_cyclic_destroy.argtypes = [vp]
+    lib.atkdsp_cyclic_destroy.restype = None
+    lib.atkdsp_cyclic_reset.argtypes = [vp]
+    lib.atkdsp_cyclic_reset.restype = None
+    lib.atkdsp_cyclic_process.argtypes = [vp, P(_Cf32), sz]
+    lib.atkdsp_cyclic_process.restype = i
+    lib.atkdsp_cyclic_read.argtypes = [vp, P(_CycResult)]
+    lib.atkdsp_cyclic_read.restype = i
+    lib.atkdsp_cyclic_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_cyclic_describe.restype = i
+    lib.atkdsp_cyclic_stats.argtypes = [vp, P(_CyclicCounters)]
+    lib.atkdsp_cyclic_stats.restype = i
+    lib.atkdsp_cp_probe_create.argtypes = [d, P(_CpCand), i, i, i, d]
+    lib.atkdsp_cp_probe_create.restype = vp
+    lib.atkdsp_cp_probe_destroy.argtypes = [vp]
+    lib.atkdsp_cp_probe_destroy.restype = None
+    lib.atkdsp_cp_probe_reset.argtypes = [vp]
+    lib.atkdsp_cp_probe_reset.restype = None
+    lib.atkdsp_cp_probe_process.argtypes = [vp, P(_Cf32), sz]
+    lib.atkdsp_cp_probe_process.restype = i
+    lib.atkdsp_cp_probe_read.argtypes = [vp, P(_CpResult)]
+    lib.atkdsp_cp_probe_read.restype = i
+    lib.atkdsp_cp_probe_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_cp_probe_describe.restype = i
+    lib.atkdsp_cp_probe_stats.argtypes = [vp, P(_CyclicCounters)]
+    lib.atkdsp_cp_probe_stats.restype = i
+
+
+_BIND_EXTRA.append(_bind_cyclic)
+
+
+def cyclic_thresholds(nseg: int, pfa_each: float) -> tuple:
+    """(level_thr, coh_thr) for nseg segments at pfa_each (atkdsp.h §23)."""
+    a, b = C.c_double(), C.c_double()
+    load().atkdsp_cyclic_thresholds(int(nseg), float(pfa_each), C.byref(a), C.byref(b))
+    return a.value, b.value
+
+
+def _nl_code(v):
+    return NL_NAMES[v.lower()] if isinstance(v, str) else int(v)
+
+
+class Cyclic:
+    """A line at each candidate symbol rate after its nonlinearity (atkdsp.h
+    §23). cands: (rate_hz, nonlin[, hard_limit]) tuples, nonlin a code or
+    'env2' / 'pow2' / 'pow4' / 'pow8' / 'dm'. read() returns one dict per
+    candidate with the twin's keys (reference.Cyclic)."""
+
+    def __init__(self, fs: float, cands, seg_len: int, nseg: int, pfa: float = 1e-3):
+        self._lib = load()
+        cl = [(float(c[0]), _nl_code(c[1]), int(c[2]) if len(c) > 2 else 0) for c in cands]
+        # the twin's checks give the reason the C would refuse with NULL
+        try:
+            _ref.Cyclic(fs, cl, seg_len, nseg, pfa)
+        except ValueError as e:
+            raise AtkDspError(f"cyclic_create refused — {e}") from None
+        arr = (_CycCand * len(cl))(*[_CycCand(r, nl, hl) for r, nl, hl in cl])
+        self._h = self._lib.atkdsp_cyclic_create(float(fs), arr, len(cl), int(seg_len), int(nseg),
+                                                 float(pfa))
+        if not self._h:
+            raise AtkDspError("cyclic_create refused")
+        self.n = len(cl)
+        self.cands = cl
+        self._res = (_CycResult * self.n)()
+        _p3_log.info("cyclic created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_cyclic_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_cyclic_reset(self._h)
+
+    def process(self, x) -> None:
+        a = _cf32(x)
+        _check(self._lib.atkdsp_cyclic_process(self._h, _cfp(a), a.size), "cyclic_process")
+
+    def read(self) -> list:
+        _check(self._lib.atkdsp_cyclic_read(self._h, self._res), "cyclic_read")
+        return [{n: (int(getattr(r, n)) if n in ("nseg", "flags") else float(getattr(r, n)))
+                 for n, _t in _CycResult._fields_} for r in self._res]
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(2048)
+        self._lib.atkdsp_cyclic_describe(self._h, buf, 2048)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CyclicCounters()
+        self._lib.atkdsp_cyclic_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+class CpProbe:
+    """OFDM cyclic-prefix probe (atkdsp.h §23). cands: (lag, cp[, period])."""
+
+    def __init__(self, fs: float, cands, seg_len: int, nseg: int, pfa: float = 1e-3):
+        self._lib = load()
+        cl = [(int(c[0]), int(c[1]), int(c[2]) if len(c) > 2 else 0) for c in cands]
+        try:
+            _ref.CpProbe(fs, cl, seg_len, nseg, pfa)
+        except ValueError as e:
+            raise AtkDspError(f"cp_probe_create refused — {e}") from None
+        arr = (_CpCand * len(cl))(*[_CpCand(a, b, p, 0) for a, b, p in cl])
+        self._h = self._lib.atkdsp_cp_probe_create(float(fs), arr, len(cl), int(seg_len), int(nseg),
+                                                   float(pfa))
+        if not self._h:
+            raise AtkDspError("cp_probe_create refused")
+        self.n = len(cl)
+        self.cands = cl
+        self._res = (_CpResult * self.n)()
+        _p3_log.info("cp_probe created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_cp_probe_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_cp_probe_reset(self._h)
+
+    def process(self, x) -> None:
+        a = _cf32(x)
+        _check(self._lib.atkdsp_cp_probe_process(self._h, _cfp(a), a.size), "cp_probe_process")
+
+    def read(self) -> list:
+        _check(self._lib.atkdsp_cp_probe_read(self._h, self._res), "cp_probe_read")
+        return [{n: (int(getattr(r, n)) if n in ("nseg", "flags") else float(getattr(r, n)))
+                 for n, _t in _CpResult._fields_} for r in self._res]
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(2048)
+        self._lib.atkdsp_cp_probe_describe(self._h, buf, 2048)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CyclicCounters()
+        self._lib.atkdsp_cp_probe_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+__all__ += ["NL_ENV2", "NL_POW2", "NL_POW4", "NL_POW8", "NL_DM", "NL_FDIFF", "CYC_LINE", "CYC_WARMUP",
+            "CP_DETECT", "CP_LINE", "CP_WARMUP", "cyclic_thresholds", "Cyclic", "CpProbe"]
+
+
+# -- §24 analog radio IDs ------------------------------------------------------
+TONE_CTCSS, TONE_DCS, TONE_DTMF, TONE_TONE = 1, 2, 3, 4
+TONE_START, TONE_END = 1, 2
+TONE_F_REVERSE_BURST, TONE_F_TURNOFF, TONE_F_NONSTANDARD, TONE_F_CORRECTED, TONE_F_FLUSHED = 1, 2, 4, 8, 16
+TONE_EN_CTCSS, TONE_EN_DCS, TONE_EN_DTMF, TONE_EN_TONE, TONE_EN_ALL = 1, 2, 4, 8, 15
+TONE_KINDS = {1: "CTCSS", 2: "DCS", 3: "DTMF", 4: "TONE"}
+
+
+class _ToneConfig(C.Structure):
+    _fields_ = [("fs", C.c_double), ("enable", C.c_int32), ("dcs_max_errors", C.c_int32),
+                ("ctcss_min_snr_db", C.c_double), ("dtmf_min_dbfs", C.c_double),
+                ("tone_min_dbfs", C.c_double), ("tone_min_snr_db", C.c_double),
+                ("reserved", C.c_int32 * 2)]
+
+
+class _ToneEvent(C.Structure):
+    _fields_ = [("t0", C.c_double), ("t1", C.c_double), ("freq_hz", C.c_double),
+                ("freq2_hz", C.c_double), ("level_db", C.c_float), ("snr_db", C.c_float),
+                ("kind", C.c_int32), ("type", C.c_int32), ("code", C.c_int32), ("alias", C.c_int32),
+                ("flags", C.c_uint32), ("reserved", C.c_uint32), ("text", C.c_char * 16)]
+
+
+class _ToneCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in
+                ("samples", "events", "dropped", "ctcss", "dcs", "dtmf", "tones", "resets")]
+
+
+def _bind_tone_id(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
+    lib.atkdsp_tone_id_defaults.argtypes = [P(_ToneConfig)]
+    lib.atkdsp_tone_id_defaults.restype = None
+    lib.atkdsp_tone_id_create.argtypes = [P(_ToneConfig), d]
+    lib.atkdsp_tone_id_create.restype = vp
+    lib.atkdsp_tone_id_destroy.argtypes = [vp]
+    lib.atkdsp_tone_id_destroy.restype = None
+    lib.atkdsp_tone_id_reset.argtypes = [vp, d]
+    lib.atkdsp_tone_id_reset.restype = None
+    lib.atkdsp_tone_id_events_max.argtypes = [vp, sz]
+    lib.atkdsp_tone_id_events_max.restype = sz
+    lib.atkdsp_tone_id_process.argtypes = [vp, P(C.c_float), sz, P(_ToneEvent), sz]
+    lib.atkdsp_tone_id_process.restype = C.c_ssize_t
+    lib.atkdsp_tone_id_flush.argtypes = [vp, P(_ToneEvent), sz]
+    lib.atkdsp_tone_id_flush.restype = C.c_ssize_t
+    lib.atkdsp_tone_id_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_tone_id_describe.restype = i
+    lib.atkdsp_tone_id_stats.argtypes = [vp, P(_ToneCounters)]
+    lib.atkdsp_tone_id_stats.restype = i
+    lib.atkdsp_ctcss_tone.argtypes = [i, P(d)]
+    lib.atkdsp_ctcss_tone.restype = i
+    lib.atkdsp_dcs_code.argtypes = [i, P(i)]
+    lib.atkdsp_dcs_code.restype = i
+    lib.atkdsp_dcs_encode.argtypes = [i]
+    lib.atkdsp_dcs_encode.restype = C.c_uint32
+    lib.atkdsp_dcs_decode.argtypes = [C.c_uint32, i, P(i), P(i)]
+    lib.atkdsp_dcs_decode.restype = i
+
+
+_BIND_EXTRA.append(_bind_tone_id)
+
+
+def dcs_encode(octal: int) -> int:
+    """The 23-bit Golay word a DCS code is sent as (bit 0 first on the air)."""
+    return int(load().atkdsp_dcs_encode(int(octal)))
+
+
+def dcs_decode(word: int, max_errors: int = 1) -> tuple:
+    """(corrections, code, alias): the normal and inverted readings of a 23-bit
+    word, or (-1, -1, -1) when it is not a standard code within max_errors."""
+    c, a = C.c_int(), C.c_int()
+    rc = load().atkdsp_dcs_decode(int(word) & 0x7FFFFF, int(max_errors), C.byref(c), C.byref(a))
+    return (int(rc), int(c.value), int(a.value)) if rc >= 0 else (-1, -1, -1)
+
+
+def _tone_event_dict(e) -> dict:
+    return {"kind": int(e.kind), "type": int(e.type), "t0": float(e.t0), "t1": float(e.t1),
+            "freq_hz": float(e.freq_hz), "freq2_hz": float(e.freq2_hz), "level_db": float(e.level_db),
+            "snr_db": float(e.snr_db), "code": int(e.code), "alias": int(e.alias),
+            "flags": int(e.flags), "text": e.text.decode(errors="replace")}
+
+
+class ToneId:
+    """Analog radio IDs on demodulated audio (atkdsp.h §24): CTCSS, DCS, DTMF
+    and tracked tones, as START / END event dicts (reference.ToneId's keys)."""
+
+    _kind = "tone_id"
+
+    def __init__(self, t0: float = 0.0, **cfg):
+        self._lib = load()
+        c = _ref.tone_id_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise AtkDspError(f"unknown tone_id option {key!r}; known: {sorted(c)}")
+            c[key] = v
+        for key in c:
+            c[key] = int(c[key]) if key in ("enable", "dcs_max_errors") else float(c[key])
+        why = _ref._tone_id_check(c)
+        if why:
+            raise AtkDspError(f"tone_id_create({c}) refused — {why}")
+        k = _ToneConfig()
+        for key, v in c.items():
+            setattr(k, key, v)
+        self._h = self._lib.atkdsp_tone_id_create(C.byref(k), float(t0))
+        if not self._h:
+            raise AtkDspError(f"tone_id_create({c}) refused")
+        self.cfg = dict(c)
+        self._buf = None
+        _p3_log.info("tone_id created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_tone_id_destroy(h)
+
+    def reset(self, t0: float = 0.0) -> None:
+        self._lib.atkdsp_tone_id_reset(self._h, float(t0))
+
+    def events_max(self, n: int) -> int:
+        return int(self._lib.atkdsp_tone_id_events_max(self._h, int(n)))
+
+    def process(self, x, cap: int | None = None) -> list:
+        a = _f32(x, "audio")
+        if cap is None:
+            cap = self.events_max(a.size)
+        if self._buf is None or len(self._buf) < cap:
+            self._buf = (_ToneEvent * int(cap))()
+        got = _check(self._lib.atkdsp_tone_id_process(self._h, _fp(a), a.size, self._buf, int(cap)),
+                     "tone_id_process")
+        return [_tone_event_dict(self._buf[i]) for i in range(got)]
+
+    def flush(self) -> list:
+        buf = (_ToneEvent * 8)()
+        got = _check(self._lib.atkdsp_tone_id_flush(self._h, buf, 8), "tone_id_flush")
+        return [_tone_event_dict(buf[i]) for i in range(got)]
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(1024)
+        self._lib.atkdsp_tone_id_describe(self._h, buf, 1024)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _ToneCounters()
+        self._lib.atkdsp_tone_id_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+__all__ += ["TONE_CTCSS", "TONE_DCS", "TONE_DTMF", "TONE_TONE", "TONE_START", "TONE_END",
+            "TONE_F_REVERSE_BURST", "TONE_F_TURNOFF", "TONE_F_NONSTANDARD", "TONE_F_CORRECTED",
+            "TONE_F_FLUSHED", "TONE_EN_CTCSS", "TONE_EN_DCS", "TONE_EN_DTMF", "TONE_EN_TONE",
+            "TONE_EN_ALL", "TONE_KINDS", "dcs_encode", "dcs_decode", "ToneId"]

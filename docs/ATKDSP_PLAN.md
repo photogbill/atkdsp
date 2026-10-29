@@ -16,7 +16,8 @@ with MSVC 19.44, loads through the binding, and `atk.core.dsp_native` takes it.
 Bill's 40 MSPS ring bench (`ring_bench.bat`, 600 s at 160 MB/s, 1 MiB x 512) passed
 the same day: 91,553 blocks committed, 0 torn reads, the fast and slow (3x work)
 consumers lost nothing, the stalled one kept the ring's 512 and lost the rest with
-exact counts. The Windows pytest run is still owed. Everything else below is still plan; next
+exact counts. The Windows pytest run passed the same evening: 848 passed in 131 s
+against the MSVC 19.44 / AVX2 / OpenMP build, through ATK's `build.bat /only atkdsp /test`. Everything else below is still plan; next
 in §G is 1c (the bench in ATK, §D6).
 
 **1c is BUILT (2026-10-28)** — in ATK, not here: the Bit Bench workspace
@@ -25,7 +26,7 @@ in §G is 1c (the bench in ATK, §D6).
 atkdsp source changed for it; ATK now expects ABI 16 (v0.15.0). Its
 acceptance — the Scoped B harness, raw bits to payload by buttons alone —
 passes on the native library and on the numpy twins. One weakness it found
-here, not fixed: **a structured payload inside a block code** (text under
+here (fixed in phase 3, ABI 18): **a structured payload inside a block code** (text under
 Hamming(7,4) behind an interleaver) gives `block_code_id` / `interleaver_id`
 extra single-position checks — the payload's fixed bits — and they then
 refuse the stream as "sliding" or "fails unlike noise" on short captures
@@ -66,9 +67,65 @@ same threshold bin for bin (ATK `tests/test_cfar_cross_check.py`).
 **For the next ABI bump** (LMR_DECODE_PLAN will bump it too — one bump,
 coordinated): put the window's correlation in `atkdsp_cfar_config` (a ρ²
 table or `n_eff`), so every caller gets the right rate, and the edge-
-refinement test (CFAR_EDGE_PFA) likewise. Also measured: the per-cell cost
+refinement test (CFAR_EDGE_PFA) likewise — **done in ABI 18 (phase 3)**. Also measured: the per-cell cost
 is ~25 ns at k_frames = 1 (dominated by the dB → linear conversion) —
 taking linear power would roughly halve it.
+
+**Phase 3 is BUILT (2026-10-29)** — atkdsp v0.17.0 / ABI 18 (§B3 pulse
+runs, §B4 both cyclic probes, §C3 the analog IDs except MDC-1200 and
+FleetSync; README "What is in v0.17.0"). The two things phase 2 left owed
+ride with it, as the cross-check note asked, in the same bump: the window's
+ρ² table is in `atkdsp_cfar_config` (`rho2[4]`, with `atkdsp_cfar_n_eff`
+and `atkdsp_cfar_window_rho2` to fill it; the band test uses it too), and
+`block_code_id` sets aside a payload's fixed bits (`atkdsp_blockid.fixed_bits`),
+so the 1c weakness — text under Hamming(7,4) behind an interleaver refused
+at 28 kbit — is fixed: 20 seeds of 20 name "linear (14,8), 1 fixed bit",
+dmin 3, and the interleaved harness case decodes back to the text. Linux:
+smoke test and the whole suite (954 tests: 848 + 73 + 22 + 11) pass, also
+under ASan + UBSan. The Windows run is owed (`build.bat /only atkdsp /test`
+from ATK), and ATK's `dsp_native.py` now expects ABI 18. Phase 3b (MDC-1200
+and FleetSync) waits for real recordings, as §C3 says. Next in §G is phase 4
+(the engine) or LMR_DECODE_PLAN's L1/L3, whichever Bill opens first — L1/L3
+need the TIA/ETSI documents, which are not connected here.
+
+**What building 3 changed in this plan** (the README has the detail):
+- §B3's `atkdsp_pulse_runs` is `atkdsp_pulses_*`, a handle with the
+  streaming state (rule 3), and it is word for word
+  `atk.core.pulse.detect_pulses` — the same median floor, 10 dB threshold,
+  10 % flank trim, 2.77 σ chirp span — so ATK's PDW ring takes it without a
+  change of meaning. The floor is the caller's (`atkdsp_mag_median`): a
+  running median inside the kernel would make the words depend on the
+  chunking. `hyst_db` is extra (0 = detect_pulses' behaviour). The 30 MSPS
+  cost is still to be recorded on Bill's PC.
+- §B4's `cyclic_line` is `atkdsp_cyclic_*` with five nonlinearities, not
+  three: |x|², x^m (m = 2, 4, 8, hard-limited or not), and two transition
+  measures the plan's "delay-multiply" turned out to need — DM is
+  |x[n] − x[n−1]|² (the plan's x[n]·x*[n−1] has no line for FSK, as the
+  tests showed), and FDIFF is (f[n] − f[n−1])² for rectangular FSK and MSK,
+  whose DM line is weak. Any clock line has harmonics; a rectangular OOK
+  envelope has no |x|² line at all (constant between transitions), DM finds
+  it. The noise-only thresholds are derived (level −ln Pfa, coherence
+  √(−ln Pfa / 0.785 K)) and measured conservative; the coherence test needs
+  K ≥ 16 segments at 1e-3, and create refuses less.
+- §B4's `cp_probe` finds the prefix by the symbol-rate line of the
+  windowed lag product (the coherence test again), not from peak spacing;
+  LTE's mixed prefix is given as the slot period. A CW tone present in the
+  band correlates at every lag, so the lag score alone is not specific —
+  the prefix stage is the confirmation.
+- §C3: CTCSS runs on a 270/330 Hz Kaiser low-pass (not 300 — voice at 250
+  Hz was a false tone), 100 ms Hann segments with the frequency from the
+  segment-to-segment phase (0.1 Hz), a line-share test and a 3-segment
+  confirmation; the reverse burst is a phase step that reads as a frequency
+  jump within the tone's lobe. DCS polarity is undecidable from the air (023
+  normal is bit for bit 047 inverted), so every event carries its alias.
+  CTCSS and DCS suppress each other's starts. DTMF is 20 ms frames every
+  10 ms with a 3-frame confirmation (25 ms frames lost 50 ms digits). The
+  selcall tables and matcher live in `reference.py` (Python-side matching,
+  as the plan said: tones and durations first, tables second). MDC-1200 /
+  FleetSync are phase 3b.
+- The CFAR cross-check's request is honoured in the kernel (`rho2`), so
+  `cue_live.py`'s Python-side correction can now be a config field (ATK
+  side, with `git status` checked first).
 
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
@@ -1497,7 +1554,8 @@ checked first).
 | **1b** ✅ v0.15.0 | **Name the code:** D4 — rank scan, block / convolutional / RS / interleaver recognition, the robust (noisy-stream) variant | M–L | Needs 1a's encoders and decoders for its decode → re-encode evidence |
 | **1c** | **Bitstream bench in ATK:** D6 — dossier, raster colours, chain, the new siga modules **(BUILT 2026-10-28 as ATK's Bit Bench — see its plan's §10)** | L | The engine is only useful to an analyst once the bench drives it |
 | 2 | **Detection track:** B1 CFAR, B2 burst descriptors + TDMA, A3 C ring **(BUILT 2026-10-28 — v0.16.0 / ABI 17)** | M–L | Cued DF, Bug Sniffer and Drone Discovery all wait on it |
-| 3 | **Small, high value:** C3 analog IDs, B4 cyclic probes, B3 pulse runs | M | ID-tagged analog bearings, waterfall captions, live PDWs |
+| 3 | **Small, high value:** C3 analog IDs, B4 cyclic probes, B3 pulse runs **(BUILT 2026-10-29 — v0.17.0 / ABI 18, with the CFAR ρ² table and the fixed-bits fix; MDC-1200 / FleetSync are 3b)** | M | ID-tagged analog bearings, waterfall captions, live PDWs |
+| 3b | **C3's data bursts:** MDC-1200, FleetSync I/II | S–M | Reverse-engineered framing: real recordings before trust |
 | 4 | **Engine:** A1 float32 FFT, A2 fused mixer, A4 channelizer | L | Before the wider SDRs (B210, Signal Hound); the channelizer feeds C3 on many channels at once |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
 | 6 | **Below the floor:** B6 DSSS, C4 strong-signal removal | M–L | Uses B4, D2 and C1 |

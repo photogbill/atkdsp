@@ -371,9 +371,25 @@ int main(void) {
     {
         /* CFAR: alpha reproduces CA's closed form; a planted burst gives one track */
         double al = 0.0, et = 0.0;
-        CHECK(atkdsp_cfar_alpha(ATKDSP_CFAR_CA, 16, 1e-6, 1.0, 0, &al, &et) == ATKDSP_OK
+        CHECK(atkdsp_cfar_alpha(ATKDSP_CFAR_CA, 16, 1e-6, 1.0, 0, NULL, &al, &et) == ATKDSP_OK
               && fabs(al / (32.0 * (pow(1e-6, -1.0 / 32.0) - 1.0)) - 1.0) < 1e-7,
               "cfar_alpha: CA alpha = N (Pfa^(-1/N) - 1)");
+        /* v0.17.0: with the Hann window's correlation the equivalent count is
+         * about 17 of 32 cells, and the threshold rises accordingly */
+        {
+            const double hann[4] = {4.0 / 9.0, 1.0 / 36.0, 0.0, 0.0};
+            const double ne = atkdsp_cfar_n_eff(16, hann);
+            double al2 = 0.0;
+            CHECK(ne > 17.0 && ne < 18.0, "cfar_n_eff: Hann, 16 a side -> ~17.4 of 32");
+            CHECK(atkdsp_cfar_alpha(ATKDSP_CFAR_CA, 16, 1e-6, 1.0, 0, hann, &al2, NULL) == ATKDSP_OK
+                  && al2 > al, "cfar_alpha: correlated cells raise the threshold");
+            float w[4096];
+            double r[4];
+            atkdsp_window(ATKDSP_WIN_HANN, 4096, w);
+            CHECK(atkdsp_cfar_window_rho2(w, 4096, r) == ATKDSP_OK
+                  && fabs(r[0] - 4.0 / 9.0) < 1e-3 && fabs(r[1] - 1.0 / 36.0) < 1e-3
+                  && r[2] < 1e-3 && r[3] < 1e-3, "cfar_window_rho2: Hann -> 4/9, 1/36, 0, 0");
+        }
         atkdsp_cfar_config cc;
         atkdsp_cfar_defaults(&cc);
         enum { NBC = 256, NF = 40 };
@@ -453,6 +469,146 @@ int main(void) {
         const ptrdiff_t gn = atkdsp_ring_read(ring, cid, got, sizeof got, &gm, &lostb);
         CHECK(gn == 100 && lostb == 6 && gm.seq == 6 && got[0] == 6, "ring: lapped reader told it lost exactly 6");
         free(rm);
+    }
+
+    /* ---- phase 3 (v0.17.0) ---- */
+    {
+        /* pulses: three 80-sample pulses 20 dB over a unit-power noise floor,
+         * split across two calls, come back as three words at their samples */
+        enum { NP = 20000, PW = 80 };
+        atkdsp_cf32 *pz = (atkdsp_cf32 *)malloc(NP * sizeof *pz);
+        uint64_t st = 777;
+        for (int i = 0; i < NP; ++i) {
+            /* Box-Muller from the same LCG as above */
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u1 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u2 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            const double r = sqrt(-log(u1));          /* unit power: E|x|^2 = 1 */
+            pz[i].re = (float)(r * cos(2 * M_PI * u2));
+            pz[i].im = (float)(r * sin(2 * M_PI * u2));
+        }
+        const int starts[3] = {1000, 7000, 15000};
+        for (int k = 0; k < 3; ++k)
+            for (int i = 0; i < PW; ++i) {
+                const double ph = 2 * M_PI * 0.05 * i;
+                pz[starts[k] + i].re += (float)(10.0 * cos(ph));
+                pz[starts[k] + i].im += (float)(10.0 * sin(ph));
+            }
+        double med = 0.0;
+        CHECK(atkdsp_mag_median(pz, NP, &med) == ATKDSP_OK && med > 0.7 && med < 1.0,
+              "mag_median: the Rayleigh median of unit-power noise (0.83)");
+        atkdsp_pulses_config pc;
+        atkdsp_pulses_defaults(&pc);
+        pc.fs = 1e6; pc.floor = med;
+        atkdsp_pulses *pp = atkdsp_pulses_create(&pc, 0.0);
+        CHECK(pp != NULL, "pulses create");
+        atkdsp_pdw pw[8];
+        ptrdiff_t np_ = atkdsp_pulses_process(pp, pz, 7040, pw, 8);        /* cuts the 2nd pulse */
+        np_ += atkdsp_pulses_process(pp, pz + 7040, NP - 7040, pw + (np_ > 0 ? np_ : 0), 8 - (size_t)(np_ > 0 ? np_ : 0));
+        np_ += atkdsp_pulses_flush(pp, pw + (np_ > 0 ? np_ : 0), 1);
+        int okp = np_ == 3;
+        for (int k = 0; k < 3 && okp; ++k)
+            okp = pw[k].start == (uint64_t)starts[k] && pw[k].n == PW
+                  && fabs(pw[k].freq_hz - 0.05e6) < 2e3 && pw[k].pa_db > 18.0f && pw[k].flags == 0;
+        CHECK(okp, "pulses: three pulses, one cut by a block edge, at their samples and frequency");
+        char pd[256];
+        CHECK(atkdsp_pulses_describe(pp, pd, sizeof pd) == ATKDSP_OK && strstr(pd, "3 pulses") != NULL,
+              "pulses describe");
+        atkdsp_pulses_destroy(pp);
+        free(pz);
+    }
+    {
+        /* cyclic: random on-off keying at 1000 Bd over unit noise, with
+         * rectangular symbols, so its clock shows in the transition energy
+         * |x[n] - x[n-1]|^2 at 1000 and not at 1300 (and NOT in |x|^2: a
+         * rectangular pulse's envelope has no clock line — shaping is what
+         * puts it there); then noise alone with random blocks of 64 and a
+         * 16-sample prefix correlates at lag 64 and not at 100 */
+        enum { NC = 48000 };
+        atkdsp_cf32 *cz = (atkdsp_cf32 *)malloc(NC * sizeof *cz);
+        uint64_t st = 4242;
+        int on = 0;
+        for (int i = 0; i < NC; ++i) {
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u1 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u2 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            const double r = sqrt(-log(u1));
+            if (i % 48 == 0) on = (int)(st >> 40) & 1;             /* a new symbol every 48 samples */
+            const double a = on ? 3.0 : 0.0;
+            cz[i].re = (float)(r * cos(2 * M_PI * u2) + a * cos(0.3 * i));
+            cz[i].im = (float)(r * sin(2 * M_PI * u2) + a * sin(0.3 * i));
+        }
+        atkdsp_cyc_cand cc[3] = {{1000.0, ATKDSP_NL_DM, 0}, {1300.0, ATKDSP_NL_DM, 0}, {1000.0, ATKDSP_NL_ENV2, 0}};
+        atkdsp_cyclic *cy = atkdsp_cyclic_create(48000.0, cc, 3, 960, 50, 1e-3);
+        CHECK(cy != NULL, "cyclic create");
+        CHECK(atkdsp_cyclic_process(cy, cz, NC) == ATKDSP_OK, "cyclic process");
+        atkdsp_cyc_result cr[3];
+        CHECK(atkdsp_cyclic_read(cy, cr) == 50 && (cr[0].flags & ATKDSP_CYC_LINE)
+              && !(cr[1].flags & ATKDSP_CYC_LINE) && !(cr[2].flags & ATKDSP_CYC_LINE)
+              && cr[0].coherence > 0.7,
+              "cyclic: the 1000 Bd clock line in the transitions, nothing at 1300 or in |x|^2");
+        atkdsp_cyclic_destroy(cy);
+        /* a prefixed block stream: 64 fresh noise samples per symbol, the
+         * last 16 copied in front (no tone: a carrier correlates at EVERY lag) */
+        for (int i = 0; i < NC; ++i) {
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u1 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+            const double u2 = ((double)(st >> 11) + 0.5) / 9007199254740992.0;
+            const double r = sqrt(-log(u1));
+            cz[i].re = (float)(r * cos(2 * M_PI * u2));
+            cz[i].im = (float)(r * sin(2 * M_PI * u2));
+        }
+        for (int i = 0; i + 80 <= NC; i += 80)
+            for (int j = 0; j < 16; ++j) cz[i + j] = cz[i + 64 + j];
+        atkdsp_cp_cand pc2[2] = {{64, 16, 0, 0}, {100, 16, 0, 0}};
+        atkdsp_cp_probe *cp = atkdsp_cp_probe_create(48000.0, pc2, 2, 2400, 20, 1e-3);
+        CHECK(cp != NULL, "cp_probe create");
+        CHECK(atkdsp_cp_probe_process(cp, cz, NC) == ATKDSP_OK, "cp_probe process");
+        atkdsp_cp_result pr2[2];
+        CHECK(atkdsp_cp_probe_read(cp, pr2) == 20 && (pr2[0].flags & ATKDSP_CP_DETECT)
+              && (pr2[0].flags & ATKDSP_CP_LINE) && !(pr2[1].flags & ATKDSP_CP_DETECT),
+              "cp_probe: the prefix correlates at lag 64 with its period, not at 100");
+        atkdsp_cp_probe_destroy(cp);
+        free(cz);
+    }
+    {
+        /* tone_id: a 127.3 Hz CTCSS tone under 1.2 s, then a DTMF '5' for
+         * 80 ms, at 8 kHz; the DCS codec round-trips every standard code */
+        enum { NT = 8000 * 2 };
+        float *au = (float *)calloc(NT, sizeof(float));
+        for (int i = 0; i < 9600; ++i) au[i] = (float)(0.15 * sin(2 * M_PI * 127.3 * i / 8000.0));
+        for (int i = 10400; i < 11040; ++i)
+            au[i] = (float)(0.3 * (sin(2 * M_PI * 770.0 * i / 8000.0) + sin(2 * M_PI * 1336.0 * i / 8000.0)));
+        atkdsp_tone_config tc;
+        atkdsp_tone_id_defaults(&tc);
+        tc.fs = 8000.0;
+        atkdsp_tone_id *ti = atkdsp_tone_id_create(&tc, 0.0);
+        CHECK(ti != NULL, "tone_id create");
+        atkdsp_tone_event tev[64];
+        ptrdiff_t nt = atkdsp_tone_id_process(ti, au, NT / 2, tev, 64);
+        nt += atkdsp_tone_id_process(ti, au + NT / 2, NT / 2, tev + nt, 64 - (size_t)nt);
+        nt += atkdsp_tone_id_flush(ti, tev + nt, 64 - (size_t)nt);
+        int saw_ctcss = 0, saw_dtmf = 0, other = 0;
+        for (ptrdiff_t i = 0; i < nt; ++i) {
+            if (tev[i].kind == ATKDSP_TONE_CTCSS && tev[i].type == ATKDSP_TONE_END)
+                saw_ctcss = tev[i].code == 19 && fabs(tev[i].freq_hz - 127.3) < 0.2 && tev[i].t1 > 1.1;
+            else if (tev[i].kind == ATKDSP_TONE_DTMF && tev[i].type == ATKDSP_TONE_END)
+                saw_dtmf = tev[i].code == '5' && fabs(tev[i].t0 - 1.3) < 0.02;
+            else if (tev[i].type == ATKDSP_TONE_END) ++other;
+        }
+        CHECK(saw_ctcss && saw_dtmf && !other, "tone_id: CTCSS 127.3 and DTMF 5, nothing else");
+        int ok_dcs = 1;
+        for (int i = 0; i < 104 && ok_dcs; ++i) {
+            int oc = 0, code = -1, alias = -1;
+            atkdsp_dcs_code(i, &oc);
+            ok_dcs = atkdsp_dcs_decode(atkdsp_dcs_encode(oc), 1, &code, &alias) == 0 && code == oc && alias >= 0;
+        }
+        CHECK(ok_dcs, "dcs: every standard code encodes and reads back as itself, with its inverted alias");
+        atkdsp_tone_id_destroy(ti);
+        free(au);
     }
 
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);

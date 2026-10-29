@@ -748,3 +748,132 @@ def test_ring_attach_refuses_a_zero_size_header():
     mem[1] = 1 | (256 << 32)                       # version 1, header 256
     mem[6] = 1                                     # max_consumers = 1, the rest zero
     assert not lib.atkdsp_ring_attach(mem.ctypes.data, mem.nbytes)
+
+
+# =============================================================================
+# §19 correlated reference cells (v0.17.0): the window's correlation, corrected
+# =============================================================================
+HANN_RHO2 = (4.0 / 9.0, 1.0 / 36.0, 0.0, 0.0)
+
+
+def test_window_rho2_for_hann_is_four_ninths_and_one_thirty_sixth():
+    w = ref.window("hann", 4096)
+    r = ref.cfar_window_rho2(w)
+    assert r[0] == pytest.approx(4 / 9, abs=2e-3)
+    assert r[1] == pytest.approx(1 / 36, abs=2e-3)
+    assert r[2] < 1e-3 and r[3] < 1e-3
+    assert ref.cfar_window_rho2(ref.window("rectangular", 4096)) == pytest.approx((0, 0, 0, 0), abs=1e-12)
+    if HAVE:
+        assert atkdsp.cfar_window_rho2(w) == pytest.approx(r, rel=1e-9)
+
+
+def test_n_eff_counts_hann_cells_as_about_seventeen_of_thirty_two():
+    ne = ref.cfar_n_eff(16, HANN_RHO2)
+    # 2 x [(16-1) 4/9 + (16-2) / 36] pairs -> 32 / (1 + 28.22 / 32)
+    assert ne == pytest.approx(32 / (1 + 2 * 2 * (15 * 4 / 9 + 14 / 36) / 32), rel=1e-12)
+    assert 17.0 < ne < 17.1
+    assert ref.cfar_n_eff(16, None) == 32.0
+    assert ref.cfar_n_eff(1, HANN_RHO2) == 2.0          # no pairs inside one cell a side
+    if HAVE:
+        assert atkdsp.cfar_n_eff(16, HANN_RHO2) == pytest.approx(ne, rel=1e-12)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3], ids=["CA", "OS", "GO", "SO"])
+def test_zero_rho2_reproduces_the_independent_cell_alpha(mode):
+    a0, e0 = ref.cfar_alpha(mode, 16, 1e-6)
+    a1, e1 = ref.cfar_alpha(mode, 16, 1e-6, rho2=(0.0, 0.0, 0.0, 0.0))
+    assert a1 == a0 and e1 == e0
+    a2, _ = ref.cfar_alpha(mode, 16, 1e-6, rho2=HANN_RHO2)
+    assert a2 > a0                                    # fewer effective cells: a higher threshold
+
+
+@needs_lib
+@pytest.mark.parametrize("mode", [0, 1, 2, 3], ids=["CA", "OS", "GO", "SO"])
+@pytest.mark.parametrize("K", [1.0, 3.0])
+def test_the_c_solver_agrees_with_the_twin_on_correlated_cells(mode, K):
+    for pfa in (1e-3, 1e-6):
+        a, et = ref.cfar_alpha(mode, 12, pfa, K, rho2=HANN_RHO2)
+        b, eu = atkdsp.cfar_alpha(mode, 12, pfa, K, rho2=HANN_RHO2)
+        assert b == pytest.approx(a, rel=1e-9)
+        assert eu == pytest.approx(et, rel=1e-9)
+
+
+def test_a_bad_rho2_is_refused():
+    with pytest.raises(ValueError, match="rho2"):
+        ref.cfar_alpha(0, 16, 1e-6, rho2=(1.0, 0, 0, 0))
+    with pytest.raises(ValueError, match="rho2"):
+        ref.Cfar(256, rho2=(0.1, 0.1, 0.1))
+    if HAVE:
+        with pytest.raises(atkdsp.AtkDspError):
+            atkdsp.cfar_alpha(0, 16, 1e-6, rho2=(-0.1, 0, 0, 0))
+
+
+def _hann_frames(rng, nframes, nfft, looks=1):
+    """Average-power frames in dB of white noise through a Hann window — the
+    frames ATK's live cue detector feeds (looks periodograms averaged)."""
+    w = ref.window("hann", nfft)
+    x = (rng.standard_normal((nframes * looks, nfft)) + 1j * rng.standard_normal((nframes * looks, nfft)))
+    p = np.abs(np.fft.fft(x * w, axis=1)) ** 2
+    p = p.reshape(nframes, looks, nfft).mean(axis=1)
+    return 10 * np.log10(p)
+
+
+def _fa_windowed(impl, mode, pfa, nframes, rho2, nfft=2048, looks=1, seed=1):
+    rng = np.random.default_rng(seed)
+    nr, ng = 16, 4
+    c = _cfar(impl, nfft, mode=mode, pfa=pfa, n_ref=nr, n_guard=ng, looks=float(looks),
+              open_m=1, open_n=1, close_k=1, max_tracks=4096, rho2=rho2)
+    W = 2 * (nr + ng) + 1
+    sel = np.arange(W, nfft - W, W)
+    hits = cells = 0
+    fr = _hann_frames(rng, nframes, nfft, looks)
+    for f in range(nframes):
+        c.process(fr[f], f * 1e-3, 1e-3)
+        _x, _t, h = c.last()
+        hits += int(h[sel].sum())
+        cells += sel.size
+    return hits, cells
+
+
+@needs_lib
+@pytest.mark.parametrize("mode", [0, 1, 2, 3], ids=["CA", "OS", "GO", "SO"])
+def test_with_the_windows_rho2_the_rate_holds_on_hann_frames(mode):
+    """The proof the correction is right AND needed: on Hann-windowed noise
+    the independent-cell threshold fires too often (the Diffusion Toolkit
+    measured 1.6x at 1e-5); with rho2 the measured rate sits inside the
+    design rate's 99 % binomial interval."""
+    pfa = 1e-3
+    nframes = 1200                                      # ~57k counted cells, ~57 hits
+    hits, cells = _fa_windowed("c", mode, pfa, nframes, HANN_RHO2, seed=101 + mode)
+    lo, hi = binom_interval(cells, pfa)
+    assert lo <= hits <= hi, (hits, cells, lo, hi)
+    raw, _ = _fa_windowed("c", mode, pfa, nframes, (0.0, 0.0, 0.0, 0.0), seed=101 + mode)
+    assert raw > 1.25 * cells * pfa, (raw, cells * pfa)    # uncorrected: too many
+
+
+@needs_lib
+def test_the_corrected_rate_holds_with_averaged_looks_too():
+    hits, cells = _fa_windowed("c", 0, 1e-3, 800, HANN_RHO2, looks=4, seed=131)
+    lo, hi = binom_interval(cells, 1e-3)
+    assert lo <= hits <= hi, (hits, cells, lo, hi)
+
+
+def test_the_twin_holds_the_corrected_rate_too():
+    """Twice the frames the first cut had: at 60 frames (2880 cells, 29
+    expected) seed 7 drew 44, one over the 99 % interval, and C drew the
+    same 44 — a 1-in-100 draw, not a defect (ten other seeds average 1.03x
+    the rate). The twin's count is also held to C's, cell for cell."""
+    hits, cells = _fa_windowed("twin", 0, 1e-2, 120, HANN_RHO2, nfft=2048, seed=7)
+    lo, hi = binom_interval(cells, 1e-2)
+    assert lo <= hits <= hi, (hits, cells, lo, hi)
+    if atkdsp.available():
+        assert _fa_windowed("c", 0, 1e-2, 120, HANN_RHO2, nfft=2048, seed=7) == (hits, cells)
+
+
+@needs_lib
+def test_describe_names_the_effective_count():
+    c = atkdsp.Cfar(1024, rho2=HANN_RHO2)
+    assert "17.0 effective" in c.describe()
+    t = ref.Cfar(1024, rho2=HANN_RHO2)
+    assert t.describe() == c.describe()
+    assert "effective" not in atkdsp.Cfar(1024).describe()

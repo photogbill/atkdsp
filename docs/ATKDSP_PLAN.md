@@ -46,6 +46,25 @@ function). The TDMA timing analyzer is ATK-side Python, as the plan says
 (`ring_bench.bat`), a real bladeRF capture for the CFAR acceptance, and the
 toolkit's `dsp/cfar.py` cross-check (that folder is not connected).
 
+**Cross-check done 2026-10-28 (late), and what it found.** The ATK
+Diffusion Toolkit's CFAR replaces N with the window's EQUIVALENT number of
+independent reference cells (a Hann window's power correlation is 4/9 one
+bin apart, 1/36 two apart, so 2 × 16 cells carry ~17 cells' evidence);
+§19's CFAR assumes N independent cells, so on Hann-windowed frames its
+stated Pfa is exceeded — measured 1.6× at 1e-5 and 1.7× at 1e-6 (6.1×10⁷
+noise cells through ATK's live cue frames). ATK corrects for it without an
+ABI change (`atk/core/cue_live.py`: the threshold the requested rate needs
+with N_eff cells, from the F distribution for K-look cells, is mapped to
+the rate that gives the same threshold with N; GO/SO use one side's
+N_eff); measured within ±8 % in all four modes, and the two CFARs set the
+same threshold bin for bin (ATK `tests/test_cfar_cross_check.py`).
+**For the next ABI bump** (LMR_DECODE_PLAN will bump it too — one bump,
+coordinated): put the window's correlation in `atkdsp_cfar_config` (a ρ²
+table or `n_eff`), so every caller gets the right rate, and the edge-
+refinement test (CFAR_EDGE_PFA) likewise. Also measured: the per-cell cost
+is ~25 ns at k_frames = 1 (dominated by the dB → linear conversion) —
+taking linear power would roughly halve it.
+
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
 

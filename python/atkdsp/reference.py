@@ -9776,8 +9776,9 @@ METHOD_NONE = 0
  METHOD_PCPS, METHOD_MBAPDI, METHOD_DOPPLER_GRID, METHOD_M2M4, METHOD_NWPR, METHOD_PD_MONITOR,
  METHOD_FUSION, METHOD_ACF_CHIP, METHOD_QPSK_SPLIT, METHOD_MSC, METHOD_PHASE_REF,
  METHOD_LATTICE, METHOD_DECHIRP, METHOD_SCALE_SURVEY, METHOD_ACF_CFAR,
- METHOD_SCALE_CYC, METHOD_PSYNC, METHOD_LAG_RATE, METHOD_BOOTSTRAP) = range(1, 30)
-METHOD_COUNT = 30
+ METHOD_SCALE_CYC, METHOD_PSYNC, METHOD_LAG_RATE, METHOD_BOOTSTRAP, METHOD_DECIM_AVG, METHOD_PARITY_FROB,
+ METHOD_REGEN, METHOD_LAGSCAN) = range(1, 34)
+METHOD_COUNT = 34
 
 _METHODS = {
     METHOD_BUREL_FLUCT: ("fluctuation-of-correlation detector", "G. Burel", "2000", "FR"),
@@ -9809,6 +9810,11 @@ _METHODS = {
     METHOD_PSYNC: ("period-synchronous eigen watch vs off-period references", "ATK (Undertow)", "2026", "ATK"),
     METHOD_LAG_RATE: ("lag-rate period refinement (radar's keystone idea)", "ATK (Undertow)", "2026", "ATK"),
     METHOD_BOOTSTRAP: ("bootstrap code recovery over the recording", "ATK (Undertow)", "2026", "ATK"),
+    METHOD_DECIM_AVG: ("m-sequence 2-adic decimation averaging", "ATK, after Golomb's decimation property", "2026", "ATK"),
+    METHOD_PARITY_FROB: ("Frobenius parity stack (squared checks)", "Meier, Staffelbach", "1989", "CH"),
+    METHOD_REGEN: ("chips regenerated from the named generator", "ATK", "2026", "ATK"),
+    METHOD_LAGSCAN: ("fast folding of lag products at every period", "Staelin (FFA, pulsar search); ATK",
+                     "1969 / 2026", "US / ATK"),
 }
 
 
@@ -10331,15 +10337,74 @@ def parity_z(chips, poly: int, degree: int) -> float:
     return z
 
 
+def parity_z_frob(chips, poly: int, degree: int):
+    """The Frobenius parity stack (v0.23) — twin of atkdsp_parity_z_frob.
+    Over GF(2), g(x)^(2^m) = g(x^(2^m)): a check polynomial's squares are
+    checks too, at taps 2^m t mod L (the low-weight-multiple trick of fast
+    correlation attacks, Meier & Staffelbach 1989). Z sums (-1)^parity over
+    every cyclic position of every DISTINCT image (r of them for L = 2^r - 1);
+    returns (Z, N), N the checks counted — threshold against sqrt(N)."""
+    chips = np.asarray(chips, np.int8)
+    L = chips.size
+    taps0 = sorted(i for i in range(degree + 1) if (poly >> i) & 1)
+    bits = (chips < 0).astype(np.int64)
+    seen, z, N = set(), 0.0, 0
+    mult = 1
+    for _ in range(64):
+        taps = tuple(sorted((t * mult) % L for t in taps0))
+        if taps in seen:
+            break
+        seen.add(taps)
+        par = np.zeros(L, np.int64)
+        for t in taps:
+            par ^= np.roll(bits, -t)
+        z += float(np.sum(1 - 2 * par)); N += L
+        mult = (mult * 2) % L
+        if mult == 1:
+            break
+    return z, N
+
+
+def mseq_from_poly(poly: int, degree: int) -> np.ndarray:
+    """The m-sequence (+-1 chips, bit 1 -> -1) whose parity checks are poly's
+    taps: b[n + r] = XOR of b[n + t] over the taps t < r, seeded 1, 0, ..."""
+    r = int(degree)
+    L = (1 << r) - 1
+    taps = [t for t in range(r) if (poly >> t) & 1]
+    b = np.zeros(L + r, np.int64)
+    b[0] = 1
+    for n in range(L):
+        v = 0
+        for t in taps:
+            v ^= b[n + t]
+        b[n + r] = v
+    return (1 - 2 * b[:L]).astype(np.int8)
+
+
+def _regen_align(v, ref_chips):
+    """The cyclic shift and sign of ref_chips best matching the soft values v
+    (circular correlation by FFT, the peak re-read exactly). Returns the
+    aligned +-1 chips."""
+    L = v.size
+    rc = ref_chips.astype(np.float64)
+    C = _decim_tone_corr(rc, v)
+    tau = int(np.argmax(np.abs(C)))
+    n = np.arange(L)
+    s = float(np.dot(rc, v[(n + tau) % L]))
+    al = np.empty(L, np.int8)
+    al[(n + tau) % L] = ref_chips if s >= 0 else -ref_chips
+    return al
+
+
 # ---- 25d. the spreading code (twin of src/dsss_code.c) ----------------------
 CHIP_BPSK, CHIP_QPSK, CHIP_OQPSK = 0, 1, 2
-CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED = 1, 2, 4, 8, 16, 32
+CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED, CODE_DECIM, CODE_REGEN = 1, 2, 4, 8, 16, 32, 64, 128
 POLY_NONE, POLY_BM, POLY_PARITY = 0, 1, 2
 
 
 def dsss_code_defaults(fs: float, rc: float, period_s: float) -> dict:
     return dict(fs=float(fs), rc=float(rc), period_s=float(period_s), chip_mod=CHIP_BPSK,
-                vote_passes=6, poly_max_degree=14, no_cfo=0, pfa=1e-3)
+                vote_passes=6, poly_max_degree=14, no_cfo=0, no_decim=0, pfa=1e-3)
 
 
 def _power_iter(windows, v0, deflate=None, iters=60):
@@ -10372,6 +10437,40 @@ def _support_start(v, N):
         if e > best:
             best, kb = e, k
     return kb
+
+
+def _decim_tone_corr(d, v):
+    """C[tau] = sum_n d[n] v[(n + tau) mod L], all tau (circular, real)."""
+    return np.real(np.fft.ifft(np.conj(np.fft.fft(d)) * np.fft.fft(v)))
+
+
+def _decim_average(v, sd, r, pfa):
+    """2-adic decimation averaging (v0.23). For an m-sequence of length
+    L = 2^r - 1, c[2^m n mod L] is a cyclic shift of c[n] (Golomb). Each
+    decimated copy of the soft chips v is matched to v by circular
+    correlation; if ALL r - 1 copies match significantly (|rho| above
+    Phi^-1(1 - pfa / (2 L (r - 1))) / sqrt(L) — a Gold or arbitrary code does
+    not), each chip is averaged over its r aligned looks, which sit at
+    different chips and so carry independent noise: the noise falls by sqrt(r).
+    The argmax comes from an FFT; rho is then an exact dot product.
+    Returns (v_avg, sd_avg, ok)."""
+    L = v.size
+    vv = float(np.dot(v, v))
+    if r < 3 or L != (1 << r) - 1 or not vv > 0:
+        return v, sd, False
+    thr = _norm_isf(pfa / (2.0 * L * (r - 1))) / _sqrt(L)
+    n = np.arange(L)
+    acc = v.copy()
+    for m in range(1, r):
+        d = v[((1 << m) * n) % L]
+        C = _decim_tone_corr(d, v)
+        tau = int(np.argmax(np.abs(C)))
+        rho = float(np.dot(d, v[(n + tau) % L])) / vv
+        if abs(rho) < thr:
+            return v, sd, False
+        # v[j] ~ sign * d[j - tau] = sign * v[2^m (j - tau) mod L]
+        acc = acc + (1.0 if rho > 0 else -1.0) * v[((1 << m) * ((n - tau) % L)) % L]
+    return acc / r, sd / _sqrt(r), True
 
 
 def _code_tone(q):
@@ -10423,9 +10522,13 @@ def dsss_code(iq, cfg: dict) -> tuple:
     off, t0 = 0, 0
     lam1 = lam2 = trace = 0.0
     M = 0
+    first = None
     for attempt in range(2):
         M = (iq.size - off) // N - 1
         if M < 3:
+            if first is not None:                       # the re-cut does not fit: keep the first cut
+                v1, lam1, lam2, trace, t0, M, off = first
+                break
             raise ValueError("dsss_code: need >= 3 windows")
         wins = np.lib.stride_tricks.sliding_window_view(iq[off:off + (M + 1) * N], W)[::N][:M]
         v1, lam1 = _power_iter(wins, iq[off:off + W].copy())
@@ -10434,11 +10537,19 @@ def dsss_code(iq, cfg: dict) -> tuple:
         v2, lam2 = _power_iter(wins, d2, deflate=v1)
         trace = float(np.mean(np.sum(np.abs(wins) ** 2, 1)))
         t0 = _support_start(v1, N)
+        # The window-boundary tie (v0.23): when the code's start meets the
+        # window's, the wide window holds two full periods and lambda2 ~
+        # lambda1; power iteration then returns a MIXTURE whose support says
+        # nothing, so the old test (supports apart by > N/2) missed it and the
+        # blend was decoded — 5-20 % of decodes at comfortable SNR (measured).
+        # Any lambda2 > 0.7 lambda1 now re-cuts N/2 later; the cut with the
+        # clearer winner (lower lambda2/lambda1) is kept.
         if attempt == 0 and lam2 > 0.7 * lam1:
-            t1 = _support_start(v2, N)
-            if abs(t1 - t0) > 0.5 * N:
-                off = N // 2
-                continue
+            first = (v1, lam1, lam2, trace, t0, M, off)
+            off = N // 2
+            continue
+        if first is not None and first[2] / first[1] < lam2 / lam1:
+            v1, lam1, lam2, trace, t0, M, off = first
         break
     sig2 = max((trace - lam1 - lam2) / (W - 2.0), 1e-30)
     edge = sig2 * (1.0 + _sqrt(W / M)) ** 2
@@ -10518,8 +10629,19 @@ def dsss_code(iq, cfg: dict) -> tuple:
         resid = float(np.mean((yr - a[:, None] * cc) ** 2))
         sd = _sqrt(resid / Mp)
         pts = instq if branch else inst
+        vk = np.array([cc[pts[k]] for k in range(L)])
+        rr = _pow2m1(L)
+        if branch == 0:
+            vsoft = vk                                # the I code's soft chips, for the regeneration below
+        if rr and not c.get("no_decim", 0):
+            vk, sd, ok = _decim_average(vk, sd, rr, pfa)
+            if ok and not (res["flags"] & CODE_DECIM):
+                res["flags"] |= CODE_DECIM
+                nm.append(METHOD_DECIM_AVG)
+            if branch == 0:
+                vsoft = vk
         for k in range(L):
-            ck = cc[pts[k]]
+            ck = vk[k]
             chips[branch * L + k] = 1 if ck >= 0 else -1
             z = abs(ck) / sd if sd > 0 else float("inf")
             vmin = min(vmin, z); vsum += z
@@ -10574,22 +10696,39 @@ def dsss_code(iq, cfg: dict) -> tuple:
     # 2. Not cleanly named: parity-check counting over the degree-r primitives,
     #    on whichever sign gives the stronger statistic.
     if not (res["flags"] & CODE_NAMED) and r and r <= poly_max:
+        # parity counting over the Frobenius stack (v0.23): each candidate's
+        # checks and their r squared images, N = r L checks, z = Z / sqrt(N) —
+        # about sqrt(r) more deflection than one image (measured at 16 % chip
+        # errors, L = 127: the true generator named 39/40 against 15/40)
         polys = primitive_polys(r)
-        best = (0.0, 0)
+        best = (-float("inf"), 0, 1)
         for cc in (chips[:L], -chips[:L]):
-            zs = [(parity_z(cc, p, r), p) for p in polys]
-            z = max(zs) if zs else (0.0, 0)
-            if z[0] > best[0]:
-                best = z
-        zbest, pbest = best
-        k = _norm_isf(pfa / max(len(polys), 1))
-        res["poly_z"] = zbest / _sqrt(L)
-        nm.append(METHOD_PARITY_COUNT)
-        if zbest > k * _sqrt(L):
+            for p_ in polys:
+                z, nchk = parity_z_frob(cc, p_, r)
+                if z / _sqrt(nchk) > best[0]:
+                    best = (z / _sqrt(nchk), p_, nchk)
+        zn, pbest, nchk = best
+        # each image counted as a hypothesis: for short codes the images' sums
+        # move together on random chips (image m's checks are the base checks
+        # on a decimated copy), so a plain sum threshold false-named 5x its
+        # design at L = 31 (measured); with this one it is at design
+        k = _norm_isf(pfa / max(len(polys) * max(nchk // L, 1), 1))
+        res["poly_z"] = zn if np.isfinite(zn) else 0.0
+        nm += [METHOD_PARITY_COUNT, METHOD_PARITY_FROB]
+        if zn > k:
             res.update(poly=pbest, poly_degree=r, poly_method=POLY_PARITY)
             res["flags"] |= CODE_POLY | CODE_NAMED
-            res["name"] = "m-sequence (%d) %s, by parity (%d checks failed)" % (
-                L, _poly_str(pbest, r), int((L - zbest) / 2.0 + 0.5))
+            # the chips regenerated from the named generator, aligned to the
+            # soft values (v0.23): an m-sequence is fixed by its polynomial
+            regen = _regen_align(vsoft, mseq_from_poly(pbest, r))
+            fixed = int(np.sum(regen != chips[:L]))
+            chips[:L] = regen
+            res["flags"] |= CODE_REGEN
+            nm.append(METHOD_REGEN)
+            nm_ = "m-sequence (%d) %s, by parity" % (L, _poly_str(pbest, r))
+            if len(nm_ + "; %d fixed" % fixed) <= 47:          # the C name field holds 47
+                nm_ += "; %d fixed" % fixed
+            res["name"] = nm_[:47]
     # 3. Still unnamed: report the linear complexity and the chips.
     if not (res["flags"] & CODE_NAMED) and lc >= 2 and 4 * lc <= L and 2 * plateau >= L:
         mask = bm_mask(poly)
@@ -12475,3 +12614,1701 @@ def hit_import(blob: bytes):
     if at != len(b) - 4:
         raise ValueError("hit blob: trailing bytes")
     return ctx, hit, bs, chips
+
+
+
+# ============================================================================
+# §31 Undertow piece 5 — the full lag scan (v0.24.0, ABI 25): the twin of
+# src/lagscan.c. Below where the survey's candidates hold the period (about
+# 2 dB under its threshold), every period of a cell is searched at once.
+#
+#   c_d[k] = y[k] conj(y[k + d])        a lag product: both samples inside one
+#                                       code period carry the same data sign,
+#                                       so it cancels, and a carrier offset is
+#                                       a constant phase per d — gone too.
+#   folded at the true period T, c_d is the code's +-1 product pattern, every
+#   bin at full amplitude; folded anywhere else it is noise.
+#
+# THE FOLD at every trial period is the Fast Folding Algorithm (Staelin 1969,
+# the pulsar search): for a base period P it folds n periods at the n trial
+# periods P / (1 - x/P), x = s/(n-1), s = 0..n-1, in n log2(n) P additions
+# (P bins over a period a little longer than P: rolling row i by i x is
+# folding t (1 - x/P) at P — the period is NOT P + x, which is short by x^2/P). For each base P
+# in [pmin, pmax) and each of nlags lags d in [lag_min, max(lag_min + 1,
+# lag_frac P)], S[s] = sum_d sum_b |F_d[s][b]|^2 / (n var(c_d)).
+#
+# THE NULL. Under noise S is a sum of squared folded bins, but not of
+# independent ones: a filtered cell's samples are correlated, so are its lag
+# products (Gaussian noise: c_d(t) and c_d(t+m) correlate as |r(m)|^2 / r(0)^2,
+# r the cell's autocorrelation, at every lag d), and so are neighbouring bins.
+# Per lag the folded bins are a circulant whose eigenvalues are that
+# correlation's spectrum lam_k over the P bins (k = 0, the removed mean, left
+# out); S is M copies of c x lam_k E_k, E_k unit exponentials — a generalized
+# chi-square. c and M are matched to the mean and variance of the base
+# period's own trials (those above median + 5 x the interquartile spread left
+# out, and at least the largest `trim` fraction — a strong code lifts a broad
+# stretch of trials), which absorbs what the spectrum does not hold: lags
+# close enough to correlate with each other (M below nlags, c above 1). Its
+# tail is Lugannani and Rice's saddlepoint (1980) — right in the far tail,
+# where a moment-matched Gamma is not: a sum whose eigenvalues spread decays
+# as its LARGEST eigenvalue, slower than the Gamma (measured on noise cells:
+# the Gamma's 1e-3 detections came 7x as often as stated, this null's at the
+# stated rate within the counts). Each base period's best trial gets the
+# one-trial tail; the scan's is that times every trial searched (Bonferroni,
+# conservative: the trials overlap). DETECT at cfg pfa.
+#
+# FAMILIES. A code also folds partly at p/q of its period (2T, T/2, 3T/4 ...),
+# and those rows detect too. The fold cannot tell T from T/2 by its level: at
+# T/2 half the pattern averages away but twice as many periods fold, the
+# excess is the same. So each family is resolved by NESTED FOLDS, seeded by
+# the most significant detection not yet in a family (period p):
+#   up    fold directly at k p (k = 2..8, whole sub-periods of round(p) bins):
+#         the power that is NOT periodic in p — the k sub-folds' differences
+#         from their mean — is noise if p is the period, (k-1)/k of the fold's
+#         signal if the period is k p. The smallest k whose residual is
+#         significant at pfa / 7 (the null: M (k-1) copies of the spectrum
+#         over round(p) bins, k = 0 kept) AND holds at least half of that
+#         (k-1)/k steps p up to k p; at most 4 steps. The half matters: when
+#         k p is a whole number of samples, the k sub-folds sample the pattern
+#         at fixed, different sub-sample offsets and a strong code leaves a
+#         significant residual that is not a longer period (measured: 5 % of
+#         the signal at 6T = 496 samples, tail 1e-5).
+#   down  fold at p into k sub-periods (k = 8..2): if p / k is the period the
+#         residual is noise (and that offset leak); if p is, (k-1)/k of the
+#         signal. Step down to p / k for the largest k whose residual sits
+#         3 standard deviations below half of what p would leave, when that is
+#         at least 6 (otherwise the data cannot tell, and the period stays);
+#         at most 4 steps.
+# Before resolving, the seed's period is refined by direct folds over all of
+# the data (the FFA's tree rounds its shifts: measured, a row's period drifted
+# 15 samples across 4 s), and the families already found are taken off the
+# lag products (CLEAN, Hogbom 1974): a seed whose detection the earlier
+# families explain — what is left there no longer detects — joins the family
+# whose removal alone leaves the least, instead of starting its own.
+# Every detection at p/q (p, q <= 8, 2e-3) of the family's fundamental joins
+# it: FUNDAMENTAL at 1/1, HARMONIC otherwise.
+# ============================================================================
+LAGSCAN_DETECT, LAGSCAN_HARMONIC, LAGSCAN_SHORT, LAGSCAN_FUNDAMENTAL = 1, 2, 4, 8
+LAGSCAN_FAM_UP, LAGSCAN_FAM_DOWN, LAGSCAN_FAM_OUTSIDE = 1, 2, 4
+LAGSCAN_CLIP = 5.0            # null fit: trials above median + 5 x the IQR spread left out
+LAGSCAN_ACF = 16              # the cell's autocorrelation, lags 0..16, builds the null
+LAGSCAN_KMAX = 8              # families: multiples / fractions tried; p, q of a harmonic
+LAGSCAN_STEPS = 4             # families: steps up at most
+LAGSCAN_POWER = 6.0           # families: a step down needs this many sd of residual to tell
+LAGSCAN_FCAP = 16             # families returned by default (the binding's)
+LAGSCAN_REFINE = 16           # families: the period refined over +-16 samples of drift
+_LS_TWO_PI = 6.283185307179586
+
+
+def lagscan_defaults(fs: float, pmin: int = 16, pmax: int = 257) -> dict:
+    return dict(fs=float(fs), pmin=int(pmin), pmax=int(pmax), nlags=8, lag_min=12, lag_frac=0.5,
+                nmax=1 << 15, pfa=1e-3, trim=0.005)
+
+
+def lagscan_lags(P: int, lag_min: int, lag_frac: float, nlags: int) -> list:
+    """The lags folded for base period P: nlags integers spread evenly over
+    [lag_min, max(lag_min + 1, floor(lag_frac P))], rounded half up, repeats
+    dropped (C computes the same integers)."""
+    hi = max(lag_min + 1, int(_m.floor(P * lag_frac)))
+    span = hi - lag_min
+    out = []
+    for i in range(int(nlags)):
+        d = lag_min if nlags == 1 else lag_min + (2 * i * span + (nlags - 1)) // (2 * (nlags - 1))
+        if d not in out:
+            out.append(int(d))
+    return out
+
+
+def ffa(X):
+    """The Fast Folding Algorithm. X: (n, P) complex, n a power of two.
+    Returns (n, P): row s folds the n rows with a drift of s samples across
+    them, x = s/(n-1) a row — the trial period P / (1 - x/P) (P bins over a
+    period a little longer than P; P + x is the first-order form). At each stage, the pair (A, B) of
+    folds of half as many rows combine as out[s] = A[s//2] + roll(B[s//2],
+    (s+1)//2), roll(x, h)[b] = x[(b + h) mod P]."""
+    X = np.asarray(X, np.complex128)
+    n, P = X.shape
+    cur = X[:, None, :]
+    g = 1
+    cols = np.arange(P)
+    while g < n:
+        A, B = cur[0::2], cur[1::2]
+        sh = np.arange(2 * g)
+        half = sh // 2
+        idx = (cols[None, :] + ((sh + 1) // 2)[:, None]) % P
+        Bs = B[:, half, :]
+        Bs = np.take_along_axis(Bs, np.broadcast_to(idx, Bs.shape), axis=2)
+        cur = A[:, half, :] + Bs
+        g *= 2
+    return cur[0]
+
+
+def lagscan_acf(y) -> np.ndarray:
+    """rho[m] = |r(m)|^2 / r(0)^2, m = 0..LAGSCAN_ACF, r(m) = mean_t conj(y[t])
+    y[t + m]: how a lag product correlates with itself m samples on (Gaussian
+    noise, at every lag d). A silent input gives rho = [1, 0, ...]."""
+    y = np.asarray(y, np.complex128).ravel()
+    N = y.size
+    rho = np.zeros(LAGSCAN_ACF + 1)
+    rho[0] = 1.0
+    if N < 2:
+        return rho
+    r0 = float(np.vdot(y, y).real) / N
+    if not r0 > 0:
+        return rho
+    for m in range(1, min(LAGSCAN_ACF, N - 1) + 1):
+        r = np.vdot(y[:N - m], y[m:]) / (N - m)
+        rho[m] = (r.real * r.real + r.imag * r.imag) / (r0 * r0)
+    return rho
+
+
+def lagscan_spectrum(rho, nb: int, dc: bool) -> np.ndarray:
+    """The circulant's eigenvalues over nb bins: lam_k = rho_0 + 2 sum_m rho_m
+    cos(2 pi (k m) / nb), k from 0 (dc) or 1 to nb - 1, floored at 1e-6."""
+    k = np.arange(0 if dc else 1, nb, dtype=np.float64)
+    lam = np.full(k.size, float(rho[0]))
+    for m in range(1, len(rho)):
+        lam = lam + 2.0 * float(rho[m]) * np.cos(_LS_TWO_PI * (k * m) / nb)
+    return np.maximum(lam, 1e-6)
+
+
+def _ls_mills(w: float) -> float:
+    """Phi-bar(w) / phi(w), w > 0."""
+    if w < 35.0:
+        return _m.sqrt(_m.pi / 2.0) * _m.exp(0.5 * w * w) * _m.erfc(w / _m.sqrt(2.0))
+    w2 = w * w
+    return (1.0 - 1.0 / w2 + 3.0 / (w2 * w2) - 15.0 / (w2 * w2 * w2)) / w
+
+
+def lagscan_tail(x: float, lam, mult: float) -> float:
+    """log10 P(Q >= x), Q = mult copies of sum_j lam_j E_j (E_j unit
+    exponentials): Lugannani-Rice. At or below the mean, the normal tail."""
+    lam = np.asarray(lam, np.float64)
+    mean = mult * float(np.sum(lam))
+    var = mult * float(np.sum(lam * lam))
+    if not var > 0:
+        return 0.0
+    if not x > mean:
+        return _m.log10(0.5 * _m.erfc((x - mean) / _m.sqrt(var) / _m.sqrt(2.0)))
+    lo, hi, s = 0.0, 1.0 / float(np.max(lam)), 0.0
+    for _ in range(100):
+        g = lam / (1.0 - lam * s)
+        k1 = mult * float(np.sum(g))
+        k2 = mult * float(np.sum(g * g))
+        if k1 > x:
+            hi = s
+        else:
+            lo = s
+        sn = s - (k1 - x) / k2
+        if not lo < sn < hi:
+            sn = 0.5 * (lo + hi)
+        done = abs(sn - s) <= 1e-13 * hi
+        s = sn
+        if done:
+            break
+    d = 1.0 - lam * s
+    K = -mult * float(np.sum(np.log(d)))
+    g = lam / d
+    k2 = mult * float(np.sum(g * g))
+    w = _m.sqrt(max(2.0 * (s * x - K), 0.0))
+    u = s * _m.sqrt(k2)
+    if w < 1e-6 or not u > 0:
+        return _m.log10(0.5)
+    t = _ls_mills(w) + 1.0 / u - 1.0 / w
+    if not t > 0:
+        t = _ls_mills(w)
+    return (-0.5 * w * w - 0.5 * _m.log(_LS_TWO_PI) + _m.log(t)) / _m.log(10.0)
+
+
+def lagscan_fold(y, lags, period: float, nb: int, sub=()) -> np.ndarray:
+    """The lag products folded DIRECTLY at a real period into nb phase bins:
+    sample t (0 .. N - max(lags) - 1) to bin floor(t (nb / period)) mod nb;
+    Z[i, b] = (F - cnt mean) / sqrt(cnt var), each lag's mean and variance over
+    the same samples (one pass: var = mean |c|^2 - |mean|^2). `sub`: families
+    already found, (period, nbins, profile(d)) — each one's folded profile is
+    taken off every sample first (CLEAN, Hogbom 1974: what a known period
+    explains is removed before the next is looked for)."""
+    y = np.asarray(y, np.complex128).ravel()
+    T = y.size - max(lags)
+    t = np.arange(T, dtype=np.float64)
+    b = np.floor(t * (nb / period)).astype(np.int64) % nb
+    sb = [(np.floor(t * (qf / tf)).astype(np.int64) % qf, prof) for tf, qf, prof in sub]
+    cnt = np.bincount(b, minlength=nb).astype(np.float64)
+    Z = np.zeros((len(lags), nb), np.complex128)
+    for i, d in enumerate(lags):
+        c = y[:T] * np.conj(y[d:d + T])
+        for bf, prof in sb:
+            c = c - prof(d)[bf]
+        mean = c.sum() / T
+        var = float(np.sum(c.real * c.real + c.imag * c.imag)) / T - (mean.real ** 2 + mean.imag ** 2)
+        if not var > 0:
+            continue
+        F = np.bincount(b, weights=c.real, minlength=nb) + 1j * np.bincount(b, weights=c.imag, minlength=nb)
+        ok = cnt > 0
+        Z[i, ok] = (F[ok] - cnt[ok] * mean) / np.sqrt(cnt[ok] * var)
+    return Z
+
+
+def lagscan_profile(y, d: int, period: float, nb: int) -> np.ndarray:
+    """One lag's folded mean profile at a real period, its overall mean taken
+    off: m[b] = F_b / cnt_b - mean, over t = 0 .. N - d - 1 (what CLEAN
+    subtracts)."""
+    y = np.asarray(y, np.complex128).ravel()
+    T = y.size - d
+    b = np.floor(np.arange(T, dtype=np.float64) * (nb / period)).astype(np.int64) % nb
+    c = y[:T] * np.conj(y[d:d + T])
+    mean = c.sum() / T
+    cnt = np.bincount(b, minlength=nb).astype(np.float64)
+    F = np.bincount(b, weights=c.real, minlength=nb) + 1j * np.bincount(b, weights=c.imag, minlength=nb)
+    m = np.zeros(nb, np.complex128)
+    ok = cnt > 0
+    m[ok] = F[ok] / cnt[ok] - mean
+    return m
+
+
+def _ls_resid(Z, k: int):
+    """(R, X): the folded power not periodic in nb/k bins, and the total."""
+    L, nb = Z.shape
+    W = Z.reshape(L, k, nb // k)
+    D = W - W.mean(axis=1, keepdims=True)
+    return float(np.sum(D.real ** 2 + D.imag ** 2)), float(np.sum(Z.real ** 2 + Z.imag ** 2))
+
+
+def lagscan(y, cfg: dict, fcap: int = LAGSCAN_FCAP):
+    """(rows, families, ntrials) — the twin of atkdsp_lagscan. One row per base
+    period P in [pmin, pmax): its best trial period (refined by a parabola over
+    the neighbouring trials), the one-trial and the scan-corrected log10
+    tails, the statistic, the null's multiplicity and scale (shape, scale),
+    the folded excess, flags (DETECT at cfg pfa; SHORT under 16 periods;
+    FUNDAMENTAL / HARMONIC with p/q of the family `family`). Up to fcap
+    families, most significant first (§31's words)."""
+    c = dict(cfg)
+    fs, pmin, pmax = float(c["fs"]), int(c["pmin"]), int(c["pmax"])
+    nl, lmin, lfrac = int(c["nlags"]), int(c["lag_min"]), float(c["lag_frac"])
+    nmax, pfa, trim = int(c["nmax"]), float(c["pfa"]), float(c["trim"])
+    if not fs > 0 or not 2 <= pmin < pmax or not 1 <= nl <= 64 or lmin < 1 or not 0 < lfrac <= 1:
+        raise ValueError("lagscan: fs, pmin < pmax, nlags 1..64, lag_min >= 1, 0 < lag_frac <= 1")
+    if nmax < 16 or nmax & (nmax - 1) or not 0 < pfa < 1 or not 0 <= trim < 0.5 or fcap < 0:
+        raise ValueError("lagscan: nmax a power of two >= 16, 0 < pfa < 1, 0 <= trim < 0.5, fcap >= 0")
+    y = np.asarray(y, np.complex128).ravel()
+    N = y.size
+    rho = lagscan_acf(y)
+    rows = []
+    for P in range(pmin, pmax):
+        L = lagscan_lags(P, lmin, lfrac, nl)
+        dmax = max(L)
+        row = dict(period_samples=0.0, period_s=0.0, log10_pfa=0.0, log10_pfa_raw=0.0, stat=0.0,
+                   shape=0.0, scale=0.0, excess=0.0, base=P, nfold=0, harmonic_p=0, harmonic_q=0,
+                   family=-1, flags=0, method=[METHOD_LAGSCAN, METHOD_SCALE_SURVEY])
+        avail = (N - dmax) // P if N > dmax else 0
+        if avail < 16:
+            row["flags"] = LAGSCAN_SHORT
+            rows.append(row)
+            continue
+        n = 1
+        while n * 2 <= avail and n * 2 <= nmax:
+            n *= 2
+        S = np.zeros(n)
+        for d in L:
+            cd = y[: n * P] * np.conj(y[d: d + n * P])
+            cd = cd - cd.mean()
+            v = float(np.mean(np.abs(cd) ** 2))
+            if v <= 0:
+                continue
+            F = ffa(cd.reshape(n, P))
+            S += np.sum(np.abs(F) ** 2, axis=1) / (n * v)
+        # the null's moments: the median and the interquartile spread, trials
+        # above median + clip x spread left out (a deep code lifts a handful
+        # of trials, a strong one a broad stretch: 13 % of them at -6 dB,
+        # measured), and never fewer than `trim` of the largest
+        srt = np.sort(S)
+        med = float(srt[(n - 1) // 2])
+        q1, q3 = float(srt[n // 4]), float(srt[(3 * n) // 4])
+        spread = (q3 - q1) / 1.349
+        lim = med + LAGSCAN_CLIP * spread
+        keep = int(np.searchsorted(srt, lim, side="right"))
+        keep = min(keep, n - int(_m.floor(n * trim)))
+        keep = max(8, keep)
+        kk = srt[:keep]
+        mu = float(kk.mean())
+        var = float(np.mean((kk - mu) ** 2))
+        row["nfold"] = n
+        if not mu > 0 or not var > 0:
+            rows.append(row)
+            continue
+        lam = lagscan_spectrum(rho, P, False)
+        sl, sl2 = float(np.sum(lam)), float(np.sum(lam * lam))
+        cc = (var / mu) * sl / sl2
+        M = mu / (cc * sl)
+        sb = int(np.argmax(S))
+        raw = lagscan_tail(float(S[sb]), cc * lam, M)
+        frac = 0.0
+        if 0 < sb < n - 1:
+            a, b, e = float(S[sb - 1]), float(S[sb]), float(S[sb + 1])
+            den = a - 2.0 * b + e
+            if den < 0:
+                frac = 0.5 * (a - e) / den
+        # the FFA's P bins fold row i rolled by i x (drift per row): bin =
+        # (t - i x) mod P = t (1 - x / P) mod P — a fold at the period
+        # P / (1 - x / P) with bins a little over a sample wide, NOT at P + x
+        # (measured: P + x was 0.005 samples short at 82.67, a 44-sample drift
+        # over 8,192 periods; the error is x^2 / P)
+        x = (sb + frac) / (n - 1)
+        T = P / (1.0 - x / P)
+        row.update(period_samples=T, period_s=T / fs, log10_pfa_raw=raw, stat=float(S[sb]),
+                   shape=M, scale=cc, excess=(float(S[sb]) - mu) / mu)
+        rows.append(row)
+    ntrials = float(sum(r["nfold"] for r in rows))
+    lt = _m.log10(ntrials) if ntrials > 0 else 0.0
+    for r in rows:
+        if r["nfold"] and r["shape"] > 0:
+            r["log10_pfa"] = min(0.0, r["log10_pfa_raw"] + lt)
+            if r["log10_pfa"] <= _m.log10(pfa):
+                r["flags"] |= LAGSCAN_DETECT
+    fams = _lagscan_families(y, rows, rho, c, int(fcap), ntrials) if fcap else []
+    return rows, fams, ntrials
+
+
+def _lagscan_ratio(a: float, b: float):
+    """(p, q) with a/b ~ p/q, p, q <= 8 (q-major), within 2e-3 relative; else None."""
+    ratio = a / b
+    for q in range(1, LAGSCAN_KMAX + 1):
+        for p_ in range(1, LAGSCAN_KMAX + 1):
+            if abs(ratio - p_ / q) < 2e-3 * (p_ / q):
+                return p_, q
+    return None
+
+
+def _ls_power(y, lags, period: float, nb: int, sub) -> float:
+    Z = lagscan_fold(y, lags, period, nb, sub)
+    return float(np.sum(Z.real ** 2 + Z.imag ** 2))
+
+
+def _ls_refine(y, lags, p: float, sub):
+    """(period, power): the direct fold's total power over a grid of periods a
+    sample of drift apart across the data (p +- LAGSCAN_REFINE samples of
+    drift), its peak refined by a parabola. The FFA's tree rounds its shifts,
+    so a row's period can drift several samples across a long record
+    (measured: 15 samples over 4 s at 82.66) — a fold over all of it needs
+    better."""
+    Tn = y.size - max(lags)
+    dl = p / Tn
+    Q = int(_m.floor(p + 0.5))
+    J = LAGSCAN_REFINE
+    X = [_ls_power(y, lags, p + j * dl, Q, sub) for j in range(-J, J + 1)]
+    jb = int(np.argmax(X))
+    frac = 0.0
+    if 0 < jb < 2 * J:
+        a_, b_, e_ = X[jb - 1], X[jb], X[jb + 1]
+        den = a_ - 2.0 * b_ + e_
+        if den < 0:
+            frac = 0.5 * (a_ - e_) / den
+    return p + (jb - J + frac) * dl, float(X[jb])
+
+
+def _ls_resolve(y, lags, p: float, M: float, cc: float, rho, pfa: float, sub):
+    """The nested folds (§31's words): (period, flags, log10 of the last step
+    up's residual tail or 0)."""
+    Tn = y.size - max(lags)
+    lstep = _m.log10(pfa / (LAGSCAN_KMAX - 1))
+    flags, ev = 0, 0.0
+    for _ in range(LAGSCAN_STEPS):
+        moved = False
+        Q = int(_m.floor(p + 0.5))
+        if Q >= 2:
+            lamQ = lagscan_spectrum(rho, Q, True)
+            for k in range(2, LAGSCAN_KMAX + 1):
+                if 16.0 * k * p > Tn:
+                    break
+                R, X = _ls_resid(lagscan_fold(y, lags, k * p, k * Q, sub), k)
+                lamF = lagscan_spectrum(rho, k * Q, False)
+                esig = X - M * cc * float(np.sum(lamF))
+                r0 = M * (k - 1) * cc * float(np.sum(lamQ))
+                t = lagscan_tail(R, cc * lamQ, M * (k - 1))
+                if t <= lstep and R - r0 >= 0.5 * (k - 1) / k * esig:
+                    p, flags, ev, moved = k * p, flags | LAGSCAN_FAM_UP, t, True
+                    break
+        if not moved:
+            break
+    for _ in range(LAGSCAN_STEPS):
+        moved = False
+        for k in range(LAGSCAN_KMAX, 1, -1):
+            Q = int(_m.floor(p / k + 0.5))
+            if Q < 4:
+                continue
+            R, X = _ls_resid(lagscan_fold(y, lags, p, k * Q, sub), k)
+            lamQ = lagscan_spectrum(rho, Q, True)
+            lamF = lagscan_spectrum(rho, k * Q, False)
+            h1 = (k - 1) / k * (X - M * cc * float(np.sum(lamF)))
+            r0 = M * (k - 1) * cc * float(np.sum(lamQ))
+            sd = _m.sqrt(M * (k - 1)) * cc * _m.sqrt(float(np.sum(lamQ * lamQ)))
+            if h1 >= LAGSCAN_POWER * sd and R - r0 < 0.5 * h1 - 3.0 * sd:
+                p, flags, moved = p / k, flags | LAGSCAN_FAM_DOWN, True
+                break
+        if not moved:
+            break
+    return p, flags, ev
+
+
+def _lagscan_families(y, rows, rho, c: dict, fcap: int, ntrials: float) -> list:
+    """Families from the detections, most significant first (ties: the
+    shorter base), up to fcap (§31's words); the rows marked."""
+    fs, pmin, pmax, pfa = float(c["fs"]), int(c["pmin"]), int(c["pmax"]), float(c["pfa"])
+    lt = _m.log10(ntrials) if ntrials > 0 else 0.0
+    det = sorted([r for r in rows if r["flags"] & LAGSCAN_DETECT], key=lambda r: (r["log10_pfa"], r["base"]))
+    fams, subs = [], []
+
+    def make_sub(T, Q):
+        cache = {}
+
+        def prof(d):
+            if d not in cache:
+                cache[d] = lagscan_profile(y, d, T, Q)
+            return cache[d]
+        return (T, Q, prof)
+
+    def mark(r, fi, pq):
+        r["family"], r["harmonic_p"], r["harmonic_q"] = fi, pq[0], pq[1]
+        r["flags"] |= LAGSCAN_FUNDAMENTAL if pq == (1, 1) else LAGSCAN_HARMONIC
+        fams[fi]["members"] += 1
+
+    def join(r):
+        for fi, f in enumerate(fams):
+            pq = _lagscan_ratio(r["period_samples"], f["period_samples"])
+            if pq:
+                mark(r, fi, pq)
+                return True
+        return False
+
+    for seed in det:
+        if seed["family"] >= 0 or join(seed):
+            continue
+        lags = lagscan_lags(seed["base"], int(c["lag_min"]), float(c["lag_frac"]), int(c["nlags"]))
+        M, cc = seed["shape"], seed["scale"]
+        if fams:
+            # cheap first: at the seed's own period, does it detect before the
+            # families come off and not after? Then it is theirs (two folds,
+            # not a refinement's 33)
+            p0 = seed["period_samples"]
+            Q0 = int(_m.floor(p0 + 0.5))
+            lam0 = cc * lagscan_spectrum(rho, Q0, False)
+            if lagscan_tail(_ls_power(y, lags, p0, Q0, ()), lam0, M) + lt <= _m.log10(pfa) \
+                    and lagscan_tail(_ls_power(y, lags, p0, Q0, subs), lam0, M) + lt > _m.log10(pfa):
+                left = [_ls_power(y, lags, p0, Q0, [s_]) for s_ in subs]
+                fi = int(np.argmin(left))
+                mark(seed, fi, _lagscan_ratio(p0, fams[fi]["period_samples"]) or (0, 0))
+                continue
+        p, X = _ls_refine(y, lags, seed["period_samples"], subs)
+        if fams:
+            Q = int(_m.floor(p + 0.5))
+            noise = cc * lagscan_spectrum(rho, Q, False)
+            if lagscan_tail(X, noise, M) + lt > _m.log10(pfa):
+                # what the known families leave at this period is noise: it is
+                # theirs — the one whose removal alone leaves the least
+                left = [_ls_power(y, lags, p, Q, [s_]) for s_ in subs]
+                fi = int(np.argmin(left))
+                mark(seed, fi, _lagscan_ratio(seed["period_samples"], fams[fi]["period_samples"]) or (0, 0))
+                continue
+        if len(fams) >= fcap:
+            break
+        T, fl, ev = _ls_resolve(y, lags, p, M, cc, rho, pfa, subs)
+        if not pmin <= T < pmax:
+            fl |= LAGSCAN_FAM_OUTSIDE
+        Q = int(_m.floor(T + 0.5))
+        X = _ls_power(y, lags, T, Q, subs)
+        noise = M * cc * float(np.sum(lagscan_spectrum(rho, Q, False)))
+        sq = _lagscan_ratio(seed["period_samples"], T) or (0, 0)
+        fams.append(dict(period_samples=T, period_s=T / fs, log10_pfa=seed["log10_pfa"], log10_step=ev,
+                         fold_snr=(X - noise) / noise, seed_base=seed["base"],
+                         seed_p=sq[0], seed_q=sq[1], members=0, flags=fl,
+                         method=[METHOD_LAGSCAN, METHOD_SCALE_SURVEY]))
+        subs.append(make_sub(T, Q))
+        fi = len(fams) - 1
+        mark(seed, fi, sq)
+        for r in det:
+            if r["family"] < 0:
+                pq = _lagscan_ratio(r["period_samples"], T)
+                if pq:
+                    mark(r, fi, pq)
+    return fams
+
+
+# ============================================================================
+# §32 analog video — the twin of src/video.c (docs/VIDEO_PLAN.md, §C6).
+# Staged 2026-10-30 by the instance that reviewed SigDigger (it was written
+# as §31; the lag scan took that number) and merged in v0.25.0 / ABI 26.
+#
+# CLEAN ROOM. Written from the public video standards (SMPTE ST 170, ITU-R
+# BT.1700 / BT.470 for the 525- and 625-line systems, ITU-R BT.601 for the
+# active-line sample counts) and textbook loop design (Rice, "Digital
+# Communications: A Discrete-Time Approach", the second-order loop gains).
+# sigutils' tvproc.c was NOT read: atkdsp rule 7 (LGPL is a test oracle only)
+# and sigutils' own licence contradiction (GPL-3 repo, LGPL-3 headers).
+#
+# NUMBERS. The standard figures below are the nominal values; each carries the
+# standard it comes from. The two that frame the picture (0H to the first
+# active sample, and the active-line length) are BT.601's sample counts at
+# 13.5 MHz: 122 (525) / 132 (625) samples from 0H, 720 samples long. They are
+# to be checked against the Recommendation text before release (VIDEO_PLAN
+# §0): a wrong one shifts the picture by pixels, it does not break lock.
+#
+# WHAT IT DOES. Real composite samples (after an FM or AM detector) in, frames
+# of luma (0 = black, 1 = white, float32) out, each with its lock metadata.
+# Stages, each a method below and a static function in the C:
+#   segment levels -> sync slicer with hysteresis (sub-sample 50 % edges)
+#   -> pulse classes (equalizing / H / broad) -> the line-locked loop
+#   (second-order, coasting through the vertical interval) -> fields and
+#   their order -> line rendering (Keys cubic, per-line DC restore, chroma
+#   trap or comb) -> frames (interlaced weave / one field / progressive)
+#   -> motion-aware stacking.
+#
+# DETERMINISM AND CHUNK INVARIANCE. All processing happens in SEGMENTS of
+# S = round(fs * 64 us) samples on the global sample index, never on the
+# caller's blocks: thresholds change only at segment boundaries, lines render
+# only at segment ends. So the same stream chunked any way gives the same
+# frames, and the C (a per-sample loop inside each segment) equals this twin
+# (vectorised inside each segment) decision for decision. Arithmetic is double
+# throughout and pixels are rounded to float32 once, at the end; medians are
+# order statistics (the element at index (m-1)//2 of the sorted window), and
+# sums are sequential (np.cumsum's last element), as the C computes them.
+
+import math as _vm
+
+import numpy as np
+
+# ---- enums (the same numbers as atkdsp.h §32) --------------------------------
+VID_STD_AUTO, VID_STD_525, VID_STD_625, VID_STD_CUSTOM = 0, 1, 2, 3
+VID_POL_AUTO, VID_POL_NORMAL, VID_POL_INVERTED = 0, 1, 2
+VID_YC_OFF, VID_YC_TRAP, VID_YC_COMB = 0, 1, 2
+VID_INTERLACED, VID_ONE_FIELD, VID_PROGRESSIVE = 0, 1, 2
+
+_VID_STD_NAMES = {VID_STD_525: "525-line", VID_STD_625: "625-line", VID_STD_CUSTOM: "custom"}
+
+#: Nominal constants. Times in seconds; levels relative to the sync amplitude
+#: (blank - sync tip = 1).
+_T525 = 286.0 / 4.5e6                        # SMPTE ST 170: fH = 4.5 MHz / 286
+_VID_STD = {
+    VID_STD_525: dict(
+        line_hz=4.5e6 / 286.0, lpf=262.5,
+        w_h=4.7e-6, w_eq=2.3e-6, w_broad=27.1e-6,        # ST 170 / BT.1700 (M)
+        a0=122.0 / 13.5e6, la=720.0 / 13.5e6,            # BT.601, 525-line
+        vbi=18, visible=240,                              # 480 visible lines a frame
+        black_rel=7.5 / 40.0, white_rel=100.0 / 40.0,     # setup 7.5 IRE, sync 40 IRE
+        fsc=315e6 / 88.0, comb_lag=1),                    # fsc = 227.5 fH
+    VID_STD_625: dict(
+        line_hz=15625.0, lpf=312.5,
+        w_h=4.7e-6, w_eq=2.35e-6, w_broad=27.3e-6,        # BT.470 / BT.1700 (B, G, I)
+        a0=132.0 / 13.5e6, la=720.0 / 13.5e6,            # BT.601, 625-line
+        vbi=22, visible=288,                              # 576 visible lines a frame
+        black_rel=0.0, white_rel=700.0 / 300.0,           # 300 mV sync, 700 mV video
+        fsc=4433618.75, comb_lag=2),                      # fsc ~ 283.75 fH + 25 Hz
+}
+#: Classification and loop constants (seconds at the 525-line period; scaled
+#: by the measured line period once locked).
+_W_MIN, _B_EQ_H, _B_H_BROAD, _W_MAX = 1.0e-6, 3.5e-6, 15.9e-6, 54.6e-6
+_ACQ_LO, _ACQ_HI = 58e-6, 70e-6               # AUTO: 14.3-17.2 kHz line rates
+_ACQ_N = 8                                    # consistent spacings before lock
+_WIN_WIDE, _WIN_TRACK = 3.0e-6, 1.5e-6
+_BL_WIDE, _BL_TRACK, _ZETA = 0.05, 0.005, 0.70710678118654752
+_WIDE_LINES, _LOSE_MISSES = 32, 64          # 64 lines (4 ms) coast through a dropout
+_LPF_MIN, _LPF_MAX = 100.0, 420.0             # lines per field the kernel accepts
+_SEG_S = 64e-6                                # segment length (one nominal line)
+_BOX_S = 0.5e-6                               # the slicer's smoothing box
+_LOOK_BACK = 32                               # samples searched back for a crossing
+_HIST_SEGS = 4                                # segments of history kept
+_QUEUE = 4                                    # frames waiting before the oldest drops
+# level windows after 0H, seconds at the 525-line period
+_TIP_A, _TIP_B = 0.6e-6, 4.1e-6
+_BLANK_A, _BLANK_B = 5.7e-6, 8.7e-6           # the back porch; a burst is symmetric about blank
+_SIG_A, _SIG_B = 8.0e-6, 9.0e-6               # after the burst, before the picture
+_TRAP_HALF, _TRAP_TAPS = 1.0e6, 31
+
+
+def video_defaults() -> dict:
+    """The defaults atkdsp_video_defaults() writes."""
+    return dict(fs=13.5e6, standard=VID_STD_AUTO, custom_line_hz=0.0, custom_lines=0,
+                polarity=VID_POL_AUTO, yc=VID_YC_TRAP, fields=VID_INTERLACED,
+                swap_fields=0, width=720, stack=1, motion_aware=1)
+
+
+def _video_check(c) -> str:
+    if not (c["fs"] >= 4e6 and _vm.isfinite(c["fs"]) and c["fs"] <= 200e6):
+        return f"composite video needs at least 4 MS/s (fs is {c['fs'] / 1e6:.3f} MS/s; at most 200)"
+    if c["standard"] not in (0, 1, 2, 3):
+        return "standard: 0 auto, 1 525-line, 2 625-line, 3 custom"
+    if c["standard"] == VID_STD_CUSTOM:
+        if not (5000.0 <= c["custom_line_hz"] <= 40000.0):
+            return "custom_line_hz 5,000..40,000 Hz"
+        if not (2 * _LPF_MIN <= c["custom_lines"] <= 2 * _LPF_MAX):
+            return "custom_lines (a frame) 200..840"
+    if c["polarity"] not in (0, 1, 2):
+        return "polarity: 0 auto, 1 normal, 2 inverted"
+    if c["yc"] not in (0, 1, 2):
+        return "yc: 0 off, 1 trap, 2 comb"
+    if c["fields"] not in (0, 1, 2):
+        return "fields: 0 interlaced, 1 one field, 2 progressive"
+    if c["swap_fields"] not in (0, 1):
+        return "swap_fields 0/1"
+    if not 64 <= c["width"] <= 1920:
+        return "width 64..1920 pixels"
+    if not 1 <= c["stack"] <= 64:
+        return "stack 1..64 frames"
+    if c["motion_aware"] not in (0, 1):
+        return "motion_aware 0/1"
+    return ""
+
+
+def _loop_gains(bl: float, zeta: float = _ZETA) -> tuple:
+    """Second-order loop gains from the noise bandwidth (in cycles per line)
+    and damping — the standard design (Rice, ch. 7, unit detector and
+    integrator gains)."""
+    th = bl / (zeta + 0.25 / zeta)
+    d = 1.0 + 2.0 * zeta * th + th * th
+    return 4.0 * zeta * th / d, 4.0 * th * th / d
+
+
+def _order_stat(v: np.ndarray, k: int) -> float:
+    """The element at index k of sorted(v) — exactly what the C selects."""
+    return float(np.partition(v, k)[k])
+
+
+def _seq_sum(v: np.ndarray) -> float:
+    """A sequential double sum (the C's loop order)."""
+    return float(np.cumsum(v, dtype=np.float64)[-1]) if v.size else 0.0
+
+
+def _trap_taps(fsc: float, pixel_rate: float):
+    """A 31-tap Hamming band-stop around the colour subcarrier, at the pixel
+    rate; None when the pixel rate is too low to hold it. Each low-pass is
+    normalised to unit DC gain, so the band-stop's DC gain is exactly 1."""
+    f1 = (fsc - _TRAP_HALF) / pixel_rate
+    f2 = (fsc + _TRAP_HALF) / pixel_rate
+    if not (0.0 < f1 < f2 < 0.5):
+        return None
+    n = _TRAP_TAPS
+    m = (n - 1) // 2
+    k = np.arange(n, dtype=np.float64)
+    w = 0.54 - 0.46 * np.cos(2.0 * _vm.pi * k / (n - 1))
+
+    def lp(fc):
+        x = k - m
+        h = np.where(x == 0, 2.0 * fc, np.sin(2.0 * _vm.pi * fc * x) / (_vm.pi * np.where(x == 0, 1.0, x)))
+        h = h * w
+        return h / _seq_sum(h)
+
+    h = -(lp(f2) - lp(f1))
+    h[m] += 1.0
+    return h
+
+
+def _keys_row(x: np.ndarray, base: int, t0: float, step: float, n: int) -> np.ndarray:
+    """Keys (a = -1/2) cubic interpolation of x at t0 + (p + 1/2) step,
+    p = 0..n-1; positions in global samples, x[0] is global sample `base`."""
+    pos = t0 + (np.arange(n, dtype=np.float64) + 0.5) * step
+    i = np.floor(pos).astype(np.int64)
+    f = pos - i
+    j = i - base
+    xm1 = x[j - 1].astype(np.float64)
+    x0 = x[j].astype(np.float64)
+    x1 = x[j + 1].astype(np.float64)
+    x2 = x[j + 2].astype(np.float64)
+    wm1 = ((-0.5 * f + 1.0) * f - 0.5) * f
+    w0 = (1.5 * f - 2.5) * f * f + 1.0
+    w1 = ((-1.5 * f + 2.0) * f + 0.5) * f
+    w2 = (0.5 * f - 0.5) * f * f
+    return ((wm1 * xm1 + w0 * x0) + w1 * x1) + w2 * x2
+
+
+class _VidCore:
+    """One polarity's decoder. `sign` multiplies the input so that sync is
+    always the low side here."""
+
+    def __init__(self, owner, sign: int):
+        self.o = owner
+        self.sign = float(sign)
+        self.fs = owner.cfg["fs"]
+        self.S = owner.S
+        self._reset()
+
+    # ---- state ---------------------------------------------------------------
+    def _reset(self):
+        self.have_thr = False
+        self.thr_s = self.thr_h = 0.0
+        self.sm_prev = self.sm_cur = None
+        self.low = False
+        self.lead = 0.0
+        self.track = False
+        self.last_h = None
+        self.acq_n = 0
+        self.acq_d = 0.0
+        self.T = 0.0
+        self.t_last = 0.0
+        self.wide = True
+        self.consec = 0
+        self.miss_run = 0
+        self.lock_acc = []                     # last 64 (accepted, e)
+        self.lpf_mem = 0.0                     # field length seen before a loss
+        self._v_reset()
+        self.render_q = []
+        self.n_lv = 0
+        self.tip_s = self.blank_s = self.sig_s = 0.0
+        self.std = None                        # dict, once known
+        self.std_id = 0
+        self._field_reset()
+
+    def _v_reset(self):
+        self.have_v = False
+        self.v_lock = False
+        self.t_v = 0.0
+        self.cls_v = 0
+        self.field_seq = 0
+        self.ivs = []
+        self.v_coast = 0
+        self.progressive = False
+        self.lpf = 0.0
+
+    def _field_reset(self):
+        self.cur_f = None                      # dict for the field being rendered
+        self.last_f = None                     # the last finished field
+        self.comb_hist = {}
+        self.o._stack_reset()
+
+    # ---- helpers --------------------------------------------------------------
+    def _k(self) -> float:
+        """Scale from 525-line nominal seconds to samples at the measured period."""
+        if self.track:
+            return self.T / _T525
+        return self.fs
+
+    def _acq_range(self):
+        c, fs = self.o.cfg, self.fs
+        if c["standard"] == VID_STD_AUTO:
+            return _ACQ_LO * fs, _ACQ_HI * fs
+        line_hz = (c["custom_line_hz"] if c["standard"] == VID_STD_CUSTOM
+                   else _VID_STD[c["standard"]]["line_hz"])
+        t = fs / line_hz
+        return 0.98 * t, 1.02 * t
+
+    def _expected_lpf(self):
+        c = self.o.cfg
+        if c["standard"] == VID_STD_CUSTOM:
+            return c["custom_lines"] / 2.0
+        if c["standard"] in _VID_STD:
+            return _VID_STD[c["standard"]]["lpf"]
+        return None
+
+    # ---- the slicer -----------------------------------------------------------
+    # The slicer works on a SMOOTHED copy: a box of L = round(fs * 0.5 us)
+    # samples. Sync needs no more than ~2 MHz of bandwidth, and FM noise is
+    # strongest at the band edge, so the box lifts the slicer's SNR by several
+    # dB and keeps a noisy sync tip from fragmenting into short pulses. Both
+    # edges of a pulse are delayed alike, (L - 1) / 2 samples, which is taken
+    # off the edge times; widths are unchanged. The picture is rendered from
+    # the raw samples. Per segment the box is computed from a running sum that
+    # starts afresh at o = i0 - B - L (B = look-back + 1), sequentially in
+    # double, so the C and the twin add the same numbers in the same order.
+    def _smooth(self, i0: int, i1: int):
+        o = self.o
+        L = o.L
+        B = _LOOK_BACK + 1
+        org = i0 - B - L
+        xs = self.sign * o.hist[org + 1 - o.hist_base:i1 - o.hist_base].astype(np.float64)
+        cs = np.empty(xs.size + 1)
+        cs[0] = 0.0
+        np.cumsum(xs, out=cs[1:])
+        n = np.arange(i0 - B, i1)
+        return (cs[n - org] - cs[n - L - org]) / L, i0 - B      # values, global index of [0]
+
+    def _cross(self, sm, base: int, i: int, s: float, down: bool) -> float:
+        """The last crossing of s at or before sample i (smoothed), in fractional
+        samples, before the box delay is taken off."""
+        lo = max(base + 1, i - _LOOK_BACK)
+        for j in range(i, lo - 1, -1):
+            a = float(sm[j - 1 - base])
+            b = float(sm[j - base])
+            if down and a >= s > b:
+                return (j - 1) + (a - s) / (a - b)
+            if (not down) and a <= s < b:
+                return (j - 1) + (s - a) / (b - a)
+        return float(i)
+
+    def segment(self, k: int):
+        o = self.o
+        i0 = k * self.S
+        i1 = i0 + self.S
+        if k >= 1:
+            sm, base = self._smooth(i0, i1)
+            self.sm_prev, self.sm_cur = self.sm_cur, sm[i0 - base:]
+            if self.have_thr:
+                s, h = self.thr_s, self.thr_h
+                d = o.Ld
+                v = sm[i0 - base:]
+                lo = v < s - h
+                hi = v > s + h
+                dec = np.flatnonzero(lo | hi)
+                if dec.size:
+                    typ = lo[dec]
+                    prev = np.empty_like(typ)
+                    prev[0] = self.low
+                    prev[1:] = typ[:-1]
+                    ch = dec[typ != prev]
+                    for j in ch:
+                        gi = i0 + int(j)
+                        if not self.low:
+                            self.low = True
+                            self.lead = self._cross(sm, base, gi, s, True) - d
+                        else:
+                            self.low = False
+                            trail = self._cross(sm, base, gi, s, False) - d
+                            self._pulse(self.lead, trail)
+        end = float(i1 - 1) - o.Ld
+        if self.track:
+            self._coast_until(end, segment_end=True)
+            self._v_flywheel(end)
+        self._render(i1 - 1)
+        self._next_thresholds(k)
+
+    def _next_thresholds(self, k: int):
+        o = self.o
+        if self.track and self.n_lv >= 8:
+            a = self.blank_s - self.tip_s
+            if a > 0.0:
+                self.thr_s = 0.5 * (self.tip_s + self.blank_s)
+                self.thr_h = min(max(3.0 * self.sig_s, 0.05 * a), 0.2 * a)
+                self.have_thr = True
+                return
+        if self.sm_prev is None or self.sm_cur is None:
+            self.have_thr = False
+            return
+        v = np.concatenate([self.sm_prev, self.sm_cur])
+        m = v.size
+        q02 = _order_stat(v, int(0.02 * (m - 1)))
+        q50 = _order_stat(v, (m - 1) // 2)
+        d = q50 - q02
+        if not d > 1e-12:
+            self.have_thr = False
+            return
+        # d <= (1 + white_rel) * A for any picture: 0.15 d + 0.05 d <= 0.7 A
+        # keeps the release level under blank; at a picture at blank (d ~ A)
+        # the entry level 0.10 A is still above the tip.
+        self.thr_s = q02 + 0.15 * d
+        self.thr_h = 0.05 * d
+        self.have_thr = True
+
+    # ---- pulses and the line loop ---------------------------------------------
+    def _classify(self, w: float) -> int:
+        k = self._k()
+        if w < _W_MIN * k or w > _W_MAX * k:
+            return -1
+        if w < _B_EQ_H * k:
+            return 0          # equalizing
+        if w < _B_H_BROAD * k:
+            return 1          # H
+        return 2              # broad
+
+    def _pulse(self, lead: float, trail: float):
+        st = self.o.st
+        if self.track:
+            self._coast_until(lead)
+        cls = self._classify(trail - lead)
+        if cls < 0:
+            st["pulses_rejected"] += 1
+            return
+        if not self.track:
+            if cls == 1:
+                self._acquire(lead)
+            return
+        if cls == 2:
+            self._v_event(lead)
+            return
+        t_pred = self.t_last + self.T
+        win = (_WIN_WIDE if self.wide else _WIN_TRACK) * self._k()
+        if abs(lead - t_pred) <= win:
+            self._accept(lead, cls)
+
+    def _acquire(self, lead: float):
+        lo, hi = self._acq_range()
+        if self.last_h is not None:
+            d = lead - self.last_h
+            if lo <= d <= hi:
+                if self.acq_n == 0 or abs(d - self.acq_d) <= 0.01 * self.acq_d:
+                    self.acq_d = (self.acq_d * self.acq_n + d) / (self.acq_n + 1)
+                    self.acq_n += 1
+                else:
+                    self.acq_n = 1
+                    self.acq_d = d
+            else:
+                self.acq_n = 0
+        self.last_h = lead
+        if self.acq_n >= _ACQ_N:
+            self.track = True
+            self.T = self.acq_d
+            self.t_last = lead
+            self.wide = True
+            self.consec = 0
+            self.miss_run = 0
+            self.lock_acc = []
+            self.o.st["h_relocks"] += 1
+            self._emit_line(lead, True, 0.0, 1)
+
+    def _accept(self, lead: float, cls: int):
+        t_pred = self.t_last + self.T
+        e = lead - t_pred
+        kp, ki = _loop_gains(_BL_WIDE if self.wide else _BL_TRACK)
+        lo, hi = self._acq_range()
+        self.T = min(max(self.T + ki * e, lo), hi)
+        t0 = t_pred + kp * e
+        self.t_last = t0
+        self.consec += 1
+        if self.wide and self.consec >= _WIDE_LINES:
+            self.wide = False
+        self.miss_run = 0
+        self._lock_push(True, e)
+        self.o.st["lines_locked"] += 1
+        self._emit_line(t0, True, e, cls)
+
+    def _coast_until(self, t: float, segment_end: bool = False):
+        while self.track:
+            win = (_WIN_WIDE if self.wide else _WIN_TRACK) * self._k()
+            t_pred = self.t_last + self.T
+            if not (t_pred + win < t):
+                return
+            if segment_end and self.low and self.lead <= t_pred + win:
+                return                       # a pulse in the window is still open
+            self.t_last = t_pred
+            self.consec = 0
+            self.miss_run += 1
+            self._lock_push(False, 0.0)
+            self.o.st["lines_coasted"] += 1
+            self._emit_line(t_pred, False, 0.0, -1)
+            if self.miss_run >= _LOSE_MISSES:
+                self._lose_h()
+
+    def _lock_push(self, acc: bool, e: float):
+        self.lock_acc.append((acc, e))
+        if len(self.lock_acc) > 64:
+            del self.lock_acc[0]
+
+    def _lose_h(self):
+        self.track = False
+        self.last_h = None
+        self.acq_n = 0
+        self.acq_d = 0.0
+        self._v_reset()
+        self.std = None
+        self.std_id = 0
+        self.cur_f = None
+        self.last_f = None
+        self.comb_hist = {}
+        self.o._stack_reset()
+
+    def h_lock(self) -> float:
+        if not self.lock_acc:
+            return 0.0
+        n = len(self.lock_acc)
+        acc = [e for a, e in self.lock_acc if a]
+        if not acc:
+            return 0.0
+        rms = _vm.sqrt(_seq_sum(np.array(acc, dtype=np.float64) ** 2) / len(acc))
+        win = _WIN_TRACK * self._k()
+        return (len(acc) / 64.0) * max(0.0, 1.0 - rms / win) if n else 0.0
+
+    # ---- fields ---------------------------------------------------------------
+    def _v_event(self, tb: float):
+        if not self.track:
+            return
+        lmin = 0.75 * self.lpf if self.v_lock else 150.0
+        if self.have_v and (tb - self.t_v) < lmin * self.T:
+            return
+        q = (tb - self.t_last) / self.T
+        phi = q - _vm.floor(q)
+        cls = 0 if (phi < 0.25 or phi >= 0.75) else 1
+        n_half = _vm.floor(2.0 * q + 0.5)
+        t_v = self.t_last + n_half * 0.5 * self.T
+        if self.have_v:
+            self.ivs.append((t_v - self.t_v) / self.T)
+            if len(self.ivs) > 2:
+                del self.ivs[0]
+            self.progressive = (cls == self.cls_v)
+        self.t_v = t_v
+        self.cls_v = cls
+        self.field_seq += 1
+        self.have_v = True
+        self.v_coast = 0
+        self.o.st["fields"] += 1
+        self._v_judge()
+
+    def _v_judge(self):
+        was = self.v_lock
+        ok = False
+        if len(self.ivs) == 1 and self.lpf_mem > 0.0:
+            # back after a loss: one field interval that matches the field
+            # length known before is enough (it is the same source)
+            ok = abs(self.ivs[0] - self.lpf_mem) <= 1.0
+            if ok:
+                self.ivs = [self.ivs[0], self.lpf_mem]
+        if len(self.ivs) == 2 and not ok:
+            a, b = self.ivs
+            ok = abs(a - b) <= 1.0 and _LPF_MIN <= a <= _LPF_MAX and _LPF_MIN <= b <= _LPF_MAX
+            exp = self._expected_lpf()
+            if ok and exp is not None:
+                ok = abs(0.5 * (a + b) - exp) <= 2.0
+        self.v_lock = ok
+        if ok:
+            self.lpf = 0.5 * (self.ivs[0] + self.ivs[1])
+            self.lpf_mem = self.lpf
+            self._decide_std()
+            if not was:
+                self.o.st["v_relocks"] += 1
+
+    def _decide_std(self):
+        c = self.o.cfg
+        line_hz = self.fs / self.T
+        sid = c["standard"]
+        if sid == VID_STD_AUTO:
+            sid = VID_STD_CUSTOM
+            for cand in (VID_STD_525, VID_STD_625):
+                n = _VID_STD[cand]
+                if abs(line_hz - n["line_hz"]) <= 0.005 * n["line_hz"] and abs(self.lpf - n["lpf"]) <= 2.0:
+                    sid = cand
+                    break
+        if sid in _VID_STD:
+            n = _VID_STD[sid]
+            tn = 1.0 / n["line_hz"]
+            std = dict(a0f=n["a0"] / tn, laf=n["la"] / tn, vbi=n["vbi"], visible=n["visible"],
+                       black_rel=n["black_rel"], white_rel=n["white_rel"], fsc=n["fsc"],
+                       comb_lag=n["comb_lag"], la_s=n["la"])
+        else:
+            vbi = int(_vm.floor(0.07 * self.lpf + 0.5))
+            std = dict(a0f=(122.0 / 13.5e6) / _T525, laf=(720.0 / 13.5e6) / _T525, vbi=vbi,
+                       visible=int(_vm.floor(self.lpf)) - vbi - 2, black_rel=0.0, white_rel=2.5,
+                       fsc=0.0, comb_lag=1, la_s=(720.0 / 13.5e6) / _T525 / line_hz)
+        prog = self.progressive or c["fields"] == VID_PROGRESSIVE
+        key = (sid, std["visible"], prog)
+        if self.std is None or self.std_key != key:
+            self.std = std
+            self.std_key = key
+            self.std_id = sid
+            self.cur_f = None
+            self.last_f = None
+            self.comb_hist = {}
+            self.o._stack_reset()
+            self.trap = None
+            if c["yc"] == VID_YC_TRAP and std["fsc"] > 0.0:
+                self.trap = _trap_taps(std["fsc"], c["width"] / std["la_s"])
+
+    def _v_flywheel(self, end: float):
+        while self.v_lock and self.have_v:
+            dead = self.t_v + (self.lpf + 3.0) * self.T
+            if not end > dead:
+                return
+            self.t_v = self.t_v + self.lpf * self.T
+            if not self.progressive:
+                self.cls_v ^= 1
+            self.field_seq += 1
+            self.v_coast += 1
+            self.o.st["fields"] += 1
+            if self.v_coast > 4:
+                self.v_lock = False
+                self.have_v = False
+                self.ivs = []
+
+    def _emit_line(self, t0: float, acc: bool, e: float, pcls: int):
+        if self.have_v:
+            y = (t0 - self.t_v) / self.T
+            rec = (t0, acc, pcls, self.field_seq, y, self.cls_v, self.v_lock, self.T)
+        else:
+            rec = (t0, acc, pcls, -1, 0.0, 0, False, self.T)
+        self.render_q.append(rec)
+
+    # ---- rendering ------------------------------------------------------------
+    def _render(self, last_idx: int):
+        o = self.o
+        q = self.render_q
+        n_done = 0
+        for rec in q:
+            t0, acc, pcls, fseq, y, cls, vl, T = rec
+            std = self.std
+            laf = std["laf"] if std else (720.0 / 13.5e6) / _T525
+            a0f = std["a0f"] if std else (122.0 / 13.5e6) / _T525
+            need = int(_vm.ceil(t0 + (a0f + laf) * T)) + 3
+            if need > last_idx:
+                break
+            n_done += 1
+            if int(_vm.floor(t0)) - 2 < o.hist_base:
+                continue                     # fell out of history: skip, never guess
+            self._render_line(rec)
+        if n_done:
+            del q[:n_done]
+
+    def _window(self, t0: float, a: float, b: float, T: float) -> np.ndarray:
+        o = self.o
+        k = T / _T525
+        ia = int(_vm.ceil(t0 + a * k))
+        ib = int(_vm.floor(t0 + b * k))
+        if ib < ia:
+            return np.empty(0)
+        return self.sign * o.hist[ia - o.hist_base:ib + 1 - o.hist_base].astype(np.float64)
+
+    def _render_line(self, rec):
+        t0, acc, pcls, fseq, y, cls, vl, T = rec
+        line_blank = None
+        if acc and pcls == 1:
+            tw = self._window(t0, _TIP_A, _TIP_B, T)
+            bw = self._window(t0, _BLANK_A, _BLANK_B, T)
+            sw = self._window(t0, _SIG_A, _SIG_B, T)
+            if tw.size and bw.size and sw.size >= 2:
+                tip = _order_stat(tw, (tw.size - 1) // 2)
+                blank = _order_stat(bw, (bw.size - 1) // 2)
+                m = sw.size
+                s1 = _seq_sum(sw)
+                s2 = _seq_sum(sw * sw)
+                var = s2 / m - (s1 / m) * (s1 / m)
+                sig = _vm.sqrt(var) if var > 0.0 else 0.0
+                if self.n_lv == 0:
+                    self.tip_s, self.blank_s, self.sig_s = tip, blank, sig
+                else:
+                    self.tip_s += (tip - self.tip_s) / 8.0
+                    self.blank_s += (blank - self.blank_s) / 8.0
+                    self.sig_s += (sig - self.sig_s) / 64.0
+                self.n_lv += 1
+                line_blank = blank
+        if fseq < 0 or not vl or self.std is None:
+            return
+        # field bookkeeping: the first line of a new field finishes the last one
+        if self.cur_f is None or self.cur_f["seq"] != fseq:
+            if self.cur_f is not None:
+                self._finish_field(self.cur_f)
+            self.cur_f = self._new_field(fseq, cls)
+        std = self.std
+        off = 0.5 if cls == 1 else 0.0
+        kk = int(_vm.floor(y - off - std["vbi"] + 0.5))
+        if not 0 <= kk < std["visible"]:
+            return
+        a = self.blank_s - self.tip_s
+        if not a > 0.0:
+            return
+        o = self.o
+        W = o.cfg["width"]
+        blank = line_blank if line_blank is not None else self.blank_s
+        v = _keys_row(o.hist, o.hist_base, t0 + std["a0f"] * T, std["laf"] * T / W, W)
+        if self.sign < 0:
+            v = -v
+        yc = o.cfg["yc"]
+        if yc == VID_YC_COMB:
+            lag = std["comb_lag"]
+            hist = self.comb_hist.setdefault(fseq, [])
+            raw = v
+            if len(hist) >= lag:
+                v = 0.5 * (v + hist[-lag])
+            hist.append(raw)
+            if len(hist) > 2:
+                del hist[0]
+        elif yc == VID_YC_TRAP and self.trap is not None:
+            h = self.trap
+            mtap = (h.size - 1) // 2
+            base_i = np.arange(W)
+            acc = np.zeros(W)
+            for t in range(h.size):                 # sequential over taps, as the C sums
+                acc = acc + h[t] * v[np.clip(base_i + t - mtap, 0, W - 1)]
+            v = acc
+        black = blank + a * std["black_rel"]
+        white = blank + a * std["white_rel"]
+        pix = np.clip((v - black) / (white - black), 0.0, 1.0).astype(np.float32)
+        f = self.cur_f
+        f["rows"][kk] = pix
+        f["filled"][kk] = True
+        if f["t0"] is None or t0 < f["t0"]:
+            f["t0"] = t0
+
+    def _new_field(self, fseq: int, cls: int) -> dict:
+        std = self.std
+        W = self.o.cfg["width"]
+        if self.comb_hist:
+            for kq in [q for q in self.comb_hist if q < fseq]:
+                del self.comb_hist[kq]
+        return dict(seq=fseq, cls=cls, rows=np.zeros((std["visible"], W), np.float32),
+                    filled=np.zeros(std["visible"], bool), t0=None)
+
+    def _finish_field(self, f: dict):
+        o = self.o
+        self.o.st["fields_rendered"] += 1
+        if not f["filled"].any():
+            self.last_f = f
+            return
+        mode = o.cfg["fields"]
+        prog = self.progressive or mode == VID_PROGRESSIVE
+        std = self.std
+        W = o.cfg["width"]
+        if prog:
+            frame = f["rows"].copy()
+            self._emit(frame, f["t0"], True)
+        elif mode == VID_ONE_FIELD:
+            frame = np.repeat(f["rows"], 2, axis=0)
+            self._emit(frame, f["t0"], False)
+        else:
+            last = self.last_f
+            if f["cls"] == 1 and last is not None and last["cls"] == 0 and last["seq"] == f["seq"] - 1:
+                frame = np.zeros((2 * std["visible"], W), np.float32)
+                top, bot = (last, f) if not o.cfg["swap_fields"] else (f, last)
+                frame[0::2] = top["rows"]
+                frame[1::2] = bot["rows"]
+                self._emit(frame, last["t0"] if last["t0"] is not None else f["t0"], False)
+        self.last_f = f
+
+    def _emit(self, frame: np.ndarray, t0, prog: bool):
+        o = self.o
+        if not o._emitting(self):
+            return
+        snr = 20.0 * _vm.log10((self.blank_s - self.tip_s) / self.sig_s) if self.sig_s > 0.0 else 99.0
+        meta = dict(sample0=int(_vm.floor(t0)) if t0 is not None else 0,
+                    standard=self.std_id, polarity=1 if self.sign > 0 else 2,
+                    progressive=1 if prog else 0, field_order=int(o.cfg["swap_fields"]),
+                    width=int(frame.shape[1]), lines=int(frame.shape[0]),
+                    line_hz=self.fs / self.T, lines_per_field=self.lpf,
+                    h_lock=float(np.float32(self.h_lock())), v_lock=1 if self.v_lock else 0,
+                    snr_db=float(np.float32(snr)), stacked=1)
+        a = self.blank_s - self.tip_s
+        std = self.std
+        sig_p = self.sig_s / (a * (std["white_rel"] - std["black_rel"])) if a > 0 else 0.0
+        out, stacked = o._stack(frame, sig_p)
+        meta["stacked"] = stacked
+        o._queue(out, meta)
+
+
+class Video:
+    """Twin of atkdsp_video (atkdsp.h §32): composite in, luma frames out.
+    Options are the atkdsp_video_config fields as keywords."""
+
+    def __init__(self, **cfg):
+        c = video_defaults()
+        for key, v in cfg.items():
+            if key not in c:
+                raise ValueError(f"unknown video option {key!r}")
+            c[key] = v
+        c = _vid_norm(c)
+        why = _video_check(c)
+        if why:
+            raise ValueError(f"video refused: {why}")
+        self.cfg = c
+        self.S = int(_vm.floor(c["fs"] * _SEG_S + 0.5))
+        self.L = max(1, int(_vm.floor(c["fs"] * _BOX_S + 0.5)))   # the slicer's box
+        self.Ld = 0.5 * (self.L - 1)                               # its delay, samples
+        self.st = dict(samples_in=0, lines_locked=0, lines_coasted=0, pulses_rejected=0,
+                       fields=0, fields_rendered=0, frames_out=0, frames_dropped=0,
+                       h_relocks=0, v_relocks=0, polarity_flips=0)
+        self._pending = None
+        self._full_reset()
+
+    def _full_reset(self):
+        self.hist = np.zeros(0, np.float32)
+        self.hist_base = 0
+        self.nseg = 0
+        self.buf = np.zeros(0, np.float32)
+        self.queue = []
+        self._stack_avg = None
+        self._stack_n = None
+        self.committed = None
+        self._last_sign = None
+        pol = self.cfg["polarity"]
+        signs = (1, -1) if pol == VID_POL_AUTO else ((1,) if pol == VID_POL_NORMAL else (-1,))
+        self.cores = []
+        for s in signs:
+            self.cores.append(_VidCore(self, s))
+        if pol != VID_POL_AUTO:
+            self.committed = self.cores[0]
+
+    def reset(self):
+        self._full_reset()
+
+    def set(self, **cfg):
+        """New settings at the next segment boundary. Display settings change
+        in place; a new standard, custom timing or polarity re-acquires."""
+        c = dict(self._pending or self.cfg)
+        for key, v in cfg.items():
+            if key not in c:
+                raise ValueError(f"unknown video option {key!r}")
+            c[key] = v
+        c = _vid_norm(c)
+        why = _video_check(c)
+        if why:
+            raise ValueError(f"video set refused: {why}")
+        if c["fs"] != self.cfg["fs"]:
+            raise ValueError("video set refused: fs cannot change (create a new one)")
+        self._pending = c
+
+    def _apply_pending(self):
+        c, self._pending = self._pending, None
+        old = self.cfg
+        self.cfg = c
+        reacq = any(c[k] != old[k] for k in ("standard", "custom_line_hz", "custom_lines", "polarity"))
+        if reacq:
+            hist, base, nseg, buf, queue = self.hist, self.hist_base, self.nseg, self.buf, self.queue
+            self._full_reset()
+            self.hist, self.hist_base, self.nseg, self.buf, self.queue = hist, base, nseg, buf, queue
+            return
+        geom = any(c[k] != old[k] for k in ("width", "fields", "yc", "swap_fields"))
+        if c["width"] != old["width"] and self.queue:
+            self.st["frames_dropped"] += len(self.queue)     # frames of the old width
+            self.queue = []
+        for core in self.cores:
+            if geom and core.std is not None:
+                core.std = None                  # rebuilt (with its trap) at the next field
+                core.std_key = None
+                core.cur_f = None
+                core.last_f = None
+                core.comb_hist = {}
+                if core.v_lock:
+                    core._decide_std()
+        if geom or c["stack"] != old["stack"] or c["motion_aware"] != old["motion_aware"]:
+            self._stack_reset()
+
+    # ---- the stream -----------------------------------------------------------
+    def process(self, x) -> int:
+        a = np.ascontiguousarray(x, dtype=np.float32).ravel()
+        self.st["samples_in"] += a.size
+        self.buf = np.concatenate([self.buf, a])
+        S = self.S
+        while self.buf.size >= S:
+            if self._pending is not None:
+                self._apply_pending()
+            seg, self.buf = self.buf[:S], self.buf[S:]
+            self._segment(seg)
+        return len(self.queue)
+
+    def _segment(self, seg: np.ndarray):
+        S = self.S
+        k = self.nseg
+        self.hist = np.concatenate([self.hist, seg])
+        keep = _HIST_SEGS * S
+        if self.hist.size > keep:
+            drop = self.hist.size - keep
+            self.hist = self.hist[drop:]
+            self.hist_base += drop
+        if self.committed is not None:
+            self.committed.segment(k)            # the other polarity is frozen
+        else:
+            for core in self.cores:
+                core.segment(k)
+        self.nseg += 1
+        self._commit()
+
+    def _commit(self):
+        """AUTO polarity: both cores race until one has field lock; it is
+        committed and the other frozen. A committed core that loses line lock
+        is released, and the frozen one starts again from nothing."""
+        if self.cfg["polarity"] != VID_POL_AUTO:
+            return
+        if self.committed is not None:
+            if not self.committed.track:
+                lost, self.committed = self.committed, None
+                for core in self.cores:          # the lost one keeps what it knew
+                    if core is not lost:
+                        core._reset()
+            return
+        for core in self.cores:                  # normal first: it wins a tie
+            if core.v_lock:
+                if self._last_sign is not None and self._last_sign != core.sign:
+                    self.st["polarity_flips"] += 1
+                self._last_sign = core.sign
+                self.committed = core
+                return
+
+    def _emitting(self, core) -> bool:
+        return self.committed is core
+
+    # ---- stacking -------------------------------------------------------------
+    def _stack_reset(self):
+        self._stack_avg = None
+        self._stack_n = None
+
+    def _stack(self, f: np.ndarray, sig_p: float):
+        N = self.cfg["stack"]
+        if N <= 1:
+            return f, 1
+        H, W = f.shape
+        bh, bw = (H + 7) // 8, (W + 7) // 8
+        if self._stack_avg is None or self._stack_avg.shape != f.shape:
+            self._stack_avg = f.copy()
+            self._stack_n = np.ones((bh, bw), np.int32)
+            return f.copy(), 1
+        avg = self._stack_avg
+        nb = self._stack_n
+        fd = f.astype(np.float64)
+        ad = avg.astype(np.float64)
+        for by in range(bh):
+            y0, y1 = by * 8, min(H, by * 8 + 8)
+            for bx in range(bw):
+                x0, x1 = bx * 8, min(W, bx * 8 + 8)
+                d = fd[y0:y1, x0:x1] - ad[y0:y1, x0:x1]
+                n = int(nb[by, bx])
+                reset = False
+                if self.cfg["motion_aware"] and sig_p > 0.0:
+                    m = d.size
+                    mad = _seq_sum(np.abs(d).ravel()) / m
+                    sd = sig_p * _vm.sqrt(1.0 + 1.0 / n)
+                    thr = sd * (_vm.sqrt(2.0 / _vm.pi) + 4.0 * _vm.sqrt(1.0 - 2.0 / _vm.pi) / _vm.sqrt(m))
+                    reset = mad > thr
+                if reset:
+                    nb[by, bx] = 1
+                    avg[y0:y1, x0:x1] = f[y0:y1, x0:x1]
+                else:
+                    n = min(n + 1, N)
+                    nb[by, bx] = n
+                    avg[y0:y1, x0:x1] = (ad[y0:y1, x0:x1] + d / n).astype(np.float32)
+        flat = nb.ravel()
+        return avg.copy(), int(np.partition(flat, (flat.size - 1) // 2)[(flat.size - 1) // 2])
+
+    def _queue(self, frame: np.ndarray, meta: dict):
+        self.st["frames_out"] += 1
+        self.queue.append((frame, meta))
+        if len(self.queue) > _QUEUE:
+            del self.queue[0]
+            self.st["frames_dropped"] += 1
+
+    # ---- out ------------------------------------------------------------------
+    def frame(self):
+        """(pixels H x W float32, meta dict) for the oldest waiting frame, or None."""
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
+
+    def stats(self) -> dict:
+        return dict(self.st)
+
+    def describe(self) -> str:
+        c = self.cfg
+        core = self.committed or (self.cores[0] if self.cores else None)
+        parts = []
+        if core is None or not core.track:
+            parts.append("searching for line sync")
+        else:
+            h = core.h_lock()
+            if core.v_lock:
+                parts.append(f"{_VID_STD_NAMES.get(core.std_id, 'standard unknown')}, "
+                             + ("progressive" if core.progressive else "interlaced")
+                             + f", locked (H {h:.2f}, V yes)")
+                parts.append(f"{core.fs / core.T:.1f} Hz line rate, {core.lpf:.1f} lines a field")
+            else:
+                parts.append(f"line-rate pulses at {core.fs / core.T:.1f} Hz but no fields yet"
+                             f" (H {h:.2f}, V no)")
+        px = c["width"]
+        real = min(px, int(c["fs"] * (720.0 / 13.5e6)))
+        parts.append(f"{px} px of which about {real} are real at {c['fs'] / 1e6:.3g} MS/s")
+        yc = {VID_YC_OFF: "chroma passed", VID_YC_TRAP: "chroma trap", VID_YC_COMB: "line comb"}[c["yc"]]
+        if c["yc"] == VID_YC_TRAP and core is not None and core.std is not None and getattr(core, "trap", None) is None:
+            yc = "chroma trap OFF (no subcarrier for this standard, or too few pixels)"
+        parts.append(yc)
+        parts.append(f"stack {c['stack']}" + (" motion-aware" if c["motion_aware"] and c["stack"] > 1 else ""))
+        pol = {VID_POL_AUTO: "auto", VID_POL_NORMAL: "set", VID_POL_INVERTED: "set"}[c["polarity"]]
+        if core is not None:
+            parts.append(("normal" if core.sign > 0 else "inverted") + f" polarity ({pol})")
+        return "video: " + ", ".join(parts) + "."
+
+
+def _vid_norm(c: dict) -> dict:
+    c = dict(c)
+    c["fs"] = float(c["fs"])
+    c["custom_line_hz"] = float(c["custom_line_hz"])
+    for k in ("standard", "custom_lines", "polarity", "yc", "fields", "swap_fields", "width",
+              "stack", "motion_aware"):
+        c[k] = int(c[k])
+    return c
+
+
+# ---- the test-pattern generator (known answers) --------------------------------
+def video_pattern(kind: str, rows: int, width: int = 720, frame_no: int = 0) -> np.ndarray:
+    """A picture with known answers, 0 = black .. 1 = white.
+    'crosshatch': white lines on grey at columns 64k+32 and rows 48k+24;
+    'ramp': eight vertical bars, 0, 1/7 .. 1;
+    'flat': mid grey; 'movingbar': a 16-px white bar below row 48 that moves
+    16 px a frame. Every kind carries the frame counter: frame_no as 16 bits,
+    MSB first, in 24-px-wide blocks at columns 48 + 24 b, rows 8..39 (1 = 0.9, 0 = 0.1)."""
+    img = np.full((rows, width), 0.5, np.float32)
+    if kind == "crosshatch":
+        img[:] = 0.3
+        for c0 in range(32, width, 64):
+            img[:, c0 - 1:c0 + 2] = 1.0
+        for r0 in range(24, rows, 48):
+            img[r0, :] = 1.0
+    elif kind == "ramp":
+        bars = 8
+        for b in range(bars):
+            img[:, b * width // bars:(b + 1) * width // bars] = b / (bars - 1.0)
+    elif kind == "movingbar":
+        img[:] = 0.3
+        c0 = 60 + (16 * int(frame_no)) % max(1, width - 140)
+        img[48:, c0:c0 + 16] = 1.0
+    elif kind != "flat":
+        raise ValueError(f"unknown pattern {kind!r}")
+    for b in range(16):
+        bit = (int(frame_no) >> (15 - b)) & 1
+        c0 = 48 + 24 * b
+        if c0 + 20 <= width and rows > 40:
+            img[8:40, c0 + 2:c0 + 22] = 0.9 if bit else 0.1
+    return img
+
+
+def video_read_counter(frame: np.ndarray):
+    """The frame counter back out of a decoded frame, or None when unreadable."""
+    if frame.shape[0] <= 40 or frame.shape[1] < 48 + 24 * 16:
+        return None
+    n = 0
+    for b in range(16):
+        c0 = 48 + 24 * b
+        v = float(np.median(frame[12:36, c0 + 6:c0 + 18]))
+        if v > 0.65:
+            n = (n << 1) | 1
+        elif v < 0.35:
+            n = n << 1
+        else:
+            return None
+    return n
+
+
+def video_synth(standard: int = VID_STD_525, fs: float = 13.5e6, seconds: float = 0.1,
+                pattern: str = "crosshatch", frame0: int = 0, line_hz: float = 0.0,
+                lines: int = 0, progressive: bool = False, burst: bool = True,
+                chroma: float = 0.0, start_lines: float = 3.25, rise: float = 140e-9,
+                width: int = 720):
+    """Composite video with the standard's exact sync structure.
+
+    Levels are in units of the sync amplitude (blank 0, sync tip -1, white
+    white_rel). The picture is `pattern` (video_pattern) carrying the frame
+    counter. Field A of every frame has its vertical reference (the first
+    broad pulse) at a line start and field B half a line later, so A carries
+    the even frame rows and B the odd ones (the decoder's geometry, §3.4).
+    `standard` VID_STD_525 / VID_STD_625, or VID_STD_CUSTOM with line_hz and
+    lines (a frame, odd). `progressive`: every field is an A field with
+    floor(lines / 2) lines (240p / 288p style). Returns (x float32, truth)."""
+    if standard in _VID_STD:
+        n = _VID_STD[standard]
+        lhz = n["line_hz"]
+        lines_frame = int(round(2 * n["lpf"]))
+        n_eq = n_b = 6 if standard == VID_STD_525 else 5
+        a0, la, vbi, visible = n["a0"], n["la"], n["vbi"], n["visible"]
+        black_rel, white_rel, fsc = n["black_rel"], n["white_rel"], n["fsc"]
+        w_h, w_eq, w_b = n["w_h"], n["w_eq"], n["w_broad"]
+        burst_t, burst_cyc = (5.3e-6, 9) if standard == VID_STD_525 else (5.6e-6, 10)
+        burst_amp = 0.5
+    else:
+        lhz = float(line_hz)
+        lines_frame = int(lines)
+        n_eq = n_b = 6
+        k = (1.0 / lhz) / _T525
+        a0, la = 122.0 / 13.5e6 * k, 720.0 / 13.5e6 * k
+        lpf = lines_frame / 2.0
+        vbi = int(_vm.floor(0.07 * lpf + 0.5))
+        visible = int(_vm.floor(lpf)) - vbi - 2
+        black_rel, white_rel, fsc = 0.0, 2.5, 0.0
+        w_h, w_eq, w_b = 4.7e-6 * k, 2.3e-6 * k, 27.1e-6 * k
+        burst, burst_t, burst_cyc, burst_amp = False, 0.0, 0, 0.0
+    T = 1.0 / lhz
+    half = T / 2.0
+    vA = n_eq + (n_eq & 1)                    # A's reference on an even slot: a line start
+    r0 = vA - n_eq                            # where A's vertical interval begins
+    if progressive:
+        Fh = 2 * (lines_frame // 2)           # half-lines a field, no half line
+        reg = Fh                              # one region a period: every field is A
+    else:
+        if lines_frame % 2 == 0:
+            raise ValueError("an interlaced frame has an odd number of lines")
+        Fh = 2 * lines_frame                  # half-lines a frame
+        reg = lines_frame                     # each field's region, in half-lines (odd)
+    nsamp = int(round(seconds * fs))
+    t = (np.arange(nsamp, dtype=np.float64) / fs) + start_lines * T
+    jh = np.floor(t / half).astype(np.int64)            # global half-line slot
+    u = t - jh * half
+
+    def edge(z):                                          # 0 -> 1 raised-cosine step
+        return np.where(z <= -0.5, 0.0, np.where(z >= 0.5, 1.0, 0.5 * (1.0 + np.sin(np.pi * z))))
+
+    def pulse(uu, w):
+        return edge(uu / rise) - edge((uu - w) / rise)
+
+    def place(slot):
+        """(is_B, srel): which field a half-line slot is in, and its slot within it."""
+        sa = np.mod(slot - r0, Fh)
+        inb = sa >= reg
+        return inb, np.where(inb, sa - reg, sa)
+
+    inB, srel = place(jh)
+    vi_end = 2 * n_eq + n_b
+    is_eq = (srel < n_eq) | ((srel >= n_eq + n_b) & (srel < vi_end))
+    is_b = (srel >= n_eq) & (srel < n_eq + n_b)
+    is_line = (srel >= vi_end) & (np.mod(jh, 2) == 0)
+    sync = np.where(is_eq, pulse(u, w_eq), 0.0)
+    sync = np.where(is_b, pulse(u, w_b), sync)
+    sync = np.where(is_line, pulse(u, w_h), sync)
+    jline = jh - np.mod(jh, 2)                            # the line's start slot (even)
+    tau = t - jline * half                                # time from the line's 0H
+    inB_l, srel_l = place(jline)
+    y = (srel_l - n_eq) / 2.0                             # lines from the field's reference
+    kk = np.floor(y - np.where(inB_l, 0.5, 0.0) - vbi + 0.5).astype(np.int64)
+    if progressive:
+        frow = kk
+        rows_total = visible
+    else:
+        frow = np.where(inB_l, 2 * kk + 1, 2 * kk)
+        rows_total = 2 * visible
+    picline = srel_l >= vi_end
+    vis = picline & (kk >= 0) & (kk < visible) & (tau >= a0) & (tau < a0 + la)
+    fr_line = np.floor_divide(jline - r0, Fh)
+    pic = np.zeros(nsamp)
+    truth_frames = {}
+    if vis.any():
+        for fno in np.unique(fr_line[vis]):
+            img = video_pattern(pattern, rows_total, width, frame0 + int(fno))
+            truth_frames[int(fno)] = img
+            sel = vis & (fr_line == fno)
+            px = (tau[sel] - a0) / la * width - 0.5
+            p0 = np.clip(np.floor(px).astype(np.int64), 0, width - 1)
+            p1 = np.clip(p0 + 1, 0, width - 1)
+            fr = np.clip(px - np.floor(px), 0.0, 1.0)
+            rr = np.clip(frow[sel], 0, rows_total - 1)
+            val = img[rr, p0] * (1.0 - fr) + img[rr, p1] * fr
+            pic[sel] = black_rel + val * (white_rel - black_rel)
+    x = pic - sync
+    if burst and fsc > 0.0:
+        bur = picline & (tau >= burst_t) & (tau < burst_t + burst_cyc / fsc)
+        x = x + np.where(bur, burst_amp * np.sin(2 * np.pi * fsc * t), 0.0)
+    if chroma > 0.0 and fsc > 0.0:
+        x = x + np.where(vis, chroma * np.sin(2 * np.pi * fsc * t), 0.0)
+    truth = dict(standard=standard, fs=fs, line_hz=lhz, lines_frame=lines_frame, visible=visible,
+                 vbi=vbi, frames=truth_frames, frame0=frame0, progressive=progressive,
+                 rows=rows_total, start_lines=start_lines, width=width,
+                 white_rel=white_rel, black_rel=black_rel)
+    return x.astype(np.float32), truth
+
+
+def video_fm(x: np.ndarray, fs: float, dev_hz: float = 1.5e6, cnr_db: float | None = None,
+             cfo_hz: float = 0.0, seed: int = 0, centre: float = 0.75) -> np.ndarray:
+    """FM-modulate composite (sync tip -1 .. white ~2.5) to complex baseband:
+    dev_hz of deviation per unit about `centre` (so sync tip to white swings
+    +-1.75 dev_hz), then AWGN at cnr_db (carrier to noise over the sampled
+    band) and a carrier offset. Test helper; the receiver is video_fm_demod."""
+    ph = 2.0 * np.pi * np.cumsum((x.astype(np.float64) - centre) * dev_hz + cfo_hz) / fs
+    z = np.exp(1j * ph)
+    if cnr_db is not None:
+        rng = np.random.default_rng(seed)
+        s = 10.0 ** (-cnr_db / 20.0) / np.sqrt(2.0)
+        z = z + s * (rng.standard_normal(z.size) + 1j * rng.standard_normal(z.size))
+    return z.astype(np.complex64)
+
+
+def video_fm_demod(z: np.ndarray, fs: float, dev_hz: float = 1.5e6, lp_hz: float = 5e6) -> np.ndarray:
+    """Discriminator (the angle of z[n] z*[n-1], atkdsp_fm_demod's arithmetic up
+    to scale) then a 63-tap Hamming low-pass at lp_hz — the front end ATK puts
+    before the kernel. Output in the composite's units."""
+    z = np.asarray(z, np.complex64)
+    d = np.angle(z[1:] * np.conj(z[:-1])).astype(np.float64)
+    d = np.concatenate([[0.0], d]) * fs / (2.0 * np.pi * dev_hz)
+    n = 63
+    m = (n - 1) // 2
+    k = np.arange(n) - m
+    fc = lp_hz / fs
+    h = np.where(k == 0, 2 * fc, np.sin(2 * np.pi * fc * k) / (np.pi * np.where(k == 0, 1, k)))
+    h *= 0.54 - 0.46 * np.cos(2 * np.pi * np.arange(n) / (n - 1))
+    h /= h.sum()
+    y = np.convolve(d, h, mode="same")
+    return y.astype(np.float32)

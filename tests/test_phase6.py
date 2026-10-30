@@ -677,3 +677,122 @@ def test_method_table_c_equals_twin():
         t = ref.method(mid)
         assert c is not None and t is not None
         assert c[3] == t[3]                                # the country tag (Bill's menu grouping)
+
+
+# =============================================================================
+# v0.23: the eigen tie, 2-adic decimation averaging, the Frobenius parity
+# stack, and chips regenerated from the named generator
+# =============================================================================
+def _dist(chips, code):
+    c = np.asarray(chips, int)
+    if c.size != code.size:
+        return None
+    return min(int(np.sum(c != sg * np.roll(code, sh))) for sg in (1, -1) for sh in range(code.size))
+
+
+def test_the_window_boundary_tie_no_longer_breaks_decodes():
+    """When the code's start meets the window's, lambda2 ~ lambda1 and the
+    eigenvector is a MIXTURE; before v0.23, 8 of 40 decodes here came back
+    wrong (measured). Any tie now re-cuts the windows."""
+    code = mseq(ref.primitive_polys(7)[0], 7)
+    N = code.size * 4
+    for seed in range(20):
+        x = dsss_signal(code, 4, 400, -10.0, np.random.default_rng(5000 + seed))
+        chips, res = ref.dsss_code(x, ref.dsss_code_defaults(1.0, 0.25, float(N)))
+        assert _dist(chips, code) == 0, (seed, res["name"], res["lambda2"] / res["lambda1"])
+
+
+def test_decimation_averaging_cleans_an_m_sequence():
+    """127 chips, -18 dB, 150 periods: the vote alone leaves 2-5 chip errors
+    (measured); averaged over the 7 decimations the chips are exact, so
+    Berlekamp-Massey names the code without parity."""
+    code = mseq(ref.primitive_polys(7)[0], 7)
+    N = code.size * 2
+    for seed in (900, 901, 902, 903, 905):
+        x = dsss_signal(code, 2, 150, -18.0, np.random.default_rng(seed))
+        chips, res = ref.dsss_code(x, ref.dsss_code_defaults(1.0, 0.5, float(N)))
+        assert res["flags"] & ref.CODE_DECIM, seed
+        assert _dist(chips, code) <= 1, (seed, _dist(chips, code))
+        assert res["name"].startswith("m-sequence (127)")
+
+
+def test_decimation_averaging_leaves_a_gold_code_alone():
+    g = gold(R5[0], R5[1], 5, 3)
+    x = dsss_signal(g, 4, 3000, -2, np.random.default_rng(21))
+    chips, res = ref.dsss_code(x, ref.dsss_code_defaults(1.0, 0.25, float(g.size * 4)))
+    assert not (res["flags"] & ref.CODE_DECIM)
+    assert _match_code(chips, g)
+
+
+def test_parity_frob_counts_every_image():
+    for r in (5, 7):
+        for p in ref.primitive_polys(r)[:3]:
+            c = ref.mseq_from_poly(p, r)
+            assert ref.parity_z(c, p, r) == c.size                 # the generator's own checks all hold
+            z, n = ref.parity_z_frob(c, p, r)
+            assert (z, n) == (r * c.size, r * c.size)
+
+
+@needs_lib
+def test_parity_frob_c_equals_twin():
+    rng = np.random.default_rng(3)
+    for r in (5, 7):
+        c = ref.mseq_from_poly(ref.primitive_polys(r)[0], r).copy()
+        c[rng.random(c.size) < 0.1] *= -1
+        for p in ref.primitive_polys(r)[:6]:
+            assert ref.parity_z_frob(c, p, r) == atkdsp.parity_z_frob(c, p, r)
+
+
+@needs_lib
+def test_the_stack_names_through_chip_errors_and_not_on_noise():
+    """At 16 % chip errors the stack names a 127-chip generator where plain
+    parity mostly cannot (measured 39/40 against 15/40); on random chips it
+    stays near its design rate (each image counted in the threshold — a
+    plain sum threshold false-named 5x its design at 31 chips, measured)."""
+    r = 7
+    polys = ref.primitive_polys(r)
+    k = ref._norm_isf(1e-3 / (len(polys) * r))
+    true = polys[0]
+    c0 = ref.mseq_from_poly(true, r)
+    named = plain = 0
+    for t in range(40):
+        c = c0.copy(); c[np.random.default_rng(t).random(c.size) < 0.16] *= -1
+        zs = max((atkdsp.parity_z_frob(cc, p, r)[0] / math.sqrt(r * c.size), p) for cc in (c, -c) for p in polys)
+        zp = max((atkdsp.parity_z(cc, p, r) / math.sqrt(c.size), p) for cc in (c, -c) for p in polys)
+        named += zs[1] == true and zs[0] > k
+        plain += zp[1] == true and zp[0] > ref._norm_isf(1e-3 / len(polys))
+    assert named >= 35 and plain <= 25, (named, plain)
+    for r2 in (5, 7):
+        polys2 = ref.primitive_polys(r2)
+        k2 = ref._norm_isf(1e-3 / (len(polys2) * r2))
+        L2 = (1 << r2) - 1
+        false = 0
+        for t in range(1000):
+            c = np.where(np.random.default_rng(10 ** 6 + t).random(L2) < 0.5, 1, -1).astype(np.int8)
+            false += max(atkdsp.parity_z_frob(cc, p, r2)[0] for cc in (c, -c) for p in polys2) / math.sqrt(r2 * L2) > k2
+        assert false <= 8, (r2, false)                            # design ~2 in 1000 with both signs
+
+
+def test_a_generator_named_by_parity_regenerates_the_chips():
+    """Without decimation, the vote's chip errors stay — until parity names
+    the generator; then the chips are regenerated from it, exact."""
+    code = mseq(ref.primitive_polys(7)[0], 7)
+    N = code.size * 2
+    x = dsss_signal(code, 2, 150, -18.0, np.random.default_rng(902))
+    chips, res = ref.dsss_code(x, dict(ref.dsss_code_defaults(1.0, 0.5, float(N)), no_decim=1))
+    assert res["flags"] & ref.CODE_REGEN and res["poly_method"] == ref.POLY_PARITY
+    assert _dist(chips, code) == 0 and "fixed" in res["name"]
+
+
+@needs_lib
+@pytest.mark.parametrize("no_decim", [0, 1])
+def test_dsss_code_v023_c_equals_twin(no_decim):
+    code = mseq(ref.primitive_polys(7)[0], 7)
+    N = code.size * 2
+    x = dsss_signal(code, 2, 150, -18.0, np.random.default_rng(902)).astype(np.complex64)
+    cfg = dict(ref.dsss_code_defaults(1.0, 0.5, float(N)), no_decim=no_decim)
+    ct, rt = ref.dsss_code(x, cfg)
+    cc, rc = atkdsp.dsss_code(x, cfg)
+    assert np.array_equal(np.asarray(cc), np.asarray(ct))
+    assert rc["flags"] == rt["flags"] and rc["name"] == rt["name"] and rc["poly"] == rt["poly"]
+    assert abs(rc["vote_min"] - rt["vote_min"]) <= 1e-3 * max(1.0, rt["vote_min"])

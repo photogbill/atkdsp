@@ -187,8 +187,27 @@ smoke lines), with a correction to `atkdsp_dsss_code`'s carrier offset. At
 the real survey rate, 2 s: the exact code, named, at −16 and −18 dB in-band,
 where the fluctuation handle is silent. What building them changed is in
 piece 2's and piece 4's notes. Not here: the catalogue (ATK, `rf_data`), the
-radiometer in the cells, a full blind scan of every lag (GPU), and
-`dsss_code`'s 2-adic decimation and Frobenius parity stack (v0.23).
+radiometer in the cells and a full blind scan of every lag (GPU).
+`dsss_code`'s 2-adic decimation and Frobenius parity stack followed in
+v0.23.0 (BUILT 2026-10-30), with a fix for its window-boundary tie and chip
+regeneration from a named generator: at 127 chips, −16 dB, 150 periods, 17/40
+exact codes in v0.22 → 40/40 (README).
+
+**Phase 6b, Undertow piece 5 (the full lag scan), is BUILT (2026-10-30)** —
+atkdsp v0.24.0 / ABI 25, on the CPU (the plan said GPU; the FFA made it
+cheap enough without): `atkdsp_lagscan` (header §31, twin `reference.py`
+§31, 17 tests in `tests/test_lagscan.py`, a smoke line). Lag products at
+every period of a cell by the Fast Folding Algorithm; a null built from the
+cell's own correlation with a saddlepoint tail (the moment-matched Gamma it
+replaced was 7× anti-conservative, measured); detections resolved into
+families by nested direct folds and CLEAN. Three things building it changed,
+each in the README: the null, the families (a strong code detects in 83
+rows), and the FFA's trial period (P/(1 − x/P), not P + x). Measured: the
+period at −15 dB in-band over 4 s of a 60 kS/s cell (6/6), where the
+survey's candidates lose it near −12 dB. ATK's LPI / LPD page runs it per
+cell and hands each family to Recover. Not here: the m-test for cyclic-line
+families on unfiltered chips (only PFB cells were seen to need none), and
+the GPU form.
 
 **What building phase 6a changed in this plan** (the README and
 `docs/DSSS_LITERATURE.md` have the detail):
@@ -278,7 +297,7 @@ before touching it).
   the below-the-floor watch, in B6c)
 - §C Demodulation and signal quality — the linear demod chain and
   equalizer, EVM/MER, analog radio IDs, strong-signal removal, transmitter
-  fingerprint features
+  fingerprint features, analog video (C6, `docs/VIDEO_PLAN.md`)
 - §D The bitstream toolbox — the checklist, the C engine, the ATK bench
 - §E Longley-Rice (ITM)
 - §F Intercept audio — re-demodulation, the classical cleanup chain, how
@@ -538,6 +557,19 @@ shows RAM.
 > Verified: in-band unit gain (matches a DDC), −111 dB stopband, C == twin
 > 5.8e-7, add/retune/remove leaves others bit-identical, chunk invariance
 > exact, W4 inter-element phase 0.008°. Both channelizer tools are now in.
+>
+> **Speed (2026-10-30, v0.23.1, no ABI change).** Bill's three findings, all
+> confirmed: one radio ran the PFB on one thread (the parallel loop was over
+> elements); the fold's double-product-then-float mix did not vectorise; the
+> stride-m output store missed the cache. Now threads over hops, a float fold
+> over duplicated taps, a 32-hop tile written channel by channel, the FFT in
+> place on the fold's buffer, and pocketfft's work buffer on the stack (its
+> per-transform malloc was a shared lock on several threads). Measured on 2
+> cores: one radio 2.3–2.8× faster on one thread, 3.7–4.4× on two (20 MS/s at
+> ~100 kHz channels: 1.1× → 4.7× real time); identical at any thread count;
+> 1.1e-7 from v0.23.0, 8.8e-8 from the twin. `pfb_bench.bat` measures it on the
+> machine that matters. The OSX extractor is single-threaded still (ATK does
+> not use it yet; parallel over channels is the obvious form when it does).
 >
 > **Corrections (2026-10-30, v0.21.0 / ABI 22).** (1) The PFB's per-hop bin
 > rotation had the wrong sign and referenced each hop to its own start: right
@@ -1411,7 +1443,8 @@ been made.
    >   §29 (`atkdsp_undertow_cfg`, one stream), not the sketch below.
    > - Throughput: 0.5× real time on one core at 2.4 MSPS, 4 scales, 120
    >   cells; 0.9–1.07× on two; deterministic at any thread count. 40 MSPS
-   >   live needs the PFB fold vectorised.
+   >   live needs the PFB fold vectorised — done in v0.23.1 (§A4's speed
+   >   note); the survey inherits it.
 2. **The long watch with drift compensation — how long.** Below the floor,
    time is the only free gain, and the first draft threw it away by
    working per capture. Undertow accumulates each cell's statistics for
@@ -1542,10 +1575,16 @@ been made.
    >   no earlier test had an offset.
    > - Measured at the real rate, 2 s, +40 kHz: the exact code named
    >   (x⁵+x²+1) at −16 and −18 dB, the offset read to the hertz.
-   > Next (v0.23): `dsss_code` averaging an m-sequence's 2-adic decimations
-   > (c[2ᵐn mod L] is a cyclic shift of c[n]: each chip seen r times, ~10·log₁₀
-   > r dB) and the Frobenius parity stack (a check polynomial's squares are
-   > checks too) for naming the generator through more chip errors.
+   > BUILT in v0.23.0 (2026-10-30): `dsss_code` averaging an m-sequence's
+   > 2-adic decimations (CODE_DECIM) and the Frobenius parity stack
+   > (`atkdsp_parity_z_frob`, each image a hypothesis in the threshold —
+   > counting only the polynomials false-named 5× its design), plus two
+   > things measuring them found: the window-boundary eigenvalue tie (2–8
+   > wrong decodes in 40 → 0) and regeneration of the chips from a named
+   > generator (CODE_REGEN). End to end the gain is the tie fix, the stack and
+   > regeneration; decimation changed no outcome measured (the identifiability
+   > gate refuses first) — its value is the margins and codes past
+   > `poly_max_degree`.
 5. **The consistency lattice — the false-alarm killer and the fingerprint.**
    Five quantities are estimated by independent statistics: Tc from the
    ACF triangle, Rc from the PSD nulls, Rc from the cyclic line, T from
@@ -1804,6 +1843,37 @@ int       atkdsp_lindemod_taps(const atkdsp_lindemod *d, atkdsp_cf32 *taps, size
 - Chunk invariance holds.
 - Results agree with `siga/baud.py`'s estimators on the same synthetic set.
 
+**C1.1 Asks from ATK's live inspector (2026-10-30;
+`ATK\docs\SIGDIGGER_PARITY_PLAN.md` §L).** The inspector is the first
+streaming consumer of `atkdsp_lindemod`. It runs live with the operator
+turning knobs, so it needs:
+
+1. **`atkdsp_lindemod_set(d, cfg)`** — every parameter (matched filter, TED,
+   loop BnT and ζ, Costas order, equalizer mode and μ) changes at the next
+   symbol boundary **without a reset**. A reset is a separate call. Test:
+   change BnT mid-stream on a locked QPSK; no unlock, and the MER dip is
+   recorded.
+2. **Per-block lock metrics:**
+   - timing-error variance;
+   - a carrier lock indicator (the mean of cos(M·φ) for Costas);
+   - MER since the last call;
+   - the current frequency estimate (FLL/PLL), in Hz;
+   - the samples-per-symbol estimate.
+
+   These come back in a struct filled by `atkdsp_lindemod_metrics`. They
+   drive the inspector's lock lamps.
+3. **Each stage callable alone,** as the section already says
+   (`atkdsp_timing_*`, `atkdsp_carrier_*`, `atkdsp_eq_*`), so the inspector
+   can show the signal after each stage (constellation before and after the
+   equalizer).
+4. **The equalizer taps readable** (`atkdsp_lindemod_taps`, already planned).
+   The inspector draws them as the channel's delay profile.
+5. **Cost known.** The README records µs per symbol for each configuration
+   on Bill's PC (14 cores, AVX2), so ATK can budget how many inspectors run
+   at once.
+6. **Chunk invariance** with blocks of 1 symbol's worth of samples, because
+   the inspector feeds whatever the queue holds.
+
 ### C2. EVM / MER and modulation quality
 
 **What.** The vector-signal-analyzer metric set, computed on the equalized
@@ -1999,6 +2069,31 @@ measured live. C5 adds the fields marked *(new)* below.
   recorded either way.
 
 ---
+
+### C6. Analog video — composite to pictures (2026-10-30)
+
+**BUILT in v0.25.0 / ABI 26** (header §32, twin `reference.py` §32, 51 tests
+in `tests/test_video.py`, a smoke block) — staged by the instance that
+reviewed SigDigger, merged here.
+
+Specified in full in `docs/VIDEO_PLAN.md`. In short:
+- **Input:** real composite samples after the FM or AM detector.
+- **Output:** luma frames with lock metadata.
+- **Inside:** a sync slicer at the standard's 50 % point, with sub-sample
+  edges; a second-order line-locked loop that coasts through the vertical
+  interval; field detection and order; 525 / 625 / measured-custom
+  standards; a chroma trap or comb; motion-aware frame stacking.
+
+**Written from the standards, not from sigutils' `tvproc.c`.** Rule 7:
+LGPL is a test oracle only, and the sigutils repo's top-level licence says
+GPL-3. A stock SigDigger may be run as a black-box oracle on our synthetic
+files.
+
+**Consumers:** ATK's viewer (`atk/core/video_rx.py`), Bug Sniffer's
+"Look", and Drone Discovery's FPV picture.
+
+**Negative control that matters:** a 15,734 Hz pulse train (radar-like) must
+give H-lock at most, and never a frame.
 
 ## §D The bitstream toolbox
 
@@ -2547,15 +2642,20 @@ checked first).
 | A4a ✅ v0.19.0 | **Channelizer part 1:** the PFB (uniform grid, coherent N-element `_process_n`), W1 covariance, W2 power — the DF-everything core (BUILT 2026-10-29) | M | `atkdf` is blocked on it; overlap-save extractor (A4b) is a later ABI |
 | A4b ✅ v0.20.0 | **Channelizer part 2:** the overlap-save extractor (`atkdsp_osx`, arbitrary channels, coherent N-element, per-channel resample) (BUILT 2026-10-30) | M | Operator/decoder-clocked/off-grid targets; completes A4 |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
+| V ✅ v0.25.0 | **Analog video:** C6 (`docs/VIDEO_PLAN.md`) — twin + generator, then C (BUILT 2026-10-30) | M | Independent of every other phase; Bug Sniffer's "Look" and Drone Discovery's FPV picture wait on ATK's viewer |
 | 6a ✅ v0.18.0 | **Spread spectrum:** B6 blind + known-code paths, B6b LoRa, B6c's receiver pair / align / lattice (BUILT 2026-10-29) | L | Uses B4, D2; the survey + catalogue of B6c wait for A4 and B5 |
 | 6 | **Below the floor (rest):** B6c's scale-space survey and catalogue, C4 strong-signal removal, MDC/FleetSync (3b), the learned fuser | M–L | After A4 (the channelizer) and B5 (the baseline) |
 | 6b-1 ✅ v0.21.0 | **Undertow piece 1:** B6c's scale-space survey over the dyadic PFB — fluctuation, ACF and scale-window cyclic handles per cell, survey-wide Pfa, merged hits (BUILT 2026-10-30) | M | Single receiver; ACF is −10 dB-walled, the fluctuation handle carries the depth |
 | 6b-2 ✅ v0.22.0 | **Undertow pieces 2, 4, 6 (kernel):** survey candidates, the period-synchronous search with period-rate refinement, the bootstrap to the code, the hit blob; `dsss_code`'s offset fix (BUILT 2026-10-30) | M | −18 dB to the named code in 2 s at the real rate; ~25 s a candidate on 2 cores |
-| 6b | **Undertow (rest):** B6c — the radiometer in the cells, a full blind lag scan (GPU), `dsss_code`'s decimation averaging + Frobenius stack (v0.23), the catalogue and survey view (ATK) | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
+| 6b-3 ✅ v0.23.0 | **`dsss_code` deeper:** 2-adic decimation averaging, the Frobenius parity stack, the window-boundary tie fix, regeneration from a named generator (BUILT 2026-10-30) | S | 127 chips, −16 dB, 150 periods: 17/40 exact → 40/40 |
+| 6b-5 ✅ v0.24.0 | **Undertow piece 5, the full lag scan:** every period of a cell by the FFA over lag products, a saddlepoint null from the cell's own correlation, families by nested folds and CLEAN (BUILT 2026-10-30) | M | −15 dB over 4 s at 60 kS/s; −18 dB over 2 s at 600 kS/s; 14 s a 600 kS/s cell on 2 cores |
+| 6b | **Undertow (rest):** B6c — the radiometer in the cells, the full blind lag scan (BUILT v0.24.0, CPU), the catalogue and survey view (ATK's LPI/LPD page, BUILT) | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
 | 7 | **The long watch and identity:** B5 occupancy + baseline, C5 fingerprint features | M | Uses B2, C2 and C3 |
 | 8 | **Intercept audio:** F1, F2, and the F3 wiring into the Workshop | M | Independent; the Workshop's radio door is waiting for it |
 | 9 | **Propagation:** E1 ITM | M | Independent; moves up if DF footprints are wanted sooner |
 | — | F4 MVDR listening | M | After atkdf's calibration path |
+
+Phase 5 (C1) also unblocks ATK's live inspector (`ATK\docs\SIGDIGGER_PARITY_PLAN.md` §L); its asks are C1.1.
 
 Sizes: S = one session; M = two or three; L = more. These are rough, and
 they are not promises. Bill's bench tests (real radios, his PC's timings) go

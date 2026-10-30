@@ -832,7 +832,138 @@ int main(void) {
             okbad = atkdsp_undertow_hit_import(blob, (size_t)need, &c2, &h2, &b2, &hb, c3, 64, &n3) == ATKDSP_E_DECODE;
         }
         CHECK(okrt && okbad, "hit blob: round-trips, and a flipped bit is refused");
+        /* v0.23: the Frobenius stack counts r images, all holding on the m-sequence itself */
+        {
+            uint64_t pp[16]; const ptrdiff_t np5 = atkdsp_primitive_polys(5, pp, 16);
+            int holding = 0, allimg = 1;
+            for (ptrdiff_t i = 0; i < np5; ++i) {
+                int32_t nchk = 0;
+                const double zf = atkdsp_parity_z_frob(code, 31, pp[i], 5, &nchk);
+                allimg &= nchk == 155;
+                holding += fabs(fabs(zf) - 155.0) < 1e-9;      /* up to the sign convention (the complement flips odd-weight checks) */
+            }
+            CHECK(np5 == 6 && allimg && holding == 1, "parity stack: 5 images x 31 checks; one generator holds them all");
+        }
         free(blob); free(px); free(pn);
+    }
+
+    /* §31 the full lag scan: a 31-chip code at 22.5 kchip/s, one data bit a
+     * period, at -6 dB in-band, through the survey's own filterbank (240 kS/s,
+     * 8 channels, the code in channel 2) — the period, 82.667 cell samples,
+     * must top the scan of every base period 60..99. */
+    {
+        static const int c31[31] = {1,-1,-1,-1,-1,1,-1,-1,1,-1,1,1,-1,-1,1,1,1,1,1,-1,-1,-1,1,1,-1,1,1,1,-1,1,-1};
+        const double FSi = 240e3, RCc = 22500.0, FC = 60e3;
+        const size_t nn = 240000;                         /* 1 s */
+        atkdsp_cf32 *xs = (atkdsp_cf32 *)malloc(nn * sizeof *xs);
+        const double s2 = (1.0 / pow(10.0, -0.6) / RCc) * FSi;      /* noise variance a sample */
+        /* xorshift64*: a linear congruential generator's low bits repeat with
+         * short periods, and a period search finds them (it did) */
+        uint64_t st = 0x9E3779B97F4A7C15ull;
+        for (size_t k = 0; k < nn; ++k) {
+            const long ci = (long)floor((double)k * RCc / FSi);
+            const long per = ci / 31;
+            const int bit = (((uint64_t)per * 0x9E3779B97F4A7C15ull) >> 40) & 1 ? 1 : -1;
+            const double a = c31[ci % 31] * bit, ph = 2.0 * ATK_SMOKE_PI * FC / FSi * (double)k;
+            double g[2];
+            for (int q = 0; q < 2; ++q) {                       /* Box-Muller */
+                double u[2];
+                for (int r = 0; r < 2; ++r) {
+                    st ^= st >> 12; st ^= st << 25; st ^= st >> 27;
+                    u[r] = ((double)((st * 0x2545F4914F6CDD1Dull) >> 11) + 0.5) / 9007199254740992.0;
+                }
+                g[q] = sqrt(-2.0 * log(u[0])) * cos(2.0 * ATK_SMOKE_PI * u[1]);
+            }
+            xs[k].re = (float)(a * cos(ph) + g[0] * sqrt(s2 / 2.0));
+            xs[k].im = (float)(a * sin(ph) + g[1] * sqrt(s2 / 2.0));
+        }
+        atkdsp_pfb *pf = atkdsp_pfb_create(FSi, 8, 2, 12, 80.0, 1);
+        const size_t mh = atkdsp_pfb_out_hops(pf, nn);
+        atkdsp_cf32 *po = (atkdsp_cf32 *)malloc(8 * mh * sizeof *po);
+        const ptrdiff_t got = atkdsp_pfb_process(pf, xs, nn, po, 8 * mh);
+        atkdsp_lagscan_cfg lc;
+        atkdsp_lagscan_defaults(&lc, 60e3, 60, 100);
+        atkdsp_lagscan_row rows[40];
+        atkdsp_lagscan_family fam[4];
+        size_t nfam = 0;
+        double nt = 0.0;
+        const ptrdiff_t nr = got > 0 ? atkdsp_lagscan(po + 2 * (size_t)got, (size_t)got, &lc, rows, 40,
+                                                      fam, 4, &nfam, &nt) : -1;
+        const double Tt = 31.0 * 60e3 / RCc;
+        CHECK(nr == 40 && nfam >= 1 && fabs(fam[0].period_samples - Tt) < 0.01 && fam[0].members >= 1
+              && nt > 1000.0,
+              "lag scan: a code's period found among every period 60..99 of its cell, as a family");
+        atkdsp_pfb_destroy(pf); free(po); free(xs);
+    }
+
+    /* -- 32. analog video ----------------------------------------------------
+     * A 525-line composite signal built here from the standard's timing: sync
+     * tip -1, blank 0, a flat grey picture; equalizing, broad and equalizing
+     * pulses at half-line spacing, field B's vertical interval half a line
+     * after field A's. 0.25 s at 13.5 MS/s must give 525-line frames of
+     * 720 x 480 with field lock; the same length of noise must give none. */
+    {
+        const double fsv = 13.5e6, T = 286.0 / 4.5e6, half = T / 2.0;
+        const size_t NV = (size_t)(0.25 * fsv);
+        float *xv = (float *)malloc(NV * sizeof(float));
+        CHECK(xv != NULL, "video: buffer");
+        if (xv) {
+            for (size_t i = 0; i < NV; i++) {
+                const double t = (double)i / fsv + 40.25 * T;
+                const long jh = (long)floor(t / half);               /* half-line slot */
+                const double u = t - (double)jh * half;
+                const long js = jh % 1050;                            /* 525 lines a frame */
+                const long srel = js < 525 ? js : js - 525;           /* field A: 0..524, B: 525.. */
+                float val;
+                if (srel < 6 || (srel >= 12 && srel < 18)) val = u < 2.3e-6 ? -1.0f : 0.0f;
+                else if (srel < 12) val = u < 27.1e-6 ? -1.0f : 0.0f;
+                else if ((jh & 1) == 0) val = u < 4.7e-6 ? -1.0f : 0.0f;
+                else val = 0.0f;
+                if (val == 0.0f) {                                    /* the picture, mid grey */
+                    const double tau = t - (double)(jh - (jh & 1)) * half;
+                    if (srel >= 18 && tau >= 122.0 / 13.5e6 && tau < 842.0 / 13.5e6) val = 1.25f;
+                }
+                xv[i] = val;
+            }
+            atkdsp_video_config vc;
+            atkdsp_video_defaults(&vc);
+            vc.fs = fsv;
+            atkdsp_video *vv = atkdsp_video_create(&vc);
+            CHECK(vv != NULL, "video create");
+            if (vv) {
+                ptrdiff_t waiting = atkdsp_video_process(vv, xv, 1000);            /* any blocks */
+                waiting = atkdsp_video_process(vv, xv + 1000, NV - 1000);
+                atkdsp_video_meta vm;
+                const int peek = atkdsp_video_frame(vv, NULL, 0, &vm);
+                CHECK(waiting > 0 && peek == ATKDSP_E_CAP, "video: frames waiting, peek gives the size");
+                CHECK(vm.standard == ATKDSP_VID_STD_525 && vm.width == 720 && vm.lines == 480 &&
+                      vm.v_lock == 1 && fabs(vm.line_hz - 4.5e6 / 286.0) < 1.0,
+                      "video: 525-line, 720 x 480, field lock, line rate");
+                float *pix = (float *)malloc((size_t)vm.width * (size_t)vm.lines * sizeof(float));
+                if (pix) {
+                    CHECK(atkdsp_video_frame(vv, pix, (size_t)vm.width * (size_t)vm.lines, &vm) == 1 &&
+                          fabsf(pix[200 * 720 + 360] - (1.25f - 0.1875f) / (2.5f - 0.1875f)) < 0.01f,
+                          "video: mid-grey where it was planted");
+                    free(pix);
+                }
+                char vd[512];
+                CHECK(atkdsp_video_describe(vv, vd, sizeof vd) == ATKDSP_OK &&
+                      strstr(vd, "525-line, interlaced, locked") != NULL, "video describe");
+                atkdsp_video_counters vs;
+                CHECK(atkdsp_video_stats(vv, &vs) == ATKDSP_OK && vs.samples_in == NV &&
+                      vs.v_relocks == 1, "video stats");
+                atkdsp_video_reset(vv);
+                unsigned s32 = 12345u;                                  /* noise: no frames */
+                for (size_t i = 0; i < NV; i++) {
+                    s32 = s32 * 1664525u + 1013904223u;
+                    xv[i] = (float)((double)(s32 >> 8) / 16777216.0 - 0.5);
+                }
+                CHECK(atkdsp_video_process(vv, xv, NV) == 0 &&
+                      atkdsp_video_frame(vv, NULL, 0, &vm) == 0, "video: noise makes no frame");
+                atkdsp_video_destroy(vv);
+            }
+            free(xv);
+        }
     }
 
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);

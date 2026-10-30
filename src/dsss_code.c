@@ -16,7 +16,12 @@
  *     Degeneracy: when t0 = 0 the two halves are both full periods and the
  *     top two eigenvalues tie with DIFFERENT supports — the windows are
  *     re-cut N/2 later. QPSK chips tie with the SAME support (two codes of
- *     equal energy), which is the normal case there.
+ *     equal energy), which is the normal case there. v0.23: the tie is
+ *     judged on the eigenvalues (lambda2 > 0.7 lambda1 -> re-cut at N/2 and
+ *     keep the cut with the lower lambda2/lambda1; the first cut when the
+ *     re-cut leaves M < 3). The v0.22 test read the support and missed ties
+ *     a few samples from the window boundary: measured 2-8 wrong decodes in
+ *     40 random starts -> 0/40.
  *  2. Identifiability (US 2007): with m = 2N and n = M the noise bulk's
  *     edge is sigma^2 (1 + sqrt(m/n))^2 (Marchenko-Pastur, complex); the
  *     principal eigenvalue must clear it, or the vector is noise and the
@@ -42,6 +47,13 @@
  *     a_m = sign(y_m . c), c <- sum_m a_m y_m (CN 2021) — and the chips are
  *     the signs at the chip instants t0 + (k + 1/2) sps. Each chip's MARGIN
  *     is |c(i_k)| over the noise of a mean of M real samples (ATK).
+ *     v0.23, DECIMATION AVERAGING (CODE_DECIM; cfg->no_decim turns it off):
+ *     for L = 2^r - 1, r >= 3, the 2-adic decimations v[2^m n mod L] of an
+ *     m-sequence are cyclic shifts of it (Golomb), each found by a circular
+ *     correlation (circ_corr_argmax). Applied only when EVERY |rho_m|
+ *     clears Phi^-1(1 - pfa / (2 L (r - 1))) / sqrt(L) — a Gold or arbitrary
+ *     code fails that and is left alone — then the r aligned looks are
+ *     averaged and the margins' noise is sd / sqrt(r).
  *  5. The generator: Berlekamp-Massey (§15) on the chips with its profile;
  *     accepted when the complexity r satisfies 2r <= L/2 and the profile sat
  *     at r for the last half (a wrong chip makes the profile jump — the
@@ -50,8 +62,19 @@
  *     the complexity is 2r', L = 2^r' - 1 and the polynomial factors into
  *     two primitive polynomials of degree r'. When BM is not believed and
  *     L + 1 is a power of two, parity-check counting over every primitive
- *     polynomial of that degree (FR 2004 / CH 1989): Z > k sqrt(L), k =
- *     Phi^-1(1 - pfa / candidates) — the polynomial through chip errors. */
+ *     polynomial of that degree (FR 2004 / CH 1989) — since v0.23 over the
+ *     FROBENIUS STACK (atkdsp_parity_z_frob, dsss_codes.c): a polynomial's
+ *     taps times 2^m mod L are valid checks too, so the checks of every
+ *     distinct image are summed, z = Z / sqrt(N), and each image counts as a
+ *     hypothesis: k = Phi^-1(1 - pfa / (npolys * nimages)). (Counting only
+ *     the polynomials named the wrong generator 5x the design rate at L = 31:
+ *     the images move together, so they are not independent looks, and the
+ *     Bonferroni bound is what holds — on random chips at pfa 1e-3, both
+ *     signs tried (design ~8 in 4000): 11/4000 at r = 5, 0/4000 at r = 7.)
+ *     A generator named this way REGENERATES the chips (CODE_REGEN): the
+ *     m-sequence from the polynomial, aligned to the soft chips by the
+ *     circular correlation, its sign by the correlation's; the name adds
+ *     "; N fixed" when it fits the 47 characters. */
 #include "internal.h"
 #include <stdio.h>
 
@@ -171,6 +194,102 @@ static void derotate(atkdsp_cf32 *x, size_t n, double alpha) {
         const double re = x[i].re * cr - x[i].im * ci, im = x[i].re * ci + x[i].im * cr;
         x[i].re = (float)re; x[i].im = (float)im;
     }
+}
+
+/* ---- v0.23: decimation averaging, regeneration -------------------------------- */
+/* argmax_tau |C[tau]|, C[tau] = sum_n d[n] v[(n + tau) mod L] (circular): the
+ * float FFT finds the peak; callers re-read its value exactly. */
+static int circ_corr_argmax(const double *d, const double *v, int L, int *tau) {
+    atkdsp_fft *pl = atkdsp_fft_create((size_t)L);
+    atkdsp_cf32 *a = (atkdsp_cf32 *)malloc((size_t)L * sizeof *a), *b = (atkdsp_cf32 *)malloc((size_t)L * sizeof *b);
+    atkdsp_cf32 *A = (atkdsp_cf32 *)malloc((size_t)L * sizeof *A), *Bv = (atkdsp_cf32 *)malloc((size_t)L * sizeof *Bv);
+    if (!pl || !a || !b || !A || !Bv) { atkdsp_fft_destroy(pl); free(a); free(b); free(A); free(Bv); return ATKDSP_E_NOMEM; }
+    double sa = 0.0, sb = 0.0;
+    for (int i = 0; i < L; i++) { if (fabs(d[i]) > sa) sa = fabs(d[i]); if (fabs(v[i]) > sb) sb = fabs(v[i]); }
+    if (!(sa > 0.0)) sa = 1.0;
+    if (!(sb > 0.0)) sb = 1.0;
+    for (int i = 0; i < L; i++) { a[i].re = (float)(d[i] / sa); a[i].im = 0.0f; b[i].re = (float)(v[i] / sb); b[i].im = 0.0f; }
+    atkdsp_fft_exec(pl, a, A, 0);
+    atkdsp_fft_exec(pl, b, Bv, 0);
+    for (int i = 0; i < L; i++) {                          /* conj(A) Bv */
+        const float re = A[i].re * Bv[i].re + A[i].im * Bv[i].im, im = A[i].re * Bv[i].im - A[i].im * Bv[i].re;
+        a[i].re = re; a[i].im = im;
+    }
+    atkdsp_fft_exec(pl, a, b, 1);
+    int best = 0; double bv = -1.0;
+    for (int i = 0; i < L; i++) { const double m = fabs((double)b[i].re); if (m > bv) { bv = m; best = i; } }
+    atkdsp_fft_destroy(pl); free(a); free(b); free(A); free(Bv);
+    *tau = best;
+    return ATKDSP_OK;
+}
+
+/* 2-adic decimation averaging: for an m-sequence of length L = 2^r - 1,
+ * c[2^m n mod L] is a cyclic shift of c[n] (Golomb). Each decimated copy of
+ * the soft chips v is matched by circular correlation; if ALL r - 1 match
+ * (|rho| above Phi^-1(1 - pfa / (2 L (r - 1))) / sqrt(L) — a Gold or arbitrary
+ * code does not), each chip is averaged over its r aligned looks (different
+ * chips, independent noise) and sd falls by sqrt(r). Returns 1 if applied,
+ * 0 if not, or an error. Twin: reference._decim_average. */
+static int decim_average(double *v, double *sd, int L, int r, double pfa) {
+    double vv = 0.0;
+    for (int i = 0; i < L; i++) vv += v[i] * v[i];
+    if (r < 3 || L != (1 << r) - 1 || !(vv > 0.0)) return 0;
+    const double thr = atk_norm_isf(pfa / (2.0 * (double)L * (double)(r - 1))) / sqrt((double)L);
+    double *acc = (double *)malloc((size_t)L * sizeof *acc), *d = (double *)malloc((size_t)L * sizeof *d);
+    if (!acc || !d) { free(acc); free(d); return ATKDSP_E_NOMEM; }
+    memcpy(acc, v, (size_t)L * sizeof *acc);
+    int ok = 1;
+    for (int m = 1; m < r && ok; m++) {
+        const long long mul = 1LL << m;
+        for (int n = 0; n < L; n++) d[n] = v[(int)((mul * n) % L)];
+        int tau = 0;
+        if (circ_corr_argmax(d, v, L, &tau) != ATKDSP_OK) { free(acc); free(d); return ATKDSP_E_NOMEM; }
+        double dot = 0.0;
+        for (int n = 0; n < L; n++) dot += d[n] * v[(n + tau) % L];
+        const double rho = dot / vv;
+        if (fabs(rho) < thr) { ok = 0; break; }
+        const double sg = rho > 0.0 ? 1.0 : -1.0;
+        for (int j = 0; j < L; j++) {                      /* v[j] ~ sg v[2^m (j - tau) mod L] */
+            const int jj = ((j - tau) % L + L) % L;
+            acc[j] += sg * v[(int)((mul * jj) % L)];
+        }
+    }
+    if (ok) {
+        for (int j = 0; j < L; j++) v[j] = acc[j] / (double)r;
+        *sd /= sqrt((double)r);
+    }
+    free(acc); free(d);
+    return ok;
+}
+
+/* The m-sequence (+-1, bit 1 -> -1) whose parity checks are poly's taps:
+ * b[n + r] = XOR of b[n + t] over taps t < r, seeded 1, 0, ... */
+static void mseq_from_poly(uint64_t poly, int r, int8_t *out) {
+    const int L = (1 << r) - 1;
+    uint8_t *b = (uint8_t *)calloc((size_t)L + (size_t)r, 1);
+    if (!b) { memset(out, 1, (size_t)L); return; }
+    b[0] = 1;
+    for (int n = 0; n < L; n++) {
+        uint8_t x = 0;
+        for (int t = 0; t < r; t++) if ((poly >> t) & 1u) x ^= b[n + t];
+        b[n + r] = x;
+    }
+    for (int n = 0; n < L; n++) out[n] = (int8_t)(b[n] ? -1 : 1);
+    free(b);
+}
+
+/* ref_chips at the cyclic shift and sign best matching the soft values v. */
+static int regen_align(const double *v, const int8_t *ref_chips, int L, int8_t *out) {
+    double *rc = (double *)malloc((size_t)L * sizeof *rc);
+    if (!rc) return ATKDSP_E_NOMEM;
+    for (int i = 0; i < L; i++) rc[i] = (double)ref_chips[i];
+    int tau = 0;
+    if (circ_corr_argmax(rc, v, L, &tau) != ATKDSP_OK) { free(rc); return ATKDSP_E_NOMEM; }
+    double sdot = 0.0;
+    for (int n = 0; n < L; n++) sdot += rc[n] * v[(n + tau) % L];
+    for (int n = 0; n < L; n++) out[(n + tau) % L] = (int8_t)(sdot >= 0.0 ? ref_chips[n] : -ref_chips[n]);
+    free(rc);
+    return ATKDSP_OK;
 }
 
 /* ---- real power iteration and the vote ---------------------------------------- */
@@ -314,9 +433,19 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
     size_t off = 0, t0 = 0;
     double lam1 = 0.0, lam2 = 0.0, trace = 0.0;
     int M = 0;
+    cd *f_v1 = (cd *)malloc(W * sizeof *f_v1);           /* the first cut, kept across a tie re-cut */
+    double f_lam1 = 0.0, f_lam2 = 0.0, f_trace = 0.0;
+    size_t f_t0 = 0, f_off = 0;
+    int f_M = 0, have_first = 0;
+    if (!f_v1) { free(v1); free(v2); free(u); return ATKDSP_E_NOMEM; }
     for (int attempt = 0; attempt < 2; attempt++) {
         M = (int)((n - off) / N) - 1;
-        if (M < 3) { free(v1); free(v2); free(u); return ATKDSP_E_EMPTY; }
+        if (M < 3 && have_first) {                         /* the re-cut does not fit: keep the first cut */
+            memcpy(v1, f_v1, W * sizeof *v1);
+            lam1 = f_lam1; lam2 = f_lam2; trace = f_trace; t0 = f_t0; M = f_M; off = f_off;
+            break;
+        }
+        if (M < 3) { free(v1); free(v2); free(u); free(f_v1); return ATKDSP_E_EMPTY; }
         /* start from the first window (a signal-bearing guess), normalised */
         double nrm = 0.0;
         for (size_t i = 0; i < W; i++) {
@@ -351,13 +480,25 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         }
         trace /= (double)M;
         t0 = support_start(v1, W, N);
+        /* The window-boundary tie (v0.23): when the code's start meets the
+           window's, lambda2 ~ lambda1 and power iteration returns a MIXTURE
+           whose support says nothing — the old test (supports apart by > N/2)
+           missed it and the blend was decoded, 5-20 % of decodes at
+           comfortable SNR (measured). Any lambda2 > 0.7 lambda1 now re-cuts
+           N/2 later; the cut with the clearer winner is kept. */
         if (attempt == 0 && lam2 > 0.7 * lam1) {
-            const size_t t1 = support_start(v2, W, N);
-            const double dd = fabs((double)t1 - (double)t0);
-            if (dd > 0.5 * (double)N) { off = N / 2; continue; }   /* the window-boundary tie */
+            memcpy(f_v1, v1, W * sizeof *v1);
+            f_lam1 = lam1; f_lam2 = lam2; f_trace = trace; f_t0 = t0; f_M = M; f_off = off; have_first = 1;
+            off = N / 2;
+            continue;
+        }
+        if (have_first && f_lam2 / f_lam1 < lam2 / lam1) {
+            memcpy(v1, f_v1, W * sizeof *v1);
+            lam1 = f_lam1; lam2 = f_lam2; trace = f_trace; t0 = f_t0; M = f_M; off = f_off;
         }
         break;
     }
+    free(f_v1);
     const double m_dim = (double)W, n_dim = (double)M;
     double sig2 = (trace - lam1 - lam2) / (m_dim - 2.0);
     if (!(sig2 > 0.0)) sig2 = 1e-30;
@@ -486,7 +627,8 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
     double *yr = (double *)malloc((size_t)Mp * N * sizeof *yr);
     double *c = (double *)malloc(N * sizeof *c), *uu = (double *)malloc(N * sizeof *uu);
     int8_t *a = (int8_t *)malloc((size_t)Mp);
-    if (!yr || !c || !uu || !a) { free(yr); free(c); free(uu); free(a); free(xd); free(inst); return ATKDSP_E_NOMEM; }
+    double *vsoft = (double *)malloc((size_t)L * sizeof *vsoft), *vk_q = (double *)malloc((size_t)L * sizeof *vk_q);
+    if (!yr || !c || !uu || !a || !vsoft || !vk_q) { free(yr); free(c); free(uu); free(a); free(xd); free(inst); free(vsoft); free(vk_q); return ATKDSP_E_NOMEM; }
     out->method[nm++] = ATKDSP_METHOD_VOTE;
     out->method[nm++] = ATKDSP_METHOD_VOTE_MARGIN;
     if (two) out->method[nm++] = ATKDSP_METHOD_QPSK_SPLIT;
@@ -502,9 +644,22 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         for (size_t i = 0; i < N; i++) c[i] /= nrm;
         real_power(yr, Mp, N, c, uu, 30);
         const double s2r = vote(yr, Mp, N, c, uu, cfg->vote_passes > 0 ? cfg->vote_passes : 1, a);
-        const double sd = sqrt(s2r / (double)Mp);             /* noise of the mean at one sample */
+        double sd = sqrt(s2r / (double)Mp);                   /* noise of the mean at one sample */
+        double *vk = branch ? vk_q : vsoft;
+        for (int k = 0; k < L; k++) vk[k] = c[inst[branch ? L + k : k]];
+        {
+            int rr = 0;
+            if (is_pow2m1(L, &rr) && !cfg->no_decim) {
+                const int got = decim_average(vk, &sd, L, rr, cfg->pfa);
+                if (got < 0) { free(yr); free(c); free(uu); free(a); free(xd); free(inst); free(vsoft); free(vk_q); return got; }
+                if (got && !(out->flags & ATKDSP_CODE_DECIM)) {
+                    out->flags |= ATKDSP_CODE_DECIM;
+                    out->method[nm < 8 ? nm++ : 7] = ATKDSP_METHOD_DECIM_AVG;
+                }
+            }
+        }
         for (int k = 0; k < L; k++) {
-            const double ck = c[inst[branch ? L + k : k]];
+            const double ck = vk[k];
             chips[branch * L + k] = (int8_t)(ck >= 0.0 ? 1 : -1);
             const double z = sd > 0.0 ? fabs(ck) / sd : HUGE_VAL;
             if (z < vmin) vmin = z;
@@ -513,7 +668,7 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
     }
     out->vote_min = vmin; out->vote_mean = vsum / (double)(L * (two ? 2 : 1));
     if (two) out->flags |= ATKDSP_CODE_Q;
-    free(yr); free(c); free(uu); free(a); free(xd); free(inst);
+    free(yr); free(c); free(uu); free(a); free(xd); free(inst); free(vk_q);
 
     /* ---- 5. the generator and the name ------------------------------------------ */
     char tmp[160];
@@ -572,29 +727,57 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
                     }
                 }
             }
-            /* 2. parity-check counting over the degree-r primitives, on the sign
-               that gives the stronger statistic (error-tolerant, FR 2004 / CH 1989). */
+            /* 2. parity-check counting over the degree-r primitives — over the
+               Frobenius stack (v0.23): each candidate's checks and their r
+               squared images, z = Z / sqrt(N); each image counted as a
+               hypothesis in k (for short codes the images' sums move together
+               on random chips: a plain threshold false-named 5x its design at
+               L = 31, measured). On whichever sign is stronger. A named
+               generator then REGENERATES the chips, aligned to the soft values:
+               an m-sequence is fixed by its polynomial. */
             if (!(out->flags & ATKDSP_CODE_NAMED) && r && r <= cfg->poly_max_degree) {
                 uint64_t polys[4096];
                 const ptrdiff_t np = atkdsp_primitive_polys(r, polys, 4096);
-                double zbest = -HUGE_VAL; uint64_t pbest = 0;
+                double zbest = -HUGE_VAL; uint64_t pbest = 0; int32_t nbest = L;
                 int8_t *neg = (int8_t *)malloc((size_t)L);
                 if (neg) for (int k = 0; k < L; k++) neg[k] = (int8_t)(-chips[k]);
-                for (ptrdiff_t i = 0; i < np && i < 4096; i++) {
-                    double z = atkdsp_parity_z(chips, L, polys[i], r);
-                    if (neg) { const double zn = atkdsp_parity_z(neg, L, polys[i], r); if (zn > z) z = zn; }
-                    if (z > zbest) { zbest = z; pbest = polys[i]; }
+                for (int sgn = 0; sgn < 2; sgn++) {
+                    const int8_t *cc = sgn ? neg : chips;
+                    if (!cc) continue;
+                    for (ptrdiff_t i = 0; i < np && i < 4096; i++) {
+                        int32_t nchk = 0;
+                        const double z = atkdsp_parity_z_frob(cc, L, polys[i], r, &nchk);
+                        const double zn = nchk > 0 ? z / sqrt((double)nchk) : -HUGE_VAL;
+                        if (zn > zbest) { zbest = zn; pbest = polys[i]; nbest = nchk; }
+                    }
                 }
                 free(neg);
-                const double k = atk_norm_isf(cfg->pfa / (double)(np > 0 ? np : 1));
-                out->poly_z = zbest / sqrt((double)L);
+                const int nimg = nbest / L > 1 ? nbest / L : 1;
+                const double k = atk_norm_isf(cfg->pfa / (double)((np > 0 ? np : 1) * nimg));
+                out->poly_z = isfinite(zbest) ? zbest : 0.0;
                 out->method[nm < 8 ? nm++ : 7] = ATKDSP_METHOD_PARITY_COUNT;
-                if (zbest > k * sqrt((double)L)) {
+                out->method[nm < 8 ? nm++ : 7] = ATKDSP_METHOD_PARITY_FROB;
+                if (zbest > k) {
                     out->poly = pbest; out->poly_degree = r; out->poly_method = ATKDSP_POLY_PARITY;
                     out->flags |= ATKDSP_CODE_POLY | ATKDSP_CODE_NAMED;
+                    int fixed = 0;
+                    int8_t *gen = (int8_t *)malloc((size_t)L), *al = (int8_t *)malloc((size_t)L);
+                    if (gen && al) {
+                        mseq_from_poly(pbest, r, gen);
+                        if (regen_align(vsoft, gen, L, al) == ATKDSP_OK) {
+                            for (int k2 = 0; k2 < L; k2++) { fixed += al[k2] != chips[k2]; chips[k2] = al[k2]; }
+                            out->flags |= ATKDSP_CODE_REGEN;
+                            out->method[nm < 8 ? nm++ : 7] = ATKDSP_METHOD_REGEN;
+                        }
+                    }
+                    free(gen); free(al);
                     char ps[40]; poly_string(pbest, r, ps, sizeof ps);
-                    snprintf(tmp, sizeof tmp, "m-sequence (%d) %s, by parity (%d checks failed)", L, ps,
-                             (int)((L - zbest) / 2.0 + 0.5));
+                    snprintf(tmp, sizeof tmp, "m-sequence (%d) %s, by parity", L, ps);
+                    if (out->flags & ATKDSP_CODE_REGEN) {
+                        char t2[sizeof tmp + 24];
+                        snprintf(t2, sizeof t2, "%s; %d fixed", tmp, fixed);
+                        if (strlen(t2) < sizeof out->name) memcpy(tmp, t2, strlen(t2) + 1);
+                    }
                     set_name(out, tmp);
                 }
             }
@@ -610,5 +793,6 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         }
         free(bits); free(poly); free(prof); free(bits1); free(poly1);
     }
+    free(vsoft);
     return L;
 }

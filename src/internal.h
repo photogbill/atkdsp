@@ -40,6 +40,10 @@ ATK_INLINE double atk_wrap(double ph) {
     return ph;
 }
 
+/* src/fft.c: the forward FFT in place on 2n interleaved doubles (thread-safe
+ * on a shared plan; the PFB's fold hands its double accumulator straight in). */
+int atk_fft_forward_inplace(const atkdsp_fft *p, double *buf);
+
 /* Aligned allocation for SIMD-friendly buffers. */
 void *atk_aligned_malloc(size_t bytes);
 void  atk_aligned_free(void *p);

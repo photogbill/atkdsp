@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 23
-#define ATKDSP_VERSION_STRING "0.22.0"
+#define ATKDSP_ABI_VERSION 26
+#define ATKDSP_VERSION_STRING "0.25.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -163,6 +163,41 @@ extern "C" {
  * atkdsp_dsss_code's carrier offset is now read on its eigenvector in two
  * steps; the period-summed estimate it replaces cancelled itself once the
  * carrier turned across the capture and returned confident wrong chips. */
+/* 23 -> 24: atkdsp_dsss_code, deeper and corrected (§25d). (1) The
+ * window-boundary tie: when the code's start met the window's, lambda2 ~ lambda1
+ * and the old test (eigenvector supports apart) missed the mixture — 5-20 % of
+ * decodes at comfortable SNR came back wrong (measured); any lambda2 > 0.7
+ * lambda1 now re-cuts and keeps the clearer cut. (2) 2-adic decimation
+ * averaging for m-sequences (CODE_DECIM): each chip averaged over its r
+ * aligned decimations. (3) The Frobenius parity stack
+ * (atkdsp_parity_z_frob), each image a hypothesis in the threshold. (4) Chips
+ * regenerated from a generator named by parity (CODE_REGEN). The config's
+ * reserved[2] becomes no_decim + reserved (same size); three methods
+ * (DECIM_AVG, PARITY_FROB, REGEN; COUNT 30 -> 33). */
+/* 0.23.1 (ABI 24, no change): the channel splitter, faster (§28b). Bill,
+ * 2026-10-30: with one radio atkdsp_pfb ran on one thread of twenty; its fold
+ * mixed double and single precision, which the compiler would not vectorise;
+ * and it wrote its output at a stride of m, missing the cache on nearly every
+ * value. Now the hops run in parallel (every (element, run of hops) is a
+ * task), the fold is single precision over duplicated taps (vectorised), the
+ * output goes through a hop-major tile written channel by channel, and the
+ * FFT runs in place on the fold's buffer (pocketfft's short work buffer moved
+ * to the stack — a malloc per hop was a shared lock on many threads). Output
+ * identical at any thread count and block split; within ~1e-7 of v0.23.0 and
+ * of the float64 twin (measured). */
+/* 24 -> 25: Undertow piece 5, the full lag scan (§31): atkdsp_lagscan folds
+ * lag products at every period of a cell with the Fast Folding Algorithm,
+ * tests each against a saddlepoint null built from the cell's own
+ * correlation, and resolves the detections into families (nested folds,
+ * CLEAN) — one method, LAGSCAN; COUNT 33 -> 34. The PFB's hops are now handed out in
+ * smaller tasks, dynamically, so a hybrid CPU's slow cores do not hold the
+ * fast ones back (Bill's 20-thread bench: 20 threads ran slower than 16) —
+ * output unchanged. */
+/* 25 -> 26: analog video (§32, docs/VIDEO_PLAN.md): atkdsp_video — composite
+ * samples to pictures (525 / 625 / measured custom, interlaced / one field /
+ * progressive, chroma trap or comb, motion-aware stacking). Written from the
+ * video standards, not from sigutils' tvproc.c (rule 7). Staged by the
+ * instance that reviewed SigDigger; merged here. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -2538,7 +2573,12 @@ ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int 
  *      Edelman): the signal eigenvalue must clear sigma^2 (1 + sqrt(m/n)),
  *      m = 2 x period samples, n = periods — below that the vector is noise
  *      and the kernel refuses with the number of periods it would need
- *      (periods_needed), instead of returning a garbage code.
+ *      (periods_needed), instead of returning a garbage code. When the
+ *      code's start meets the window's, the two full periods tie (lambda2 ~
+ *      lambda1) and the vector is a MIXTURE: any lambda2 > 0.7 lambda1 re-cuts
+ *      the windows half a period later and keeps the clearer cut (v0.23;
+ *      before, a support test missed the mixture and 5-20 % of decodes at
+ *      comfortable SNR were wrong — measured).
  *   2. The contiguous period inside the wide vector (k_max) is the code
  *      waveform, and its position is the code start.
  *   3. The carrier offset AFTER the processing gain (the idea of BE 2015, Le
@@ -2565,7 +2605,14 @@ ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int 
  *      estimate, decide the symbol, accumulate each chip's evidence with
  *      the decided sign, repeat; the chips are the signs at the chip
  *      instants, and each chip's MARGIN is its accumulated evidence over the
- *      noise, a z-score. vote_min says which chips may be trusted.
+ *      noise, a z-score. vote_min says which chips may be trusted. For an
+ *      m-sequence (L = 2^r - 1) the soft chips are then averaged over their
+ *      r 2-adic decimations (v0.23, CODE_DECIM; no_decim skips it):
+ *      c[2^m n mod L] is a cyclic shift of c[n] (Golomb), so each aligned
+ *      decimation is another look at every chip, at a different chip's noise
+ *      — applied only when ALL r - 1 match significantly (a Gold or arbitrary
+ *      code does not), and the margins then carry sd / sqrt(r). Measured:
+ *      127 chips at -18 dB in 150 periods, 2-5 chip errors -> 0-1.
  *   6. The generator polynomial, through chip errors: Berlekamp-Massey on
  *      the chips with its linear-complexity profile (a plateau at r with
  *      2r << L and the recurrence holding to the end names an LFSR of
@@ -2579,7 +2626,13 @@ ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int 
  *      (LC = 2r, BM's polynomial factoring into two primitive polynomials
  *      of degree r) is named; a Barker code is named from the table;
  *      anything else is "L chips, generator not confirmed", and the chips
- *      are returned anyway.
+ *      are returned anyway. Since v0.23 the
+ *      parity counting runs over the FROBENIUS STACK (atkdsp_parity_z_frob:
+ *      each candidate's checks and their r squared images, z = Z / sqrt(N),
+ *      each image a hypothesis in k — measured at 16 % chip errors, 127
+ *      chips: the generator named 39/40 against plain parity's 15/40), and a
+ *      generator named by parity REGENERATES the chips, aligned to the soft
+ *      values (CODE_REGEN; the name says how many were fixed).
  *
  * atkdsp_dsss_acquire — the parallel code-phase search (GNSS-SDR's form, ES;
  * Borre, DK): per Doppler bin, the FFT of ncoh periods of derotated signal
@@ -2657,7 +2710,11 @@ typedef struct {
 #define ATKDSP_METHOD_PSYNC         27   /* ATK (period-synchronous eigen watch)       */
 #define ATKDSP_METHOD_LAG_RATE      28   /* ATK (lag-rate period refinement)           */
 #define ATKDSP_METHOD_BOOTSTRAP     29   /* ATK (bootstrap code recovery)              */
-#define ATKDSP_METHOD_COUNT        30
+#define ATKDSP_METHOD_DECIM_AVG     30   /* ATK, after Golomb (m-sequence decimation averaging) */
+#define ATKDSP_METHOD_PARITY_FROB   31   /* CH 1989 (Frobenius parity stack)           */
+#define ATKDSP_METHOD_REGEN         32   /* ATK (chips regenerated from the generator) */
+#define ATKDSP_METHOD_LAGSCAN       33   /* US 1969 Staelin (FFA) / ATK: lag products folded at every period */
+#define ATKDSP_METHOD_COUNT        34
 /* NULL for an unknown id. */
 ATKDSP_API const atkdsp_method_info *atkdsp_method(int method_id);
 
@@ -2763,6 +2820,8 @@ ATKDSP_API int              atkdsp_cyclic_scan_stats(const atkdsp_cyclic_scan *s
 #define ATKDSP_CODE_NAMED        8u   /* the code family was named                */
 #define ATKDSP_CODE_Q            16u  /* the Q code is in chips[L..2L)            */
 #define ATKDSP_CODE_REFUSED      32u  /* not identifiable: no chips returned      */
+#define ATKDSP_CODE_DECIM        64u  /* m-sequence: chips averaged over the r 2-adic decimations */
+#define ATKDSP_CODE_REGEN       128u  /* chips regenerated from the generator named by parity */
 #define ATKDSP_POLY_NONE   0
 #define ATKDSP_POLY_BM     1
 #define ATKDSP_POLY_PARITY 2
@@ -2775,7 +2834,8 @@ typedef struct {
     int32_t poly_max_degree;  /* parity-check search up to this degree, 3..16 (default 14) */
     int32_t no_cfo;           /* skip the offset estimate                      */
     double  pfa;              /* for the polynomial decision (default 1e-3)    */
-    int32_t reserved[2];
+    int32_t no_decim;         /* skip the m-sequence decimation averaging (v0.23) */
+    int32_t reserved;
 } atkdsp_dsss_code_config;    /* 56 bytes */
 
 typedef struct {
@@ -2809,6 +2869,14 @@ ATKDSP_API ptrdiff_t        atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n,
 /* The parity-check decision on its own: Z over the cyclic positions of chips
  * for the candidate polynomial (bitmask, §15 convention). */
 ATKDSP_API double           atkdsp_parity_z(const int8_t *chips, int L, uint64_t poly, int degree);
+/* The Frobenius parity stack (v0.23): Z over the cyclic positions of every
+ * distinct image g(x^(2^m)) of the candidate (taps 2^m t mod L) — r images for
+ * L = 2^r - 1; *nchecks (may be NULL) gets N, the checks counted. Threshold
+ * against sqrt(N); dsss_code counts each image as a hypothesis in its
+ * Bonferroni k (for short codes the images' sums move together on random
+ * chips: measured, a plain threshold false-named 5x its design at L = 31). */
+ATKDSP_API double           atkdsp_parity_z_frob(const int8_t *chips, int L, uint64_t poly, int degree,
+                                                 int32_t *nchecks);
 /* Primitive polynomials of a degree, in a fixed order; returns the count,
  * fills up to cap masks. Degree 2..16. */
 ATKDSP_API ptrdiff_t        atkdsp_primitive_polys(int degree, uint64_t *out, size_t cap);
@@ -3142,7 +3210,11 @@ ATKDSP_API ptrdiff_t   atkdsp_pfb_process(atkdsp_pfb *p, const atkdsp_cf32 *in, 
                                           atkdsp_cf32 *out, size_t cap);
 /* N elements, ONE block clock: ins[el] each n samples, sample-aligned; out is
  * [nel][nchan][m] (element el, channel k, hop i at (el*nchan + k)*m + i).
- * Returns m, or ATKDSP_E_CAP if cap < nel*nchan*m. nel <= max_nel. */
+ * Returns m, or ATKDSP_E_CAP if cap < nel*nchan*m. nel <= max_nel.
+ * Threads (since 0.23.1): the hops are shared among atkdsp_get_threads()
+ * threads, one radio or many; the result is identical at any thread count
+ * and any block split. Scratch is per thread, grown (once) when the thread
+ * count grows; nothing is allocated per block. */
 ATKDSP_API ptrdiff_t   atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins,
                                             unsigned nel, size_t n,
                                             atkdsp_cf32 *out, size_t cap);
@@ -3466,6 +3538,225 @@ ATKDSP_API ptrdiff_t atkdsp_undertow_hit_export(const atkdsp_undertow_ctx *ctx, 
 ATKDSP_API int       atkdsp_undertow_hit_import(const uint8_t *buf, size_t n, atkdsp_undertow_ctx *ctx,
                                                 atkdsp_undertow_cell *hit, atkdsp_bootstrap_result *bs,
                                                 int *has_bs, int8_t *chips, size_t cap, size_t *nchips);
+
+/* ---- 31. Undertow piece 5: the full lag scan ---------------------------------
+ * Below where the survey's candidates hold the period (about 2 dB under its
+ * own threshold; measured), every period of one cell is searched at once.
+ *
+ * The lag product c_d[k] = y[k] conj(y[k + d]) cancels the data sign (both
+ * samples inside one code period carry the same one) and turns a carrier
+ * offset into a constant phase per lag. Folded at the true period it is the
+ * code's +-1 product pattern, every bin at full amplitude. The fold at every
+ * trial period is the FAST FOLDING ALGORITHM (D. H. Staelin, Proc. IEEE 1969 —
+ * the pulsar search): per base period P, the n trial periods P / (1 - x/P),
+ * x = s/(n-1) the drift a row (P bins over a period a little over P; P + x,
+ * the first-order form, is short by x^2/P — measured, 0.005 samples a period
+ * at 82.67: 44 samples of drift over 8,192 periods), in n log2(n) P additions. For each base P in [pmin, pmax), nlags lags spread
+ * over [lag_min, max(lag_min + 1, lag_frac P)] are folded and the statistic
+ * is S[s] = sum_d sum_b |fold|^2 / (n var(c_d)).
+ *
+ * The null: a filtered cell's lag products are correlated sample to sample
+ * (Gaussian noise: as |r(m)|^2 / r(0)^2, r the cell's autocorrelation), so
+ * the folded bins are too; per lag they form a circulant whose eigenvalues
+ * are that correlation's spectrum over the P bins. S is M copies of c x that
+ * spectrum times unit exponentials (a generalized chi-square), c and M
+ * matched to the mean and variance of the base period's own trials (those
+ * above median + 5 x the interquartile spread left out, and at least the
+ * `trim` largest — a strong code lifts a broad stretch of them), which also
+ * absorbs lags close enough to correlate with each other. Its tail: the
+ * saddlepoint (Lugannani & Rice 1980). Measured on noise-only cells: a
+ * moment-matched Gamma — this scan's first null — gave its stated 1e-3 seven
+ * times as often (a sum with spread eigenvalues decays as its largest one);
+ * this one at the stated rate within the counts (200 + 100 + 16 cells). The
+ * best trial's one-trial tail times every trial scanned (Bonferroni,
+ * conservative: the trials overlap) is log10_pfa; DETECT at cfg pfa.
+ *
+ * FAMILIES. A code folds partly at p/q of its period too (2T, T/2, 3T/4 ...),
+ * and with a strong code those rows detect (measured: 83 rows at -6 dB, 1 s).
+ * The level cannot tell T from T/2 — half the pattern averages away there,
+ * but twice the periods fold. So the detections, most significant first, seed
+ * FAMILIES resolved by direct folds over all the data:
+ *   - the seed's period refined over +-16 samples of drift (the FFA's tree
+ *     rounds its shifts: measured, a row's period drifted 15 samples over
+ *     4 s);
+ *   - the families already found taken off the lag products (their folded
+ *     profiles — CLEAN, Hogbom 1974): if what is left no longer detects, the
+ *     seed is theirs and joins the one whose removal alone leaves the least;
+ *   - else NESTED FOLDS: at k p (k = 2..8) the power not periodic in p is
+ *     noise if p is the period and (k-1)/k of the signal if k p is — the
+ *     smallest k significant at pfa / 7 holding at least half of that steps
+ *     up; folded at p in k sub-periods, a residual 3 sd under half of what p
+ *     would leave (when that is 6 sd or more) steps down to p / k, the
+ *     largest such k; at most 4 steps each way. ("Half", not "significant":
+ *     where k p is a whole number of samples, the sub-folds sample a strong
+ *     pattern at fixed sub-sample offsets and leave a residual that is not a
+ *     longer period — measured, 5 % of the signal.)
+ *   - every detection at p/q (p, q <= 8, 2e-3) of the result joins the new
+ *     family: FUNDAMENTAL at 1/1, HARMONIC otherwise.
+ *
+ * Sensitivity (measured, the scaled scene of tests/test_lagscan.py): the
+ * period at -14 dB in-band over 4 s, where the survey's candidates no longer
+ * hold it; at -6 dB, one family at the true period from 83 detections.
+ * Cost: about n log n P x nlags per base period, the base periods in
+ * parallel; per family a few dozen direct folds of all the data. The family's
+ * period (to a fraction of a sample over the record) feeds psync / the
+ * bootstrap like a candidate's. */
+#define ATKDSP_LAGSCAN_DETECT      1u
+#define ATKDSP_LAGSCAN_HARMONIC    2u    /* p/q (not 1/1) of its family's period */
+#define ATKDSP_LAGSCAN_SHORT       4u    /* fewer than 16 periods in the data   */
+#define ATKDSP_LAGSCAN_FUNDAMENTAL 8u    /* its family's period                 */
+#define ATKDSP_LAGSCAN_FAM_UP      1u    /* the period is a whole multiple of the seed's */
+#define ATKDSP_LAGSCAN_FAM_DOWN    2u    /* ... a whole fraction (after any steps up)   */
+#define ATKDSP_LAGSCAN_FAM_OUTSIDE 4u    /* the period lies outside [pmin, pmax)        */
+typedef struct {
+    double  fs;               /* the cell's sample rate                          */
+    int32_t pmin, pmax;       /* base periods scanned, samples: pmin <= P < pmax  */
+    int32_t nlags;            /* lag products per base period (8; 1..64)         */
+    int32_t lag_min;          /* the shortest lag (12: past a cell's noise correlation) */
+    double  lag_frac;         /* the longest lag = max(lag_min + 1, lag_frac P) (0.5) */
+    int32_t nmax;             /* the most periods folded, a power of two (32768) */
+    int32_t reserved0;
+    double  pfa;              /* per scan, over every trial (1e-3)               */
+    double  trim;             /* the largest trials left out of the null fit (0.005) */
+    int32_t reserved[4];
+} atkdsp_lagscan_cfg;         /* 72 bytes */
+typedef struct {
+    double   period_samples;  /* the best trial, refined; 0 when not scanned     */
+    double   period_s;
+    double   log10_pfa;       /* corrected for every trial of the scan          */
+    double   log10_pfa_raw;   /* one trial                                       */
+    double   stat;            /* S at the best trial                             */
+    double   shape, scale;    /* the null: M copies of c x the spectrum (M, c)   */
+    double   excess;          /* (S - null mean) / null mean                     */
+    int32_t  base, nfold;     /* P; n periods folded (0: SHORT)                  */
+    int32_t  harmonic_p, harmonic_q;  /* period ~ p/q x its family's (0/0: further) */
+    int32_t  family;          /* index into the families, -1: none              */
+    uint32_t flags;           /* ATKDSP_LAGSCAN_*                                */
+    int32_t  method[2];
+} atkdsp_lagscan_row;         /* 96 bytes */
+typedef struct {
+    double   period_samples;  /* resolved and refined over all the data          */
+    double   period_s;
+    double   log10_pfa;       /* the seed's, scan-corrected                      */
+    double   log10_step;      /* the last step up's residual tail (0: no step up) */
+    double   fold_snr;        /* the folded pattern's power over the noise's, per bin, at the period */
+    int32_t  seed_base;       /* the row it grew from                            */
+    int32_t  seed_p, seed_q;  /* the seed's period ~ p/q x this one (0/0: further) */
+    int32_t  members;         /* rows marked as this family's                    */
+    uint32_t flags;           /* ATKDSP_LAGSCAN_FAM_*                            */
+    int32_t  method[2];
+    int32_t  reserved;
+} atkdsp_lagscan_family;      /* 72 bytes */
+ATKDSP_API void      atkdsp_lagscan_defaults(atkdsp_lagscan_cfg *cfg, double fs, int pmin, int pmax);
+/* One row per base period, pmin first (cap >= pmax - pmin); returns the row
+ * count or an error. Families (most significant first) up to fcap (at most
+ * 64), *nfam the count — with fcap 0, fams and nfam may be NULL and no row is
+ * marked; *ntrials (may be NULL) the trials scanned. */
+ATKDSP_API ptrdiff_t atkdsp_lagscan(const atkdsp_cf32 *y, size_t n, const atkdsp_lagscan_cfg *cfg,
+                                    atkdsp_lagscan_row *rows, size_t cap,
+                                    atkdsp_lagscan_family *fams, size_t fcap, size_t *nfam,
+                                    double *ntrials);
+
+/* ---- 32. Analog video: composite samples to pictures (§C6, docs/VIDEO_PLAN.md) --
+ * Real composite-video samples in (after an FM or AM detector: an OSX / DDC
+ * channel, then atkdsp_fm_demod or atkdsp_am_demod, then a ~5 MHz low-pass),
+ * frames of luma out — float32, 0 = black, 1 = white, width x lines, row 0
+ * the top — each with its lock metadata. Written from the video standards
+ * (SMPTE ST 170, ITU-R BT.1700 / BT.470, BT.601), NOT from sigutils'
+ * tvproc.c (rule 7). The twin is reference.py §32 (class Video); src/video.c
+ * says how each stage works and where each number comes from.
+ *
+ * Stages: a 0.5 us box-smoothed sync slicer with hysteresis (sub-sample 50 %
+ * edges, the standard's 0H) -> pulse classes (equalizing / H / broad) -> a
+ * second-order line-locked loop that coasts through the vertical interval and
+ * through dropouts of up to 64 lines -> fields, their order, interlaced or
+ * progressive -> line rendering (Keys cubic, per-line DC restore from the back
+ * porch, chroma trap or line comb) -> frames (weave / one field / progressive)
+ * -> motion-aware stacking (a 1/N exponential average per 8x8 block, reset
+ * where the block moved by more than four standard deviations of its noise).
+ *
+ * Everything runs in SEGMENTS of S = round(fs x 64 us) samples on the global
+ * sample index, so the same stream chunked any way gives the same frames.
+ * Frames appear only with field lock: a train of line-rate pulses with no
+ * field structure (a radar, say) is never shown as a picture.
+ *
+ * Polarity AUTO runs both polarities until one has field lock, then only
+ * that one. Standard AUTO names 525 / 625 from the measured line rate and
+ * field length, or CUSTOM with the measured numbers.
+ *
+ * Nothing in atkdsp_video_process allocates: every buffer is sized at create
+ * (or by atkdsp_video_set when the width changes) for the largest frame,
+ * 2 x 420 lines. Memory at width 720 is about 20 MB (two polarities' field
+ * buffers, a four-frame queue and the stacking average). */
+enum { ATKDSP_VID_STD_AUTO = 0, ATKDSP_VID_STD_525 = 1, ATKDSP_VID_STD_625 = 2,
+       ATKDSP_VID_STD_CUSTOM = 3 };
+enum { ATKDSP_VID_POL_AUTO = 0, ATKDSP_VID_POL_NORMAL = 1, ATKDSP_VID_POL_INVERTED = 2 };
+enum { ATKDSP_VID_YC_OFF = 0, ATKDSP_VID_YC_TRAP = 1, ATKDSP_VID_YC_COMB = 2 };
+enum { ATKDSP_VID_INTERLACED = 0, ATKDSP_VID_ONE_FIELD = 1, ATKDSP_VID_PROGRESSIVE = 2 };
+
+typedef struct {
+    double  fs;              /* composite sample rate, Hz: 4e6 .. 200e6                */
+    double  custom_line_hz;  /* STD_CUSTOM only: 5,000 .. 40,000                      */
+    int32_t standard;        /* ATKDSP_VID_STD_*                                      */
+    int32_t custom_lines;    /* STD_CUSTOM only: lines a frame, 200 .. 840            */
+    int32_t polarity;        /* ATKDSP_VID_POL_*                                      */
+    int32_t yc;              /* ATKDSP_VID_YC_*: trap (default), comb, off            */
+    int32_t fields;          /* ATKDSP_VID_INTERLACED / _ONE_FIELD / _PROGRESSIVE     */
+    int32_t swap_fields;     /* 0/1: put the other field on top                       */
+    int32_t width;           /* pixels a line, 64 .. 1920 (default 720)               */
+    int32_t stack;           /* frames averaged, 1 .. 64 (1 = off)                    */
+    int32_t motion_aware;    /* 0/1: restart a block's average where it moved         */
+    int32_t reserved[3];
+} atkdsp_video_config;       /* 64 bytes */
+
+typedef struct {
+    int64_t sample0;         /* input sample index of the frame's first line 0H (caller -> UTC) */
+    int32_t standard;        /* ATKDSP_VID_STD_525 / _625 / _CUSTOM (never AUTO)       */
+    int32_t polarity;        /* 1 normal, 2 inverted                                    */
+    int32_t progressive;     /* 1 when every field is a frame                           */
+    int32_t field_order;     /* 0 = field A on top, 1 = swapped                         */
+    int32_t width, lines;    /* this frame's geometry                                   */
+    double  line_hz;         /* measured                                                */
+    double  lines_per_field; /* measured                                                */
+    float   h_lock;          /* 0..1: lines accepted of the last 64 x timing quality    */
+    float   snr_db;          /* sync amplitude to back-porch noise, dB                  */
+    int32_t v_lock;          /* 1 (frames exist only with field lock)                   */
+    int32_t stacked;         /* the median 8x8 block's depth of averaging               */
+} atkdsp_video_meta;         /* 64 bytes */
+
+typedef struct {
+    uint64_t samples_in, lines_locked, lines_coasted, pulses_rejected;
+    uint64_t fields, fields_rendered, frames_out, frames_dropped;
+    uint64_t h_relocks, v_relocks, polarity_flips;
+} atkdsp_video_counters;     /* 88 bytes */
+
+typedef struct atkdsp_video atkdsp_video;
+ATKDSP_API void          atkdsp_video_defaults(atkdsp_video_config *cfg);
+/* NULL on an invalid configuration (the binding prints the reason) or no memory. */
+ATKDSP_API atkdsp_video *atkdsp_video_create(const atkdsp_video_config *cfg);
+ATKDSP_API void          atkdsp_video_destroy(atkdsp_video *v);
+/* Forget everything: lock, levels, fields, the stack and waiting frames. */
+ATKDSP_API void          atkdsp_video_reset(atkdsp_video *v);
+/* New settings from the next segment on. Display settings (width, fields,
+ * swap_fields, yc, stack, motion_aware) change in place and keep lock; a new
+ * standard, custom timing or polarity re-acquires. fs cannot change. A width
+ * change reallocates here (never in process) and empties the frame queue.
+ * ATKDSP_E_ARG on an invalid configuration, ATKDSP_E_NOMEM. */
+ATKDSP_API int           atkdsp_video_set(atkdsp_video *v, const atkdsp_video_config *cfg);
+/* Feed n composite samples. Returns the number of frames waiting (0..4), or
+ * ATKDSP_E_ARG. A fifth frame drops the oldest (counted). */
+ATKDSP_API ptrdiff_t     atkdsp_video_process(atkdsp_video *v, const float *x, size_t n);
+/* The oldest waiting frame: 1 = copied into pix (width x lines floats) and
+ * removed; 0 = none waiting; ATKDSP_E_CAP = cap too small — meta is filled
+ * and the frame stays, so a caller may call with pix NULL, cap 0 to read the
+ * geometry first. */
+ATKDSP_API int           atkdsp_video_frame(atkdsp_video *v, float *pix, size_t cap,
+                                            atkdsp_video_meta *meta);
+/* "video: 525-line, interlaced, locked (H 0.98, V yes), 15734.3 Hz line rate,
+ * 262.5 lines a field, 720 px of which about 720 are real at 13.5 MS/s,
+ * chroma trap, stack 1, normal polarity (auto)." */
+ATKDSP_API int           atkdsp_video_describe(const atkdsp_video *v, char *buf, size_t cap);
+ATKDSP_API int           atkdsp_video_stats(const atkdsp_video *v, atkdsp_video_counters *st);
 
 #ifdef __cplusplus
 }

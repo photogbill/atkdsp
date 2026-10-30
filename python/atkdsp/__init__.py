@@ -54,7 +54,7 @@ __all__ = [
 #: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
 #:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
 #:    window's bin correlation) and block_code_id's fixed_bits.
-ABI_VERSION = 23
+ABI_VERSION = 26
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -3440,7 +3440,7 @@ class _ScanLine(C.Structure):
 class _DsssCodeCfg(C.Structure):
     _fields_ = [("fs", C.c_double), ("rc", C.c_double), ("period_s", C.c_double),
                 ("chip_mod", C.c_int32), ("vote_passes", C.c_int32), ("poly_max_degree", C.c_int32),
-                ("no_cfo", C.c_int32), ("pfa", C.c_double), ("reserved", C.c_int32 * 2)]
+                ("no_cfo", C.c_int32), ("pfa", C.c_double), ("no_decim", C.c_int32), ("reserved", C.c_int32)]
 
 
 class _DsssCodeResult(C.Structure):
@@ -3691,7 +3691,7 @@ DSSS_H_FLUCT, DSSS_H_CAV, DSSS_H_ACF = 1, 2, 4
 DSSS_FLUCT, DSSS_CAV, DSSS_PERIOD, DSSS_WARMUP, DSSS_ACF, DSSS_DETECT = 1, 2, 4, 8, 16, 32
 SCAN_LINE, SCAN_HARMONIC, SCAN_WARMUP = 1, 2, 4
 CHIP_BPSK, CHIP_QPSK, CHIP_OQPSK = 0, 1, 2
-CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED = 1, 2, 4, 8, 16, 32
+CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED, CODE_DECIM, CODE_REGEN = 1, 2, 4, 8, 16, 32, 64, 128
 POLY_NONE, POLY_BM, POLY_PARITY = 0, 1, 2
 ACQ_NPDI, ACQ_MBAPDI, ACQ_DETECT = 0, 1, 1
 TRK_LOCK, TRK_VALID_CN0, TRK_DISTORTED, TRK_POWER_HIGH = 1, 2, 4, 8
@@ -3737,6 +3737,19 @@ def primitive_polys(degree: int) -> list:
 def parity_z(chips, poly: int, degree: int) -> float:
     p, a = _i8(chips)
     return float(load().atkdsp_parity_z(p, a.size, C.c_uint64(int(poly)), int(degree)))
+
+
+def parity_z_frob(chips, poly: int, degree: int):
+    """(Z, N) over the Frobenius stack — binding of atkdsp_parity_z_frob."""
+    lib = load()
+    if not getattr(lib, "_frob_bound", False):
+        lib.atkdsp_parity_z_frob.argtypes = [C.POINTER(C.c_int8), C.c_int, C.c_uint64, C.c_int, C.POINTER(C.c_int32)]
+        lib.atkdsp_parity_z_frob.restype = C.c_double
+        lib._frob_bound = True
+    p, a = _i8(chips)
+    n = C.c_int32(0)
+    z = lib.atkdsp_parity_z_frob(p, a.size, C.c_uint64(int(poly)), int(degree), C.byref(n))
+    return float(z), int(n.value)
 
 
 def cav_threshold(lags: int, ns: float, pfa: float) -> float:
@@ -3883,7 +3896,7 @@ def dsss_code(iq, cfg: dict):
     a = _cf32(iq)
     c = _DsssCodeCfg()
     lib.atkdsp_dsss_code_defaults(C.byref(c), float(cfg["fs"]), float(cfg["rc"]), float(cfg["period_s"]))
-    for k in ("chip_mod", "vote_passes", "poly_max_degree", "no_cfo"):
+    for k in ("chip_mod", "vote_passes", "poly_max_degree", "no_cfo", "no_decim"):
         if k in cfg:
             setattr(c, k, int(cfg[k]))
     if "pfa" in cfg:
@@ -4643,4 +4656,249 @@ def hit_import(blob: bytes):
 
 __all__ += ["psync_defaults", "psync", "bootstrap_defaults", "bootstrap", "hit_export", "hit_import",
             "PS_DETECT", "PS_RATE", "PS_EDGE", "PS_BUDGET", "PS_MULTI", "PS_RECUT",
-            "BS_DETECT", "BS_CODE", "BS_REFUSED", "BS_RC_GIVEN", "BS_HARMONIC", "UT_BLOB_VERSION"]
+            "BS_DETECT", "BS_CODE", "BS_REFUSED", "BS_RC_GIVEN", "BS_HARMONIC", "UT_BLOB_VERSION",
+            "parity_z_frob", "CODE_DECIM", "CODE_REGEN"]
+
+
+
+# ---- §31 Undertow piece 5: the full lag scan ------------------------------------
+class _LagscanCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("pmin", C.c_int32), ("pmax", C.c_int32), ("nlags", C.c_int32),
+                ("lag_min", C.c_int32), ("lag_frac", C.c_double), ("nmax", C.c_int32),
+                ("reserved0", C.c_int32), ("pfa", C.c_double), ("trim", C.c_double),
+                ("reserved", C.c_int32 * 4)]
+
+
+class _LagscanRow(C.Structure):
+    _fields_ = [(k, C.c_double) for k in ("period_samples", "period_s", "log10_pfa", "log10_pfa_raw",
+                                          "stat", "shape", "scale", "excess")] + \
+               [(k, C.c_int32) for k in ("base", "nfold", "harmonic_p", "harmonic_q", "family")] + \
+               [("flags", C.c_uint32), ("method", C.c_int32 * 2)]
+
+
+class _LagscanFamily(C.Structure):
+    _fields_ = [(k, C.c_double) for k in ("period_samples", "period_s", "log10_pfa", "log10_step", "fold_snr")] + \
+               [(k, C.c_int32) for k in ("seed_base", "seed_p", "seed_q", "members")] + \
+               [("flags", C.c_uint32), ("method", C.c_int32 * 2), ("reserved", C.c_int32)]
+
+
+def _bind_lagscan(lib) -> None:
+    P = C.POINTER
+    lib.atkdsp_lagscan_defaults.argtypes = [P(_LagscanCfg), C.c_double, C.c_int, C.c_int]
+    lib.atkdsp_lagscan_defaults.restype = None
+    lib.atkdsp_lagscan.argtypes = [P(_Cf32), C.c_size_t, P(_LagscanCfg), P(_LagscanRow), C.c_size_t,
+                                   P(_LagscanFamily), C.c_size_t, P(C.c_size_t), P(C.c_double)]
+    lib.atkdsp_lagscan.restype = C.c_ssize_t
+
+
+_BIND_EXTRA.append(_bind_lagscan)
+
+LAGSCAN_DETECT, LAGSCAN_HARMONIC, LAGSCAN_SHORT, LAGSCAN_FUNDAMENTAL = 1, 2, 4, 8
+LAGSCAN_FAM_UP, LAGSCAN_FAM_DOWN, LAGSCAN_FAM_OUTSIDE = 1, 2, 4
+
+
+def lagscan_defaults(fs: float, pmin: int = 16, pmax: int = 257) -> dict:
+    c = _LagscanCfg()
+    load().atkdsp_lagscan_defaults(C.byref(c), float(fs), int(pmin), int(pmax))
+    d = _struct_dict(c)
+    d.pop("reserved", None); d.pop("reserved0", None)
+    return d
+
+
+def lagscan(y, cfg: dict, fcap: int = 16):
+    """(rows, families, ntrials) — binding of atkdsp_lagscan (§31): one row
+    per base period, then up to fcap families, most significant first. Twin:
+    reference.lagscan."""
+    lib = load()
+    a = _cf32(y)
+    c = _LagscanCfg()
+    lib.atkdsp_lagscan_defaults(C.byref(c), float(cfg["fs"]), int(cfg["pmin"]), int(cfg["pmax"]))
+    _fill(c, {k: v for k, v in cfg.items() if k != "reserved0"})
+    nrow = max(0, c.pmax - c.pmin)
+    rows = (_LagscanRow * max(1, nrow))()
+    fcap = max(0, int(fcap))
+    fams = (_LagscanFamily * max(1, fcap))()
+    nf = C.c_size_t(0)
+    tot = C.c_double(0.0)
+    n = lib.atkdsp_lagscan(_cfp(a), a.size, C.byref(c), rows, nrow, fams, fcap, C.byref(nf), C.byref(tot))
+    _check(n if n >= 0 else int(n), "lagscan")
+    out_f = []
+    for i in range(nf.value):
+        d = _struct_dict(fams[i])
+        d.pop("reserved", None)
+        out_f.append(d)
+    return [_struct_dict(rows[i]) for i in range(n)], out_f, float(tot.value)
+
+
+__all__ += ["lagscan_defaults", "lagscan", "LAGSCAN_DETECT", "LAGSCAN_HARMONIC", "LAGSCAN_SHORT",
+            "LAGSCAN_FUNDAMENTAL", "LAGSCAN_FAM_UP", "LAGSCAN_FAM_DOWN", "LAGSCAN_FAM_OUTSIDE"]
+
+
+# ============================================================================
+# §32 — analog video: composite to pictures (docs/VIDEO_PLAN.md, §C6)
+# ============================================================================
+_vid_log = _logging.getLogger("atkdsp.video")
+
+
+class _VideoConfig(C.Structure):
+    _fields_ = [("fs", C.c_double), ("custom_line_hz", C.c_double),
+                ("standard", C.c_int32), ("custom_lines", C.c_int32),
+                ("polarity", C.c_int32), ("yc", C.c_int32), ("fields", C.c_int32),
+                ("swap_fields", C.c_int32), ("width", C.c_int32), ("stack", C.c_int32),
+                ("motion_aware", C.c_int32), ("reserved", C.c_int32 * 3)]
+
+
+class _VideoMeta(C.Structure):
+    _fields_ = [("sample0", C.c_int64), ("standard", C.c_int32), ("polarity", C.c_int32),
+                ("progressive", C.c_int32), ("field_order", C.c_int32),
+                ("width", C.c_int32), ("lines", C.c_int32),
+                ("line_hz", C.c_double), ("lines_per_field", C.c_double),
+                ("h_lock", C.c_float), ("snr_db", C.c_float),
+                ("v_lock", C.c_int32), ("stacked", C.c_int32)]
+
+
+_VIDEO_COUNTERS = ("samples_in", "lines_locked", "lines_coasted", "pulses_rejected", "fields",
+                   "fields_rendered", "frames_out", "frames_dropped", "h_relocks", "v_relocks",
+                   "polarity_flips")
+
+
+class _VideoCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in _VIDEO_COUNTERS]
+
+
+def _bind_video(lib) -> None:
+    P = C.POINTER
+    vp, sz, i = C.c_void_p, C.c_size_t, C.c_int
+    lib.atkdsp_video_defaults.argtypes = [P(_VideoConfig)]
+    lib.atkdsp_video_defaults.restype = None
+    lib.atkdsp_video_create.argtypes = [P(_VideoConfig)]
+    lib.atkdsp_video_create.restype = vp
+    lib.atkdsp_video_destroy.argtypes = [vp]
+    lib.atkdsp_video_destroy.restype = None
+    lib.atkdsp_video_reset.argtypes = [vp]
+    lib.atkdsp_video_reset.restype = None
+    lib.atkdsp_video_set.argtypes = [vp, P(_VideoConfig)]
+    lib.atkdsp_video_set.restype = i
+    lib.atkdsp_video_process.argtypes = [vp, P(C.c_float), sz]
+    lib.atkdsp_video_process.restype = C.c_ssize_t
+    lib.atkdsp_video_frame.argtypes = [vp, P(C.c_float), sz, P(_VideoMeta)]
+    lib.atkdsp_video_frame.restype = i
+    lib.atkdsp_video_describe.argtypes = [vp, C.c_char_p, sz]
+    lib.atkdsp_video_describe.restype = i
+    lib.atkdsp_video_stats.argtypes = [vp, P(_VideoCounters)]
+    lib.atkdsp_video_stats.restype = i
+
+
+_BIND_EXTRA.append(_bind_video)
+
+
+def _video_cfg(cfg: dict, base: dict | None = None):
+    c = dict(base) if base is not None else _ref.video_defaults()
+    for key, v in cfg.items():
+        if key not in c:
+            raise AtkDspError(f"unknown video option {key!r}; known: {sorted(c)}")
+        c[key] = v
+    c = _ref._vid_norm(c)
+    why = _ref._video_check(c)
+    if why:
+        raise AtkDspError(f"video refused — {why}")
+    k = _VideoConfig()
+    for key, v in c.items():
+        setattr(k, key, v)
+    return c, k
+
+
+def _video_meta(m) -> dict:
+    return {"sample0": int(m.sample0), "standard": int(m.standard), "polarity": int(m.polarity),
+            "progressive": int(m.progressive), "field_order": int(m.field_order),
+            "width": int(m.width), "lines": int(m.lines), "line_hz": float(m.line_hz),
+            "lines_per_field": float(m.lines_per_field), "h_lock": float(m.h_lock),
+            "v_lock": int(m.v_lock), "snr_db": float(m.snr_db), "stacked": int(m.stacked)}
+
+
+class Video:
+    """Analog video: composite samples in, luma frames out (atkdsp.h §32).
+    Options are the atkdsp_video_config fields as keywords (the twin's
+    reference.video_defaults() lists them). process() returns the number of
+    frames waiting; frame() returns (pixels H x W float32, meta dict) or
+    None. The twin, reference.Video, is ATK's fallback: same answers, file
+    speed only."""
+
+    _kind = "video"
+
+    def __init__(self, **cfg):
+        self._lib = load()
+        self.cfg, k = _video_cfg(cfg)
+        self._h = self._lib.atkdsp_video_create(C.byref(k))
+        if not self._h:
+            raise AtkDspError(f"video_create({self.cfg}) refused (out of memory?)")
+        self._ncalls = 0
+        self._relocks = (0, 0)
+        _vid_log.info("video created: %s", self.describe())
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_video_destroy(h)
+
+    def reset(self) -> None:
+        self._lib.atkdsp_video_reset(self._h)
+        _vid_log.info("video reset")
+
+    def set(self, **cfg) -> None:
+        """New settings from the next segment on (display settings keep lock;
+        a new standard, custom timing or polarity re-acquires)."""
+        c, k = _video_cfg(cfg, self.cfg)
+        if c["fs"] != self.cfg["fs"]:
+            raise AtkDspError("video set refused — fs cannot change (create a new one)")
+        rc = self._lib.atkdsp_video_set(self._h, C.byref(k))
+        if rc != 0:
+            _vid_log.warning("video_set(%s) returned %d", c, rc)
+        _check(rc, "video_set")
+        self.cfg = c
+        _vid_log.info("video settings: %s", c)
+
+    def process(self, x) -> int:
+        a = _f32(x)
+        n = self._lib.atkdsp_video_process(self._h, _fp(a), a.size)
+        if n < 0:
+            _vid_log.warning("video_process(%d samples) returned %d", a.size, n)
+        _check(n, "video_process")
+        self._ncalls += 1
+        st = self.stats()
+        rel = (st["h_relocks"], st["v_relocks"])
+        if rel != self._relocks:                       # a lock change: say what it is now
+            self._relocks = rel
+            _vid_log.info("video: %s", self.describe())
+        if self._ncalls % 1000 == 0:
+            _vid_log.debug("video stats: %s", st)
+        return int(n)
+
+    def frame(self):
+        m = _VideoMeta()
+        rc = self._lib.atkdsp_video_frame(self._h, None, 0, C.byref(m))
+        if rc == 0:
+            return None
+        if rc != -3:                                    # ATKDSP_E_CAP is the expected answer
+            _vid_log.warning("video_frame(peek) returned %d", rc)
+            _check(rc, "video_frame")
+        pix = np.empty((m.lines, m.width), dtype=np.float32)
+        rc = self._lib.atkdsp_video_frame(self._h, _fp(pix.ravel()),
+                                          pix.size, C.byref(m))
+        if rc != 1:
+            _vid_log.warning("video_frame returned %d", rc)
+            _check(rc, "video_frame")
+        return pix, _video_meta(m)
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_video_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _VideoCounters()
+        self._lib.atkdsp_video_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n in _VIDEO_COUNTERS}
+
+
+__all__ += ["Video"]

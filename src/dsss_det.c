@@ -93,6 +93,11 @@ static const atkdsp_method_info METHODS[ATKDSP_METHOD_COUNT] = {
     {"period-synchronous eigen watch vs off-period references", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
     {"lag-rate period refinement (radar's keystone idea)", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
     {"bootstrap code recovery over the recording", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
+    {"m-sequence 2-adic decimation averaging", "ATK, after Golomb's decimation property", "2026", "atkdsp", "ATK"},
+    {"Frobenius parity stack (squared checks)", "Meier, Staffelbach", "1989", "J. Cryptology", "CH"},
+    {"chips regenerated from the named generator", "ATK", "2026", "atkdsp", "ATK"},
+    {"fast folding of lag products at every period", "Staelin (FFA, pulsar search); ATK", "1969 / 2026",
+     "Proc. IEEE / atkdsp", "US / ATK"},
 };
 
 const atkdsp_method_info *atkdsp_method(int method_id) {

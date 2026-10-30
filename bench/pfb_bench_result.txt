@@ -1,0 +1,9 @@
+atkdsp 0.23.1 - 0.23.1 abi 24 msvc avx2 openmp built Oct 30 2026 14:03:23
+configuration                          MS/s    1 thr    2 thr    4 thr    8 thr   16 thr   20 thr   (x real time)
+trunking grid, RTL 2.4 MS/s             2.4    25.00    37.54    65.03    68.90   118.52    99.14
+survey scale, 64 channels               2.4    31.27    59.70    87.88   104.55   166.00   118.82
+trunking grid, 10 MS/s                 10.0     6.91    12.36    17.74    20.79    31.91    23.31
+trunking grid, 20 MS/s                 20.0     2.90     5.17     8.00     8.79    12.10     9.76
+trunking grid, 40 MS/s                 40.0     1.37     2.37     3.36     3.94     4.81     4.54
+trunking grid, 56 MS/s                 56.0     0.89     1.49     2.26     2.63     3.14     3.14
+Kraken DF, 192 ch x 5 elements          2.4     5.47     8.25    11.15    14.76    17.62    19.40

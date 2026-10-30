@@ -727,7 +727,9 @@ chip rate, so the chip-rate line is weak.
 
 Nothing found handles band-limited chips below the floor.
 
-**Two ideas Bill relayed (03:08), sound, for `dsss_code` (v0.23):**
+**Two ideas Bill relayed (03:08), sound, for `dsss_code` — BUILT in v0.23.0
+(the README has the measurements; what building them found is noted after
+each):**
 1. **2-adic decimation averaging.** For an m-sequence of length L = 2^r − 1,
    c[2^m n mod L] is a cyclic shift of c[n] (the Frobenius automorphism). So
    the r decimations of the soft-chip vector, aligned by their cyclic shifts
@@ -736,12 +738,23 @@ Nothing found handles band-limited chips below the floor.
    10·log₁₀ r dB per chip (7 dB at 31 chips, 10 dB at 1023). Not for Gold
    codes (each component shifts differently). The technique is known in
    coding as permutation / automorphism-ensemble decoding.
+   *Built (CODE_DECIM):* applied only when every decimation correlates
+   significantly. It cuts chip errors before naming (127 chips, −18 dB, 150
+   periods: 2–5 → 0–1) but changed no end-to-end outcome measured: the
+   eigenvector's identifiability gate refuses before the errors outgrow the
+   parity stack, and a named generator regenerates the chips anyway.
 2. **The Frobenius parity stack.** Over GF(2), g(x)^(2^m) = g(x^(2^m)): every
    parity check's squares are checks too, at power-of-two lags — the
    low-weight-multiple trick of fast correlation attacks (Meier &
    Staffelbach, CH 1989; already cited for parity counting). Summing the
    parity statistic over the orbit gives about √r more deflection when
    naming the generator through chip errors.
+   *Built (`atkdsp_parity_z_frob`):* the √r is real, but the images are not
+   independent looks — a threshold counting only the polynomials false-named
+   5× its design at 31 chips. Each image is counted as a hypothesis
+   (Bonferroni), which holds the design rate (11/4,000 against ~8 at 31
+   chips). At 16 % chip errors on 127 chips it names the generator 39/40
+   against plain parity's 15/40.
 
 Rejected from the same exchange, with reasons in the conversation: quantile /
 Wasserstein envelope tests (a robust variant of the chip-rate envelope

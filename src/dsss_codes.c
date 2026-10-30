@@ -149,3 +149,47 @@ double atkdsp_parity_z(const int8_t *chips, int L, uint64_t poly, int degree) {
     }
     return z;
 }
+
+/* The Frobenius parity stack (v0.23; atkdsp.h §25d). Over GF(2),
+ * g(x)^(2^m) = g(x^(2^m)): a check polynomial's squares are checks too, at
+ * taps 2^m t mod L (the low-weight-multiple trick of fast correlation
+ * attacks, Meier & Staffelbach 1989). Z sums (-1)^parity over every cyclic
+ * position of every DISTINCT image (r of them for L = 2^r - 1); *nchecks gets
+ * N, the checks counted. Twin: reference.parity_z_frob. */
+double atkdsp_parity_z_frob(const int8_t *chips, int L, uint64_t poly, int degree, int32_t *nchecks) {
+    if (nchecks) *nchecks = 0;
+    if (!chips || L < 2 || degree < 1 || degree > 63) return 0.0;
+    int taps0[64], nt = 0;
+    for (int i = 0; i <= degree; i++) if ((poly >> i) & 1u) taps0[nt++] = i;
+    int seen[64][64], nseen = 0;
+    double z = 0.0;
+    int32_t N = 0;
+    long long mult = 1;
+    for (int img = 0; img < 64; img++) {
+        int taps[64];
+        for (int t = 0; t < nt; t++) taps[t] = (int)(((long long)taps0[t] * mult) % L);
+        for (int a = 1; a < nt; a++) {                      /* sort, to compare tap sets */
+            const int v = taps[a]; int b = a - 1;
+            while (b >= 0 && taps[b] > v) { taps[b + 1] = taps[b]; b--; }
+            taps[b + 1] = v;
+        }
+        int dup = 0;
+        for (int s = 0; s < nseen && !dup; s++) {
+            int same = 1;
+            for (int t = 0; t < nt; t++) same &= seen[s][t] == taps[t];
+            dup = same;
+        }
+        if (dup) break;
+        if (nseen < 64) { memcpy(seen[nseen], taps, (size_t)nt * sizeof taps[0]); nseen++; }
+        for (int n = 0; n < L; n++) {
+            int par = 0;
+            for (int t = 0; t < nt; t++) par ^= (chips[(n + taps[t]) % L] < 0);
+            z += par ? -1.0 : 1.0;
+        }
+        N += L;
+        mult = (mult * 2) % L;
+        if (mult == 1) break;
+    }
+    if (nchecks) *nchecks = N;
+    return z;
+}

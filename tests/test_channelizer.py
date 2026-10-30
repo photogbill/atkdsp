@@ -355,3 +355,57 @@ def test_osx_retune_to_an_odd_bin_stays_on_centre():
     y = o.process(_tone(off + 7e3, 4096 * 50))[0][c]
     f, res = _peak_hz(y[400:], OSX_RATE)
     assert abs(f - 7e3) <= res
+
+
+# ---- v0.24: the PFB fast path (threads over hops, float fold, tiled output) --
+# Bill, 2026-10-30: "With one radio its work runs on 1 of your 20 threads. It
+# also mixes double and single precision, which blocks fast vector math, and
+# it writes its output in an order that misses the cache on almost every
+# value." All three were so (src/channelizer.c, v0.24 notes). What must not
+# change: the output at any thread count and any block split, bit for bit;
+# and its distance from the float64 twin (measured ~1e-7 relative, as v0.23).
+@needs_lib
+@pytest.mark.parametrize("nchan,os_,nel", [(24, 2, 1), (200, 2, 1), (64, 4, 1), (60, 3, 2), (192, 2, 5)])
+def test_pfb_one_radio_is_identical_at_any_thread_count_and_split(nchan, os_, nel):
+    rng = np.random.default_rng(nchan + nel)
+    n = nchan * 300 + 17
+    xs = [(rng.standard_normal(n) + 1j * rng.standard_normal(n)).astype(np.complex64) for _ in range(nel)]
+    before = atkdsp.get_threads()
+    try:
+        outs = []
+        for th in (1, 2, 3, 7):
+            atkdsp.set_threads(th)
+            outs.append(np.asarray(atkdsp.Pfb(FS, nchan, os_, max_nel=nel).process_n(xs, nel)))
+        p = atkdsp.Pfb(FS, nchan, os_, max_nel=nel)
+        parts, pos = [], 0
+        for b in (5, nchan * 7 + 3, 1, n):
+            o = np.asarray(p.process_n([x[pos:pos + b] for x in xs], nel))
+            if o.shape[-1]:
+                parts.append(o)
+            pos += b
+            if pos >= n:
+                break
+        split = np.concatenate(parts, axis=-1)
+    finally:
+        atkdsp.set_threads(before)
+    for o in outs[1:]:
+        assert np.array_equal(outs[0], o)
+    m = min(outs[0].shape[-1], split.shape[-1])
+    assert np.array_equal(outs[0][..., :m], split[..., :m])
+    yt = np.asarray(ref.Pfb(FS, nchan, os_, max_nel=nel).process_n(xs, nel))
+    m = min(m, yt.shape[-1])
+    rel = np.max(np.abs(outs[0][..., :m] - yt[..., :m])) / np.max(np.abs(yt[..., :m]))
+    assert rel < 5e-7, rel                       # float accuracy (v0.23: ~1e-7 too)
+
+
+@needs_lib
+@pytest.mark.parametrize("nchan", [1024, 1026, 2048])
+def test_pfb_long_transforms_match_the_twin(nchan):
+    """Past 1024 channels pocketfft's work buffer comes from the heap again
+    (the stack buffer is for short transforms); both paths are checked."""
+    rng = np.random.default_rng(nchan)
+    x = (rng.standard_normal(nchan * 40) + 1j * rng.standard_normal(nchan * 40)).astype(np.complex64)
+    yc = atkdsp.Pfb(FS, nchan).process(x)
+    yt = ref.Pfb(FS, nchan).process(x)
+    m = min(yc.shape[1], yt.shape[1])
+    assert np.max(np.abs(yc[:, :m] - yt[:, :m])) / np.max(np.abs(yt[:, :m])) < 5e-7

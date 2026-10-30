@@ -99,7 +99,195 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.22.0 (ABI 23)
+## What is in v0.25.0 (ABI 26)
+
+**Analog video (`atkdsp_video`, header §32, twin `reference.py` §32, 51 tests
+in `tests/test_video.py`, a smoke block).** Staged on 2026-10-30 by the
+instance that reviewed SigDigger for ATK (`ATK\docs\SIGDIGGER_PARITY_PLAN.md`)
+and merged here. It was written as §31; the lag scan took that number, so it
+is §32. Composite video in (after an FM or AM detector), luma frames out
+with lock metadata:
+- 525 / 625 / measured-custom standards; auto polarity;
+- interlaced, one-field or progressive;
+- chroma trap or line comb;
+- motion-aware frame stacking.
+
+Written from the video standards (SMPTE ST 170, ITU-R BT.1700 / BT.470 /
+BT.601), **not** from sigutils' `tvproc.c` (rule 7). The full design, and
+where the code differs from it, is `docs/VIDEO_PLAN.md`.
+
+Measured by the instance that wrote it (synthetic NTSC through an FM link):
+lock and an exact frame counter down to 8 dB CNR at 13.5 MS/s (6 dB at
+20 MS/s), and 4–5× real time at 20 MS/s on one core. Every negative control
+makes no frame: noise, an FM voice carrier, OFDM-like bursts, and a
+radar-like pulse train at the line rate (line lock at most, never field
+lock). Here, merged: the smoke block and all 51 tests pass (C against the twin, in
+1-sample blocks and through live `set()` calls), also under ASan + UBSan; the
+whole suite 1163 passed. Not yet built with MSVC — `build.bat /only atkdsp
+/test` is the first time.
+
+The consumers are ATK's "Look" viewer, Bug Sniffer's VIDEO step and Drone
+Discovery's FPV picture; ATK's viewer (`atk/core/video_rx.py`,
+`atk/ui/video_view.py`) is not written yet.
+
+## What was in v0.24.0 (ABI 25)
+
+**The full lag scan (`atkdsp_lagscan`, header §31, twin `reference.py` §31,
+17 tests in `tests/test_lagscan.py`, a smoke line).** Bill, 2026-10-30:
+*"lets go ahead and build the full lag scan."* Below where the survey's
+candidates hold a code's period (about 2 dB under the survey's threshold),
+this searches **every period of one cell at once**:
+
+- **What it folds.** Lag products c_d[k] = y[k]·conj(y[k+d]) at 8 lags. The
+  data sign cancels inside a code period, and a carrier offset becomes a fixed
+  phase.
+- **How it folds every period.** The Fast Folding Algorithm (Staelin 1969,
+  the pulsar search): per base period P, n trial periods in n·log n·P
+  additions.
+- **What it reports.** One row per base period (a periodogram), and the
+  detections resolved into **families**: one per periodic emitter, at its
+  period to a fraction of a sample over the whole record. ATK hands that
+  period to Recover like a candidate's.
+
+What building it found, and what changed because of it:
+
+| finding (measured) | what was done |
+|---|---|
+| A moment-matched Gamma null (the first design) gave its stated 1e-3 **7× too often** on noise. Lag products of a filtered cell are correlated; the folded statistic is a sum with spread eigenvalues, and such a sum's far tail decays as its *largest* eigenvalue, slower than the Gamma's. | The null is now built from the cell's own correlation (its spectrum over the P bins), matched to each base period's trials. The tail is a saddlepoint (Lugannani-Rice; exact to 0.02 in log10 down to 1e-16 where a closed form exists). On 316 noise-only cells (1–4 s, scaled and real rate) it gives the stated rate within the counts. |
+| A strong code also folds partly at 2T, T/2, 3T/4 …: **83 rows detected** at −6 dB in 1 s, and the most significant was 2T/3. The fold's level cannot tell T from T/2. | **Families.** Detections seed, most significant first. Nested direct folds step the seed up to k·p or down to p/k (k ≤ 8), using the power that is not periodic in the shorter period. The families already found are taken off the lag products (CLEAN, Högbom 1974); a seed whose detection they explain joins them. Result: one family at T. Two codes in one cell give two families. A period below the scanned range is stepped down to (flagged OUTSIDE). |
+| The FFA's trial period is **not P + x** (x the drift a row). The FFA's P bins fold the period **P/(1 − x/P)**, and P + x is short by x²/P. At 82.67 that is 0.005 samples a period, 44 samples of drift over 8,192 periods. A real-rate cell gave two families for one code until this was fixed. | The rows report P/(1 − x/P), exact. Each family's period is then refined by direct folds over all the data. |
+
+Measured (C, this 2-core VM; the scaled scene of `tests/test_lagscan.py` and
+the same code at the real survey rate, 600 kS/s cells):
+
+| | 1 thread | 2 threads |
+|---|---|---|
+| 4 s of a 60 kS/s cell (240 k samples), every period 16–256 | 4.0 s | 2.1 s |
+| 2 s of a 600 kS/s cell (1.2 M samples), every period 16–256 | 26 s (rows 22.6, families 3.5) | 14 s |
+
+The rows run in parallel by base period (dynamic schedule, longest first); past 2
+cores it is not measured here. The family stage is a few dozen direct folds
+of the whole cell, each family's in parallel.
+
+| depth (true period found, no other family) | |
+|---|---|
+| 4 s at 60 kS/s: −14 / −15 / −16 / −17 dB in-band | 6/6, 6/6, 4/6, 1/6 |
+| 2 s at 600 kS/s (the real survey rate): −16 / −17 / −18 / −19 / −20 dB | 3/3, 3/3, 3/3, 2/3, 0/3 (Pfa at −18: 1e-9 to 1e-16) |
+
+At −14 dB (4 s, scaled) the survey's candidates no longer hold the period; the
+scan finds it to 4·10⁻⁵ samples a period. C equals the twin row for row and
+family for family (periods to 1e-6, tails to 2·10⁻⁷ relative), at any thread
+count. The
+statistic is second order: 6 dB less signal is 16× less folded excess, so the
+edge is sharp (at −18 dB the period came at 1e-9 or better; at −20 dB, in none of 3). Whole suite: 1112 passed, also under ASan + UBSan.
+
+**The channel splitter's tasks are now handed out dynamically**
+(`schedule(dynamic, 1)`, several small tasks a thread). Bill's 20-thread bench
+on v0.23.1 ran **slower at 20 threads than at 16**: equal shares on a hybrid
+CPU wait for the slow cores. The output is unchanged and identical at any
+thread count (tests). Run `pfb_bench.bat` again to see the 20-thread column.
+
+## What was in v0.23.1 (ABI 24 — no ABI change, a rebuild)
+
+**The channel splitter (`atkdsp_pfb`), several times faster.** Bill, 2026-10-30:
+*"With one radio its work runs on 1 of your 20 threads. It also mixes double
+and single precision, which blocks fast vector math, and it writes its output
+in an order that misses the cache on almost every value."* All three were so:
+
+| finding | was | now |
+|---|---|---|
+| threads | the one parallel loop ran over **elements**, so one radio (`nel = 1`) used one thread | every (element, run of hops) is a task; hops are independent, so the output is **identical at any thread count and block split** (tested at 1, 2, 3, 7 threads) |
+| precision | each tap's product formed in double, rounded to float, summed in float — a mix the compiler would not vectorise | a single-precision fold over duplicated taps, one flat multiply-add per tap, vectorised 8 wide (AVX2) — the same accuracy class (float accumulation either way) |
+| output order | `out[k*m + i]`: one 8-byte store per channel per hop, `m` apart — a cache miss nearly every time | each thread fills a 32-hop tile, then writes it channel by channel (256-byte runs) |
+| and two found on the way | the FFT copied float → double → float through a locked scratch slot each hop; pocketfft **malloc'd its work buffer on every transform** — on several threads, a shared allocator lock in the inner loop (a 24-channel bank did not speed up on 2 threads at all until it moved) | the FFT runs in place on the fold's double buffer; pocketfft's work buffer is on the stack up to 1,024 points (`vendor/pocketfft/pocketfft.c`, marked) |
+
+Measured here (`bin/atkdsp_bench_pfb`, a 2-core AVX2 Linux VM; × real time,
+higher is better, 1.0 = the worker exactly saturated; one radio unless noted;
+the new column is the range over two runs — this VM varies ±20 % run to run):
+
+| configuration | v0.23.0, 1 / 2 threads | v0.23.1, 1 / 2 threads |
+|---|---|---|
+| trunking grid (~100 kHz channels), 2.4 MS/s, 24 ch | 9.6 / 9.6 | **22–25 / 34–46** |
+| survey scale, 2.4 MS/s, 64 ch | 9.2 / 9.5 | **19–24 / 33–48** |
+| trunking grid, 10 MS/s, 100 ch | 2.1 / 2.2 | **6.0–7.6 / 11.7–13.4** |
+| trunking grid, 20 MS/s, 200 ch | 1.1 / 1.1 | **2.6–3.1 / 4.7–5.3** |
+| trunking grid, 40 MS/s, 400 ch | 0.54 / 0.54 | **1.2–1.4 / 2.0–2.2** |
+| trunking grid, 56 MS/s, 560 ch | 0.37 / 0.37 | **0.8–1.0 / 1.4–1.7** |
+| Kraken DF, 2.4 MS/s, 192 ch × 5 elements | 1.8 / 2.8 | **3.9–4.5 / 7.2–7.7** |
+
+One thread is about 2–3× faster; two are about 3.5–5× faster for one radio.
+The survey (one PFB per scale, plus its per-cell detectors, which did not
+change) went from 0.95× / 1.73× to 1.18× / 2.45× real time at 2.4 MS/s.
+Beyond
+two cores it is not measured here: **`pfb_bench.bat`** (double-click, after
+the build) runs the same table on the machine that matters at 1, 2, 4, 8, 16
+and every thread, and saves `bench\pfb_bench_result.txt`. Expect it to scale
+until memory bandwidth or the FFT (now ~30 % of the work, pocketfft in double)
+is the limit.
+
+**Accuracy, measured** (random input; N 24–2048; 2×, 3×, 4×; 1, 2 and 5
+elements): the output differs from v0.23.0 by at most 1.1·10⁻⁷ of full scale
+— float rounding — and from the float64 twin by at most 8.8·10⁻⁸ (v0.23.0:
+1.1·10⁻⁷). So the earlier "bit-identical" claims (v0.20 → v0.21) now read
+"identical to float precision"; chunk invariance and identical elements on
+identical input are still exact, and `tests/test_channelizer.py` holds them
+(plus 8 new tests: every thread count and split, and long transforms past the
+stack buffer). The survey, which runs one PFB per scale, inherits the speed.
+Whole suite: 1095 passed, also under ASan + UBSan.
+
+**Found on the way, not fixed in this release (next):** the known-code
+tracker (`atkdsp_dsss_trk`, v0.18.0) integrates its DLL discriminator into the
+code RATE with no proportional term — an undamped loop. Its tests (GPS C/A,
+1,023 chips at 1.023 Mchip/s) pass; a short code at a low chip rate does not
+lock (measured, 31 chips, 4 samples a chip, 0 dB a sample: locked at 1,023,
+225 and 90 kchip/s; lost at 45 and 22.5 kchip/s — the C twin and the numpy
+twin alike; a quick damped second-order DLL in the twin did not cure it, so
+the loops want a proper look, not a patch). Until then ATK's LPI / LPD Measure
+step despreads open loop, from the bootstrap's period and carrier.
+And `atkdsp_dsss_acquire` assumes a whole number of samples per period
+(non-integer: the correlation peak smears over the dwells) — resample first.
+
+## What was in v0.23.0 (ABI 24)
+
+**`atkdsp_dsss_code`, deeper and corrected** — the two ideas Bill relayed on
+2026-10-30 (`docs/DSSS_LITERATURE.md` §L), plus a long-standing bug found
+while measuring them, plus chip regeneration. No signature changes:
+`atkdsp_dsss_code_config` keeps its 56 bytes (`reserved[2]` became
+`no_decim` and one reserved word); one new function; two result flags.
+
+| | what | how |
+|---|---|---|
+| **the window-boundary tie** (a fix, since v0.18.0) | `atkdsp_dsss_code` step 1 | when the code's start met the wide window's, λ₂ ≈ λ₁ and the eigenvector was a mixture of two cuts; the old test (supports apart) missed it a few samples from the boundary and the decode came back confidently wrong. Now any λ₂ > 0.7 λ₁ re-cuts the windows half a period later and keeps the cut with the lower λ₂/λ₁. Measured on random code starts: 2, 7 and 8 wrong decodes in 40 (three scenes) → 0 in 40 |
+| **2-adic decimation averaging** | `CODE_DECIM`, `cfg.no_decim` | for an m-sequence (L = 2ʳ − 1), c[2ᵐn mod L] is a cyclic shift of c[n], so the soft chips' r decimations, aligned by circular correlation, are r looks at every chip with different noise. Applied only when **every** decimation correlates significantly (Φ⁻¹ of pfa/(2L(r−1)), over √L) — a Gold or arbitrary code fails that and is left alone (tested); margins then carry sd/√r. Measured: 127 chips, −18 dB, 150 periods — chip errors before naming 2–5 → 0–1 |
+| **the Frobenius parity stack** | `atkdsp_parity_z_frob` | over GF(2) a check polynomial's squares are checks too: the taps times 2ᵐ mod L. The checks of every distinct image are summed, z = Z/√N, and **each image counts as a hypothesis** in the threshold, k = Φ⁻¹(1 − pfa/(npolys·nimages)). Counting only the polynomials false-named 5× the design rate at 31 chips (the images move together — measured, fixed). On chips with 16 % errors, 127 chips: the generator named 39/40 against plain parity's 15/40; at 31 chips with 8/12/16 % errors, 36/27/14 of 40 against 13/7/1. On random chips, pfa 10⁻³ with both signs (design ~8 in 4,000): 11/4,000 false names at 31 chips, 0/4,000 at 127 |
+| **regeneration** | `CODE_REGEN` | a generator named by parity regenerates the chips — the m-sequence from the polynomial, aligned to the soft chips — so a named code comes back exact; the name says how many chips that fixed (`"; N fixed"`, when it fits the 47 characters) |
+
+End to end, the same scenes through v0.22's twin and v0.23's (40 seeds each,
+random code start, BPSK, one data bit a period; "wrong" = chips not the code):
+
+| scene | v0.22.0 | v0.23.0 |
+|---|---|---|
+| 31 chips, 4 samples a chip, −6 dB, 600 periods | 39 exact, 1 wrong | **40 exact** |
+| 127 chips, 2 a chip, −14 dB, 600 periods | 38 exact, 2 wrong | **40 exact** |
+| 127 chips, 2 a chip, −16 dB, 150 periods | 17 exact, 23 wrong | **40 exact** |
+| 127 chips, 2 a chip, −17 dB, 200 periods | 19 exact, 21 wrong | **40 exact** |
+| 31 chips, 4 a chip, −13 dB, 50 periods | 18 exact, 21 wrong, 1 refused | **38 exact**, 1 wrong (6 chips, and its name says "generator not confirmed"), 1 refused |
+
+**Where the gain comes from, honestly.** The tie fix, the stack and
+regeneration. Turning decimation off (`no_decim = 1`) leaves both bottom
+scenes' outcomes unchanged (40 exact; 38/1/1): in every scene measured here
+the identifiability gate refuses before the chip errors grow past what the
+stack names through, and once the generator is named the chips are
+regenerated exact either way. Decimation's value is the margins (sd/√r) and
+m-sequences the stack cannot name — degree above `poly_max_degree` (14), i.e.
+32,767 chips and up. The ~10·log₁₀ r dB it promises per chip is real at the
+chips; it does not move the end-to-end floor, which is the eigenvector's
+identifiability (more periods, or psync's longer watch). Tests: 8 new in
+`tests/test_phase6.py` (9 cases; C equals the twin at both `no_decim` settings), the
+smoke test's parity-stack line; the whole suite and the smoke test pass on
+Linux, also under ASan + UBSan.
+
+## What was in v0.22.0 (ABI 23)
 
 **Undertow, pieces 2, 4 and 6 — below the survey's floor, to the code.**
 Building piece 1 measured what limits the survey: Burel's fluctuation

@@ -25,6 +25,8 @@ else
   # the ring's stress test and Bill's bench (tests/test_ring_stress.c)
   $CC -std=c99 -O2 -D_POSIX_C_SOURCE=200112L -Iinclude tests/test_ring_stress.c -o bin/atkdsp_ring_stress \
       -Lbin -l:atkdsp.so -lpthread -lm -Wl,-rpath,'$ORIGIN'
+  # the channel splitter's bench (bench/bench_pfb.c)
+  $CC -std=c99 -O2 -Iinclude bench/bench_pfb.c -o bin/atkdsp_bench_pfb -Lbin -l:atkdsp.so -lm -Wl,-rpath,'$ORIGIN'
 fi
 ./bin/atkdsp_smoke
 ./bin/atkdsp_ring_stress 1

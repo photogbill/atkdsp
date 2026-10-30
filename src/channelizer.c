@@ -1,5 +1,16 @@
 /* THE CHANNELIZER (§28; docs/ATKDSP_PLAN.md §A4, docs/CHANNELIZER_DF_REQUIREMENTS.md).
  *
+ * 0.23.1 — the PFB's process path rewritten for speed (Bill's three findings,
+ * 2026-10-30, all confirmed in the code): threads over HOPS, not only
+ * elements (one radio used one thread); a single-precision fold over
+ * duplicated taps (the double-product-then-float mix did not vectorise); a
+ * hop-major tile written out channel by channel (the stride-m store missed
+ * the cache on nearly every value); the FFT in place on the fold's buffer.
+ * Measured on a 2-core AVX2 box (bench/bench_pfb.c): one radio 2.3-2.8x
+ * faster on one thread, 3.7-4.4x on two; e.g. 20 MS/s at ~100 kHz channels
+ * from 1.1x to 4.7x real time. Identical at any thread count; ~1e-7 from
+ * v0.23.0 and from the float64 twin.
+ *
  * 28b. the polyphase filterbank (PFB) — a uniform 2x-oversampled grid, every
  *      channel at once, N element streams on one block clock (the DF path).
  * 28a. the overlap-save extractor (OSX) — arbitrary channels at arbitrary
@@ -12,6 +23,9 @@
  */
 #include "internal.h"
 #include <stdio.h>
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
 
 double atk_kaiser_beta(double atten_db);                 /* src/design.c */
 
@@ -44,10 +58,19 @@ struct atkdsp_pfb {
     atkdsp_cf32 *leftover;            /* max_nel * hop, up to hop-1 used      */
     unsigned     lc;                  /* leftover count (same for all el)     */
     int64_t      b;                   /* global hop index (drives rotation)   */
-    /* shared per-hop scratch (one element at a time) */
-    atkdsp_cf32 *win;                 /* L                                    */
-    atkdsp_cf32 *folded;              /* nchan                                */
-    atkdsp_cf32 *X;                   /* nchan                                */
+    /* v0.24: the fold reads the taps in single precision, duplicated per
+     * re/im (2L floats), so its inner loop is one flat float multiply-add
+     * the compiler vectorises 8 wide; the rotation reads a double twiddle
+     * table (2 nchan). */
+    float       *hf;                  /* 2L: hf[2q] = hf[2q+1] = (float)h[q]  */
+    double      *twd;                 /* 2 nchan: cos, sin of 2 pi j / nchan  */
+    /* per-THREAD scratch (v0.24: hops run in parallel, not just elements):
+     * slot t = [win: L cf32][fold: 2 nchan floats][fft: 2 nchan doubles]
+     * [tile: PFB_TILE x nchan cf32], tslot_bytes apart; tslots grown
+     * (serially) when the thread count grows. */
+    unsigned char *tscratch;
+    int          tslots;
+    size_t       tslot_bytes;
     /* cal */
     atkdsp_cf32 *cal;                 /* max_nel * nchan, or NULL             */
     unsigned     cal_nel;
@@ -75,6 +98,43 @@ static void pfb_build_prototype(atkdsp_pfb *p) {
     }
 }
 
+/* hops per output tile: each thread transforms PFB_TILE hops into a
+ * hop-major tile, then writes the tile channel by channel — PFB_TILE
+ * consecutive samples of each channel's output (256 bytes at 32) instead of
+ * one 8-byte value per channel per hop at a stride of m (v0.23 and before:
+ * nearly every store a cache miss). */
+#define PFB_TILE 32
+/* a task (one element's run of hops) is at least this many hops, so a short
+ * block is not split into slivers that cost more to schedule than to run;
+ * and there are up to PFB_TASKS_PER_THREAD tasks a thread, handed out
+ * dynamically (0.24.0): on a hybrid CPU the efficiency cores are slower, and
+ * with one equal share a thread everyone waited on them — Bill's 14-core /
+ * 20-thread bench ran slower at 20 threads than at 16. */
+#define PFB_MIN_TASK 8
+#define PFB_TASKS_PER_THREAD 4
+
+static size_t pfb_align64(size_t b) { return (b + 63) & ~(size_t)63; }
+
+static size_t pfb_slot_bytes(const atkdsp_pfb *p) {
+    return pfb_align64(p->L * sizeof(atkdsp_cf32)) + pfb_align64(2 * (size_t)p->nchan * sizeof(float))
+         + pfb_align64(2 * (size_t)p->nchan * sizeof(double))
+         + pfb_align64((size_t)PFB_TILE * p->nchan * sizeof(atkdsp_cf32));
+}
+
+/* Make room for `nt` threads' scratch. Called serially (create, and the top
+ * of process_n before any parallel region) — so it only allocates when the
+ * thread count has GROWN since the last call, never per block. */
+static int pfb_ensure_slots(atkdsp_pfb *p, int nt) {
+    if (nt < 1) nt = 1;
+    if (nt <= p->tslots && p->tscratch) return ATKDSP_OK;
+    unsigned char *t = (unsigned char *)atk_aligned_malloc((size_t)nt * p->tslot_bytes);
+    if (!t) return ATKDSP_E_NOMEM;
+    atk_aligned_free(p->tscratch);
+    p->tscratch = t;
+    p->tslots = nt;
+    return ATKDSP_OK;
+}
+
 atkdsp_pfb *atkdsp_pfb_create(double fs, unsigned nchan, unsigned oversample,
                               unsigned taps_per_poly, double atten_db, unsigned max_nel) {
     if (!(fs > 0.0) || nchan < 2 || oversample < 1 || nchan % oversample != 0) return NULL;
@@ -92,17 +152,19 @@ atkdsp_pfb *atkdsp_pfb_create(double fs, unsigned nchan, unsigned oversample,
     p->twiddle = (atkdsp_cf32 *)malloc(nchan * sizeof(atkdsp_cf32));
     p->hist = (atkdsp_cf32 *)calloc((size_t)max_nel * p->ov, sizeof(atkdsp_cf32));
     p->leftover = (atkdsp_cf32 *)calloc((size_t)max_nel * p->hop, sizeof(atkdsp_cf32));
-    /* scratch per element: process_n runs the elements in parallel */
-    p->win = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * p->L * sizeof(atkdsp_cf32));
-    p->folded = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * nchan * sizeof(atkdsp_cf32));
-    p->X = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * nchan * sizeof(atkdsp_cf32));
-    if (!p->h || !p->fft || !p->twiddle || !p->hist || !p->leftover || !p->win ||
-        !p->folded || !p->X) { atkdsp_pfb_destroy(p); return NULL; }
+    p->hf = (float *)atk_aligned_malloc(2 * p->L * sizeof(float));
+    p->twd = (double *)atk_aligned_malloc(2 * (size_t)nchan * sizeof(double));
+    p->tslot_bytes = pfb_slot_bytes(p);
+    if (!p->h || !p->fft || !p->twiddle || !p->hist || !p->leftover || !p->hf || !p->twd ||
+        pfb_ensure_slots(p, atkdsp_get_threads()) != ATKDSP_OK) { atkdsp_pfb_destroy(p); return NULL; }
     pfb_build_prototype(p);
+    for (size_t q = 0; q < p->L; ++q) p->hf[2 * q] = p->hf[2 * q + 1] = (float)p->h[q];
     for (unsigned j = 0; j < nchan; ++j) {
         const double a = 2.0 * ATK_PI * (double)j / (double)nchan;
         p->twiddle[j].re = (float)cos(a);
         p->twiddle[j].im = (float)sin(a);
+        p->twd[2 * j] = cos(a);
+        p->twd[2 * j + 1] = sin(a);
     }
     p->lc = 0; p->b = 0; p->cal = NULL; p->cal_nel = 0;
     return p;
@@ -112,7 +174,7 @@ void atkdsp_pfb_destroy(atkdsp_pfb *p) {
     if (!p) return;
     free(p->h); atkdsp_fft_destroy(p->fft); free(p->twiddle);
     free(p->hist); free(p->leftover);
-    atk_aligned_free(p->win); atk_aligned_free(p->folded); atk_aligned_free(p->X);
+    atk_aligned_free(p->hf); atk_aligned_free(p->twd); atk_aligned_free(p->tscratch);
     free(p->cal);
     free(p);
 }
@@ -149,6 +211,97 @@ int atkdsp_pfb_set_cal(atkdsp_pfb *p, const atkdsp_cf32 *table, unsigned nel) {
     return ATKDSP_OK;
 }
 
+/* One element's hops [i0, i1) into dstbase (nchan x m, channel-major), with
+ * thread slot `slot`. Every hop depends only on its own window, so how the
+ * hops are split among threads cannot change a single output value: the
+ * result is identical at any thread count and any block split. */
+static int pfb_run_hops(const atkdsp_pfb *p, unsigned e, const atkdsp_cf32 *xin, size_t i0, size_t i1,
+                        size_t m, int64_t b0, unsigned char *slot, atkdsp_cf32 *dstbase) {
+    const unsigned N = p->nchan, hop = p->hop;
+    const size_t L = p->L, ov = p->ov, K = p->K, N2 = 2 * (size_t)N;
+    atkdsp_cf32 *win = (atkdsp_cf32 *)slot;
+    unsigned char *at = slot + pfb_align64(L * sizeof(atkdsp_cf32));
+    float *fold = (float *)at;
+    at += pfb_align64(N2 * sizeof(float));
+    double *acc = (double *)at;
+    at += pfb_align64(N2 * sizeof(double));
+    atkdsp_cf32 *tile = (atkdsp_cf32 *)at;
+    const atkdsp_cf32 *hist = p->hist + (size_t)e * ov;
+    const atkdsp_cf32 *lo = p->leftover + (size_t)e * hop;
+    const atkdsp_cf32 *cal = (p->cal && e < p->cal_nel) ? p->cal + (size_t)e * N : NULL;
+    const size_t head = ov + p->lc;                     /* s index where `in` begins */
+    const float *hf = p->hf;
+    const double *twd = p->twd;
+    for (size_t t0 = i0; t0 < i1; t0 += PFB_TILE) {
+        const size_t t1 = (t0 + PFB_TILE < i1) ? t0 + PFB_TILE : i1;
+        for (size_t i = t0; i < t1; ++i) {
+            /* the window: s[i*hop, i*hop + L), s = hist ++ leftover ++ in */
+            const size_t st = i * hop;
+            const atkdsp_cf32 *wp;
+            if (st >= head) {
+                wp = xin + (st - head);
+            } else {
+                for (size_t q = 0; q < L; ++q) {
+                    const size_t pq = st + q;
+                    win[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
+                }
+                wp = win;
+            }
+            /* the fold, in single precision: fold[q] = sum_k h[kN + q/2] *
+             * w[kN + q/2] (re and im interleaved, taps duplicated), k
+             * ascending — one flat float multiply-add over 2N values per tap,
+             * which vectorises 8 wide. Until v0.24 each product was formed in
+             * double and rounded to float before the float sum: the same
+             * accuracy class (float accumulation either way), but a mix the
+             * compiler would not vectorise. Measured against v0.23's outputs
+             * and the float64 twin in tests/test_channelizer.py. */
+            {
+                const float *ATK_RESTRICT w = (const float *)wp;
+                float *ATK_RESTRICT f = fold;
+                for (size_t q = 0; q < N2; ++q) f[q] = hf[q] * w[q];
+                for (size_t k = 1; k < K; ++k) {
+                    const float *ATK_RESTRICT hk = hf + k * N2;
+                    const float *ATK_RESTRICT wk = w + k * N2;
+                    for (size_t q = 0; q < N2; ++q) f[q] += hk[q] * wk[q];
+                }
+                for (size_t q = 0; q < N2; ++q) acc[q] = (double)f[q];
+            }
+            if (atk_fft_forward_inplace(p->fft, acc) != ATKDSP_OK) return ATKDSP_E_FFT;
+            /* reference the bins to input sample 0: the block starts at
+             * (b+1)*hop - L and L = K*N, so remove exp(+2 pi i k ((b+1) hop mod N)/N)
+             * — multiply by exp(-2 pi i k shift/N), twiddle index (-k*shift) mod N,
+             * stepped (no per-bin multiply and modulo). Correct at every
+             * oversampling (v0.19-0.20 used +b*hop: right only at 2x). */
+            const int64_t b = b0 + (int64_t)i;
+            const unsigned shift = (unsigned)((((b + 1) * (int64_t)hop) % (int64_t)N + N) % N);
+            atkdsp_cf32 *row = tile + (i - t0) * N;
+            unsigned idx = 0;
+            for (unsigned k = 0; k < N; ++k) {
+                const double xr = acc[2 * k], xi = acc[2 * k + 1];
+                const double wr = twd[2 * idx], wi = twd[2 * idx + 1];
+                double yr = xr * wr - xi * wi;
+                double yi = xr * wi + xi * wr;
+                if (cal) {
+                    const double cr = cal[k].re, ci = cal[k].im;
+                    const double zr = yr * cr - yi * ci, zi = yr * ci + yi * cr;
+                    yr = zr; yi = zi;
+                }
+                row[k].re = (float)yr;
+                row[k].im = (float)yi;
+                idx = (idx >= shift) ? idx - shift : idx + N - shift;
+            }
+        }
+        /* the tile, channel by channel: (t1 - t0) consecutive outputs each */
+        const size_t nt = t1 - t0;
+        for (unsigned k = 0; k < N; ++k) {
+            atkdsp_cf32 *d = dstbase + (size_t)k * m + t0;
+            const atkdsp_cf32 *src = tile + k;
+            for (size_t r = 0; r < nt; ++r) d[r] = src[r * N];
+        }
+    }
+    return ATKDSP_OK;
+}
+
 ptrdiff_t atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins, unsigned nel,
                                size_t n, atkdsp_cf32 *out, size_t cap) {
     if (!p || !ins || nel < 1 || nel > p->max_nel) return ATKDSP_E_ARG;
@@ -166,89 +319,83 @@ ptrdiff_t atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins, uns
     const size_t consumed = m * hop;
     const size_t rem = avail - consumed;
     const int64_t b0 = p->b;
-    /* Element e's stream is s = hist(ov) ++ leftover(lc) ++ in(n), and hop i's
-     * window is s[i*hop, i*hop + L). Every window that starts at or past ov+lc
-     * lies wholly inside `in` and is folded IN PLACE — no copy. Only the first
-     * few windows (those that reach back into hist/leftover) are assembled into
-     * `win`, and the history is saved once per call, not slid per hop: v0.19's
-     * per-hop memcpy+memmove of the ov-sample history moved ~2*ov/hop (≈46)
-     * samples of memory per input sample. Same window values, same fold order:
-     * the output is bit-identical. */
     const size_t ov = p->ov, L = p->L;
-    /* elements are independent (own history, scratch and output; the FFT plan
-     * is thread-safe), so they run in parallel — same result at any thread count */
-    int ei;
-#pragma omp parallel for num_threads(atkdsp_get_threads()) schedule(static, 1)
-    for (ei = 0; ei < (int)nel; ++ei) {
-        const unsigned e = (unsigned)ei;
-        atkdsp_cf32 *win = p->win + (size_t)e * L;
-        atkdsp_cf32 *folded = p->folded + (size_t)e * N;
-        atkdsp_cf32 *X = p->X + (size_t)e * N;
-        atkdsp_cf32 *hist = p->hist + (size_t)e * ov;
-        const atkdsp_cf32 *cal = (p->cal && e < p->cal_nel) ? p->cal + (size_t)e * N : NULL;
-        atkdsp_cf32 *dstbase = out + (size_t)e * N * m;
-        const atkdsp_cf32 *lo = p->leftover + (size_t)e * hop;
-        const unsigned lc = p->lc;
-        const atkdsp_cf32 *xin = ins[e];
-        const size_t head = ov + lc;                    /* s index where `in` begins */
-        for (size_t i = 0; i < m; ++i) {
-            const size_t st = i * hop;                  /* window start in s */
-            const atkdsp_cf32 *wp;
-            if (st >= head) {
-                wp = xin + (st - head);                 /* wholly inside `in` */
-            } else {
-                for (size_t q = 0; q < L; ++q) {
-                    const size_t pq = st + q;
-                    win[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
-                }
-                wp = win;
-            }
-            /* fold + fft + rotate + cal, write stride m */
-            const unsigned Nn = N;
-            for (unsigned j = 0; j < Nn; ++j) { folded[j].re = 0.0f; folded[j].im = 0.0f; }
-            for (size_t k = 0; k < p->K; ++k) {
-                const size_t base = k * Nn;
-                for (unsigned j = 0; j < Nn; ++j) {
-                    const double hc = p->h[base + j];
-                    folded[j].re += (float)(hc * wp[base + j].re);
-                    folded[j].im += (float)(hc * wp[base + j].im);
-                }
-            }
-            atkdsp_fft_exec(p->fft, folded, X, 0);
-            /* reference the bins to input sample 0: the block starts at
-             * (b+1)*hop - L and L = K*N, so remove exp(+2 pi i k ((b+1) hop mod N)/N)
-             * — multiply by exp(-2 pi i k shift/N), twiddle index (N - k*shift) mod N.
-             * Correct at every oversampling (v0.19-0.20 used +b*hop: right only at 2x,
-             * up to a constant (-1)^k per bin). */
-            const int64_t b = b0 + (int64_t)i;
-            const unsigned shift = (unsigned)((((b + 1) * (int64_t)hop) % (int64_t)Nn + Nn) % Nn);
-            for (unsigned k = 0; k < Nn; ++k) {
-                const unsigned idx = (unsigned)((Nn - ((size_t)k * shift) % Nn) % Nn);
-                const float wr = p->twiddle[idx].re, wi = p->twiddle[idx].im;
-                float yr = X[k].re * wr - X[k].im * wi;
-                float yi = X[k].re * wi + X[k].im * wr;
-                if (cal) {
-                    const float cr = cal[k].re, ci = cal[k].im;
-                    const float zr = yr * cr - yi * ci, zi = yr * ci + yi * cr;
-                    yr = zr; yi = zi;
-                }
-                dstbase[(size_t)k * m + i].re = yr;
-                dstbase[(size_t)k * m + i].im = yi;
-            }
+    /* Element e's stream is s = hist(ov) ++ leftover(lc) ++ in(n), and hop i's
+     * window is s[i*hop, i*hop + L). Windows wholly inside `in` are folded in
+     * place; the first few (reaching back into hist/leftover) are assembled
+     * in the thread's scratch.
+     *
+     * v0.24 — THE PARALLEL SPLIT IS OVER HOPS, not only elements. Through
+     * v0.23 the one parallel loop ran over elements, so a single radio
+     * (nel = 1) ran on one thread however many the machine had (Bill,
+     * 2026-10-30: "With one radio its work runs on 1 of your 20 threads").
+     * Now each element's hops are cut into runs and every (element, run)
+     * pair is a task. Hops are independent, so the output is the same at
+     * any thread count (tests/test_channelizer.py holds that). */
+    int nth = atkdsp_get_threads();
+    if (nth < 1) nth = 1;
+    if (pfb_ensure_slots(p, nth) != ATKDSP_OK) return ATKDSP_E_NOMEM;
+    size_t runs = (m + PFB_MIN_TASK - 1) / PFB_MIN_TASK;           /* per element */
+    size_t want = ((size_t)nth * PFB_TASKS_PER_THREAD + nel - 1) / nel;
+    if (runs > want) runs = want;
+    if (runs < 1) runs = 1;
+    const int ntask = (int)(runs * nel);
+    int rc = ATKDSP_OK;
+    /* MSVC's OpenMP 2.0: a signed loop variable declared outside the pragma,
+     * and no atomic write — a failing task sets its own flag (fail[] is one
+     * int per task, so no two threads write the same int). */
+    int ti;
+    int fail_stack[256];
+    int *fail = (ntask <= 256) ? fail_stack : (int *)malloc((size_t)ntask * sizeof(int));
+    if (!fail) return ATKDSP_E_NOMEM;
+    memset(fail, 0, (size_t)ntask * sizeof(int));
+#ifdef _OPENMP
+    if (nth > ntask) nth = ntask;
+#   pragma omp parallel num_threads(nth)
+    {
+        unsigned char *slot = p->tscratch + (size_t)omp_get_thread_num() * p->tslot_bytes;
+#       pragma omp for schedule(dynamic, 1)
+        for (ti = 0; ti < ntask; ++ti) {
+            const unsigned e = (unsigned)((size_t)ti / runs);
+            const size_t r = (size_t)ti % runs;
+            const size_t i0 = r * m / runs, i1 = (r + 1) * m / runs;
+            if (pfb_run_hops(p, e, ins[e], i0, i1, m, b0, slot, out + (size_t)e * N * m) != ATKDSP_OK)
+                fail[ti] = 1;
         }
-        /* save the state once: new hist = s[m*hop, m*hop + ov) — assembled into
-         * `win` first, since it can read the old hist and leftover — then the
-         * new leftover = s[m*hop + ov, head + n), which (m >= 1, lc < hop)
-         * always lies inside `in`. */
-        const size_t ns0 = consumed;                    /* = m*hop */
-        for (size_t q = 0; q < ov; ++q) {
-            const size_t pq = ns0 + q;
-            win[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
-        }
-        for (size_t s = 0; s < rem; ++s)
-            p->leftover[(size_t)e * hop + s] = xin[ns0 + ov + s - head];
-        memcpy(hist, win, ov * sizeof(atkdsp_cf32));
     }
+#else
+    for (ti = 0; ti < ntask; ++ti) {
+        const unsigned e = (unsigned)((size_t)ti / runs);
+        const size_t r = (size_t)ti % runs;
+        const size_t i0 = r * m / runs, i1 = (r + 1) * m / runs;
+        if (pfb_run_hops(p, e, ins[e], i0, i1, m, b0, p->tscratch, out + (size_t)e * N * m) != ATKDSP_OK)
+            fail[ti] = 1;
+    }
+#endif
+    for (ti = 0; ti < ntask; ++ti) if (fail[ti]) rc = ATKDSP_E_FFT;
+    if (fail != fail_stack) free(fail);
+    if (rc != ATKDSP_OK) return rc;
+    /* save each element's state, after every hop has read the old one: new
+     * hist = s[m*hop, m*hop + ov) — assembled in scratch first, since it can
+     * read the old hist and leftover — then the new leftover =
+     * s[m*hop + ov, head + n), which (m >= 1, lc < hop) always lies inside
+     * `in`. */
+    const unsigned lc = p->lc;
+    const size_t head = ov + lc;
+    atkdsp_cf32 *tmp = (atkdsp_cf32 *)p->tscratch;                 /* slot 0's window, L >= ov */
+    for (unsigned e = 0; e < nel; ++e) {
+        atkdsp_cf32 *hist = p->hist + (size_t)e * ov;
+        const atkdsp_cf32 *lo = p->leftover + (size_t)e * hop;
+        const atkdsp_cf32 *xin = ins[e];
+        for (size_t q = 0; q < ov; ++q) {
+            const size_t pq = consumed + q;
+            tmp[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
+        }
+        for (size_t s2 = 0; s2 < rem; ++s2)
+            p->leftover[(size_t)e * hop + s2] = xin[consumed + ov + s2 - head];
+        memcpy(hist, tmp, ov * sizeof(atkdsp_cf32));
+    }
+    (void)L;
     p->lc = (unsigned)rem;
     p->b = b0 + (int64_t)m;
     return (ptrdiff_t)m;

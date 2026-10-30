@@ -107,6 +107,15 @@ static int transform(const atkdsp_fft *p, const atkdsp_cf32 *in, const float *wi
     return rc == 0 ? ATKDSP_OK : ATKDSP_E_FFT;
 }
 
+/* The forward transform IN PLACE on a caller's interleaved double buffer
+ * (2n doubles) — no slot, no float copies. For kernels that already hold the
+ * data in double (the PFB's fold); the plan is read-only here, so any number
+ * of threads may call this on one plan with their own buffers. */
+int atk_fft_forward_inplace(const atkdsp_fft *p, double *buf) {
+    if (!p || !buf) return ATKDSP_E_ARG;
+    return cfft_forward(p->plan, buf, 1.0) == 0 ? ATKDSP_OK : ATKDSP_E_FFT;
+}
+
 int atkdsp_fft_exec(const atkdsp_fft *p, const atkdsp_cf32 *in, atkdsp_cf32 *out, int inverse) {
     if (!p || !in || !out) return ATKDSP_E_ARG;
     int s = claim_slot(p);

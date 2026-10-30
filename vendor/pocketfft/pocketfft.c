@@ -874,7 +874,13 @@ NOINLINE WARN_UNUSED_RESULT static int pass_all(cfftp_plan plan, cmplx c[], doub
   if (plan->length==1) return 0;
   size_t len=plan->length;
   size_t l1=1, nf=plan->nfct;
-  cmplx *ch = RALLOC(cmplx, len);
+  /* atkdsp (v0.24): the work buffer on the stack for short transforms. The
+   * PFB runs one of these per hop on every thread; a malloc/free per hop was
+   * a measurable share of a small channelizer, and on several threads it is
+   * a shared allocator in the inner loop (measured: a 24-channel bank went
+   * from 1.0x to 1.9x on 2 threads). 1024 complex = 16 KB of stack. */
+  cmplx stackbuf[1024];
+  cmplx *ch = (len <= 1024) ? stackbuf : RALLOC(cmplx, len);
   if (!ch) return -1;
   cmplx *p1=c, *p2=ch;
 
@@ -900,7 +906,7 @@ NOINLINE WARN_UNUSED_RESULT static int pass_all(cfftp_plan plan, cmplx c[], doub
     else
       {
       if (passg(ido, ip, l1, p1, p2, plan->fct[k1].tw, plan->fct[k1].tws, sign))
-        { DEALLOC(ch); return -1; }
+        { if (ch!=stackbuf) DEALLOC(ch); return -1; }
       SWAP(p1,p2,cmplx *);
       }
     SWAP(p1,p2,cmplx *);
@@ -924,7 +930,7 @@ NOINLINE WARN_UNUSED_RESULT static int pass_all(cfftp_plan plan, cmplx c[], doub
         c[i].r *= fct;
         c[i].i *= fct;
         }
-  DEALLOC(ch);
+  if (ch!=stackbuf) DEALLOC(ch);
   return 0;
   }
 

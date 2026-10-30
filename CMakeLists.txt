@@ -25,7 +25,7 @@ set(ATKDSP_SOURCES
   src/cfar.c src/burst.c src/ring.c
   src/pulses.c src/cyclic.c src/tone_id.c
   src/dsss_det.c src/dsss_codes.c src/dsss_code.c src/dsss_acq.c src/css.c src/xspec.c
-  src/channelizer.c src/undertow.c src/psync.c
+  src/channelizer.c src/undertow.c src/psync.c src/lagscan.c src/video.c
   vendor/pocketfft/pocketfft.c)
 
 add_library(atkdsp SHARED ${ATKDSP_SOURCES})
@@ -82,6 +82,14 @@ if(ATKDSP_TESTS)
     target_compile_definitions(atkdsp_ring_stress PRIVATE _POSIX_C_SOURCE=200112L)
   endif()
   set_target_properties(atkdsp_ring_stress PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+  # the channel splitter's bench (bench/bench_pfb.c; pfb_bench.bat runs it)
+  add_executable(atkdsp_bench_pfb bench/bench_pfb.c)
+  target_link_libraries(atkdsp_bench_pfb PRIVATE atkdsp)
+  if(NOT MSVC)
+    target_link_libraries(atkdsp_bench_pfb PRIVATE m)
+  endif()
+  set_target_properties(atkdsp_bench_pfb PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
   enable_testing()
   add_test(NAME smoke COMMAND atkdsp_smoke)

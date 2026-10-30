@@ -96,6 +96,7 @@ order.
 - **Feeds:** `cue_detector.py` (cued DF) and the Bug-Sniffer trigger.
 
 ### A2.2 `atkdsp_pfb` + `atkdsp_osc_extract`  (roadmap 1/2 — the channelizer)
+- **DF requirements (2026-10-29): read `docs/CHANNELIZER_DF_REQUIREMENTS.md` first** — N-element processing on one block clock, sample-index bookkeeping, per-channel covariance accumulator, channel-grid powers for the CFAR. It is what makes the PFB the Kraken's "DF everything" engine.
 - **What, two forms:**
   - **Uniform polyphase filterbank** — N equally-spaced channels from one input
     FFT + polyphase prototype, so the 50-entry watchlist costs ~one channel.

@@ -82,8 +82,9 @@ so the 1c weakness — text under Hamming(7,4) behind an interleaver refused
 at 28 kbit — is fixed: 20 seeds of 20 name "linear (14,8), 1 fixed bit",
 dmin 3, and the interleaved harness case decodes back to the text. Linux:
 smoke test and the whole suite (954 tests: 848 + 73 + 22 + 11) pass, also
-under ASan + UBSan. The Windows run is owed (`build.bat /only atkdsp /test`
-from ATK), and ATK's `dsp_native.py` now expects ABI 18. Phase 3b (MDC-1200
+under ASan + UBSan. Windows the same evening (commit ac9e395): MSVC 19.44 /
+AVX2 / OpenMP builds, ATK takes ABI 18, 954 passed in 244 s through ATK's
+`build.bat /only atkdsp /test`. ATK's `dsp_native.py` expects ABI 18. Phase 3b (MDC-1200
 and FleetSync) waits for real recordings, as §C3 says. Next in §G is phase 4
 (the engine) or LMR_DECODE_PLAN's L1/L3, whichever Bill opens first — L1/L3
 need the TIA/ETSI documents, which are not connected here.
@@ -126,6 +127,28 @@ need the TIA/ETSI documents, which are not connected here.
 - The CFAR cross-check's request is honoured in the kernel (`rho2`), so
   `cue_live.py`'s Python-side correction can now be a config field (ATK
   side, with `git status` checked first).
+
+**§B6 revised (2026-10-29, evening).** Bill asked for the DSSS section to
+be improved comprehensively and for the literature (arXiv, IEEE, the
+Chinese signal-processing journals) to be read for ideas. It was —
+`docs/DSSS_LITERATURE.md` has every paper, what it adds, its evidence
+grade and what could not be read — and §B6 is rewritten around what an
+analyst actually meets (Wi-Fi Barker, Zigbee, GPS, DSM's GFSK chips, 406
+SGB, CDMA pilots, bugs), a fused three-handle detector of ours with stated
+false-alarm rates, the eigen step as the literature does it now, the
+generator polynomial through chip errors, a first-class known-code path
+(acquire, track, the power-distortion GNSS monitor), the Kraken's channels
+as a detector, acceptance in tiers Bill can run with a HackRF, and **a
+provenance field on every method** (Bill's rule: Chinese-journal methods
+identifiable in ATK's menu). B6b adds LoRa. **B6c, Undertow**, is the
+answer to Bill's next question the same evening — a new technique for
+unknown DSSS at unknown chip rate and bandwidth, as far below the floor as
+physics allows, that records and catalogues: a second-order correlation
+radiometer across receivers at its centre (the DSSS literature is
+single-receiver and fourth-order), a scale-space survey, a long watch with
+drift compensation, bootstrap despreading over the ring, a consistency
+lattice, and the catalogue. The §G rows for phase 6 grow accordingly.
+Nothing of it is built.
 
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
@@ -185,7 +208,9 @@ before touching it).
 - §1 Rules every item follows
 - §A The engine — float32 FFT, the fused mixer, C ring buffers, the channelizer
 - §B Detection and measurement — CFAR, burst descriptors and TDMA timing,
-  live pulse runs, cyclic probes, occupancy and baseline, DSSS
+  live pulse runs, cyclic probes, occupancy and baseline, spread spectrum
+  (DSSS blind and known-code, the GNSS monitor; LoRa in B6b; Undertow,
+  the below-the-floor watch, in B6c)
 - §C Demodulation and signal quality — the linear demod chain and
   equalizer, EVM/MER, analog radio IDs, strong-signal removal, transmitter
   fingerprint features
@@ -425,6 +450,8 @@ memory between processes has no numpy meaning.
 shows RAM.
 
 ### A4. The channelizer (roadmap #1)
+
+> **DF requirements (2026-10-29):** before building, read `docs/CHANNELIZER_DF_REQUIREMENTS.md` — the multi-element (N coherent streams, one block clock) form, sample-index bookkeeping, the per-channel covariance accumulator and channel-grid powers that make this kernel the KrakenSDR "DF everything" engine. Nothing there changes the ABI below; it adds `_process_n` forms and three small outputs.
 
 Two tools, because there are two jobs.
 
@@ -679,7 +706,25 @@ int       atkdsp_occ_duty(const atkdsp_occ *o, int slot, float *out);
 trigger); survey pattern of life; an occupancy view (duty cycle per
 channel); site selection.
 
-### B6. DSSS — detection, chip rate, and the code itself
+### B6. Spread spectrum — detection, chip rate, the code, and despreading
+
+*Revised 2026-10-29, after phase 3, at Bill's request ("improve it
+comprehensively"), against the literature read the same day —
+`docs/DSSS_LITERATURE.md` holds every paper, what it adds, and what could
+not be read. The first draft's four blind steps are kept; the box at the
+end lists what changed. Nothing here is built yet.*
+
+**Provenance rule (Bill, 2026-10-29).** Every method here carries where it
+came from — authors, year, venue, country — as a fixed string in the
+header (`ATKDSP_DSSS_METHOD_*` with an `atkdsp_method_info` table) and in
+every result struct and `describe()`, so ATK can group the instrument's
+method menu by origin: **Chinese-journal methods are identifiable** (their
+own drop-down, or a flag on each entry), and so are ours. The tags used
+below: **CN** China, **FR** France, **SG** Singapore, **FI** Finland, **US**,
+**ES** Spain, **DE** Germany, **UK**, **BE** Belgium, **ATK** ours. Where a
+CN method is known to us from its abstract only (the literature file says
+which), the kernel is rebuilt from the idea and the tag still names the
+source.
 
 **Theory — the part that makes it interesting.**
 - Spreading multiplies each data symbol by a fast pseudo-random chip
@@ -694,68 +739,772 @@ channel); site selection.
 - **A blind receiver does not know the code.** But noise has no memory, and
   a short-code DSSS signal repeats its code every period. So the signal's
   autocorrelation has structure at the code period even while the signal
-  sits below the floor. That is the handle everything below uses.
+  sits below the floor. That is the handle the blind path uses — and its
+  price is known: Burel's detector pays **four dB of output for every dB
+  of input**, and buys it back at 10·log10(windows) (literature A1).
+- **Chip transitions are periodic whatever the code.** Squaring or
+  delay-multiplying the signal leaves a spectral line at the chip rate, long
+  code or short, one user or many. That is the handle that does not need a
+  period, and the one that names the chip rate.
+- **Correlation is the third handle.** Across the Kraken's five antennas a
+  signal is correlated and noise is not; across oversampled or shaped
+  chips the same holds within one channel. Tests built on that need no
+  noise-power estimate, which is what a radiometer lacks (A2, A3, F1).
+- **Many codes an analyst meets are published.** Then the problem is not
+  blind at all: it is acquisition (which code, what code phase, what
+  Doppler) and tracking — the GPS receiver's problem, cheap and exact. The
+  kernel does both, blind and known, and the known path is also the second
+  half of the blind one (once a code is recovered it is a known code).
 
-**What, in four steps.**
-1. **Detect.** Burel's fluctuation-of-correlation detector: cut the signal
-   into M windows, estimate the autocorrelation in each, and average
-   |R_m(τ)|². Noise gives a flat floor at τ ≠ 0; a DSSS signal gives peaks
-   at multiples of the code period. The threshold is derived from the noise
-   distribution of that statistic. With enough windows this works well below
-   0 dB SNR.
-2. **Chip rate.** Chip transitions leave a cyclostationary line at the chip
-   rate. Delay-multiply at about half a chip (or square the envelope after
-   band-limiting), then run a fine scan using B4's machinery. Squaring also
-   gives the carrier offset — a line at 2× the offset for BPSK spreading, 4×
-   for QPSK — and that tells the two apart.
-3. **Code period and length.** The period comes from step 1's peak spacing,
-   and L = period × Rc. An m-sequence gives 2^n − 1: 31, 63, 127, 511,
-   1023, and so on.
-4. **The code (short codes).**
-   - Take the principal eigenvector(s) of the covariance of code-period-long
-     windows (Bouder, Azou and Burel). Misaligned windows give two
-     eigenvectors, and those locate where the code starts.
-   - The sign of the eigenvector at the chip instants *is* the chip
-     sequence.
-   - Then run Berlekamp–Massey (D2) on the chips. An m-sequence returns its
-     LFSR; a Gold code returns linear complexity 2n. Either way the
-     generator(s) are named.
-   - Despread, and hand the narrowband symbols to the linear demod chain
-     (C1).
+**What the analyst will actually meet.** The design is driven by this table,
+not by the textbook BPSK case alone. "Blind?" is whether the chip sequence
+can be recovered without the code: it needs a short code (one period
+spanning few symbols), chips that carry the data as a sign, and one user.
+
+| Signal | Chip rate | Code | Chips carry | Known? | Blind? |
+|---|---|---|---|---|---|
+| GPS L1 C/A | 1.023 Mc/s | 1023 chips, 1 ms; 20 periods per 50 bit/s bit | BPSK | IS-GPS-200, every PRN | detect and period yes; one SV's code no — 8–12 SVs overlap at different Dopplers |
+| GLONASS L1OF | 511 kc/s | 511 chips, 1 ms (one code, FDMA) | BPSK | ICD | as GPS |
+| Galileo E1, GPS L1C, M-code | 1.023 (BOC) | 4092 / 10230 chips + secondary codes | BOC: a square subcarrier on the chips | ICD (M-code no) | detect: lines at the subcarrier AND the chip rate, a split spectrum; code no |
+| 802.11b beacons, 1 and 2 Mbit/s | 11 Mc/s | Barker-11, one symbol per period | DBPSK / DQPSK | standard | **yes — the cleanest real case, any Wi-Fi AP sends them** |
+| 802.11b 5.5 / 11 Mbit/s | 11 Mc/s | CCK: 8-chip codes chosen by the data | complex | standard | detect and chip rate; code set, not a code |
+| IEEE 802.15.4 (Zigbee, Thread) | 2 Mc/s | 16 sequences of 32 chips, one per 4-bit symbol | O-QPSK, half-sine (MSK-like) | standard | detect, chip rate, period 16 µs; the sequence SET by clustering, named against the standard |
+| COSPAS-SARSAT SGB (406 MHz) | 38.4 kc/s | spreading factor 256, I and Q codes from x²³ + x¹⁸ + 1, one 1 s burst | OQPSK | T.018 | known-code only (INTERCEPT_IDEAS_PLAN §I2 already says so) |
+| IS-95 / CDMA2000 pilot | 1.2288 Mc/s | short PN 2¹⁵ chips, 26.67 ms; traffic under the 2⁴² long code | QPSK | IS-95 / C.S0002 | pilot: detect, chip rate, period; the long code no |
+| UMTS CPICH | 3.84 Mc/s | scrambling code 38400 chips, 10 ms | QPSK | 25.213 (512 primary codes) | detect, chip rate, period; the code by known-code search |
+| Spektrum DSM2 / DSMX, CYRF6936 toys and RC links | 1 Mc/s | 32- or 64-chip PN codes; SDR 1 bit, DDR 2, 8DR 8 bits per code (derived codes); DSMX also hops 23 channels | **GFSK, ±270–323 kHz** — the chips are frequency, not phase | datasheet modes; the PN tables are in open-source RC firmware (licence check before use) | detect and chip rate yes (FDIFF / DM lines); the code from the FM-demodulated chips, not from the I/Q eigenvector |
+| Spread-spectrum "bugs" (commercial 900 MHz / 2.4 GHz audio) | 0.5–10 Mc/s typical | short codes, proprietary | BPSK/QPSK usually | no | the design case for the blind path |
+| LoRa / ELRS / Crossfire / Meshtastic / Cricket | — | chirp spread spectrum, SF 5–12, BW 125 kHz–1.6 MHz | chirps | Semtech, open | **not DSSS** — see B6b below |
+| Frequency hopping (Bluetooth, FHSS RC, SINCGARS) | — | — | — | — | not DSSS; hops are B1/B2 bursts |
+
+Three consequences for the design. (1) Chips are not always a sign on a
+carrier: O-QPSK/MSK and GFSK chips need the transition nonlinearities phase
+3 built (DM and FDIFF in `atkdsp_cyclic`) for the chip rate, and the GFSK
+case needs the FM-demodulated chip stream for the code. (2) Several
+important signals use a *set* of codes selected by the data (CCK, 802.15.4,
+8DR), so "the code" is sometimes "the codebook", found by clustering
+period-long windows, not by one eigenvector. (3) The known-code path is
+where most of the operational value is — GPS, 406 SGB, Wi-Fi, Zigbee — so
+it is a first-class deliverable, not a footnote to the blind path.
+
+**The chain, in six steps.** Each step reports what it found, its
+evidence and its provenance, and the next step takes the previous step's
+output, so an analyst can stop anywhere and still have an answer ("spread,
+2.000 Mc/s, period 16 µs, code set of 16 — 802.15.4") rather than nothing.
+Every threshold states its Pfa and is measured in the harness the way
+phase 3 measured its own (binomial bands on noise-only runs).
+
+0. **Precondition.** Run after C4's excision when a narrowband interferer
+   is present (a CW tone 30 dB up swamps every statistic below), and run
+   B4's `cp_probe` first on any candidate: an OFDM cyclic prefix also
+   correlates at a fixed lag. The two are told apart by the shape of the
+   lag peak — OFDM's is a triangle Ncp wide at lag N with nothing at 2N;
+   a short code's is a full replica at every multiple of the period.
+1. **Detect — three handles, fused (ATK).** Three statistics on the same
+   windows, each with its own noise-only distribution, each honest about
+   the class it cannot see, combined as a sum of log-likelihood ratios so
+   that a short-code BPSK bug, a long-code CDMA pilot and a GFSK-chip DSM
+   link are all caught by whichever handle fits, and the evidence says
+   which one did. No paper read does this fusion; it is ours.
+   - **Repetition — Burel's fluctuation-of-correlation detector (FR
+     2000).** Cut the signal into M windows (window ≥ the longest period
+     sought), estimate the autocorrelation in each, and average |R_m(τ)|².
+     Noise gives a flat floor for τ ≠ 0 at the estimator's own variance
+     σ⁴/T (the analytic threshold); a short-code signal gives peaks at
+     every multiple of the period, whatever the carrier offset (Doppler
+     rotates R's phase, not its magnitude) and without chip timing.
+     Reported −13 dB at 50 windows, −16.6 dB at best (literature A1); the
+     periodicity test (≥ 6 equally spaced peaks) takes the false alarms
+     out. Streaming: windows cut on the global index, a running mean,
+     `read` gives ρ(τ), its floor and the peaks — chunk-invariant by
+     construction. The UI shows the sizing law: 4·SNR_in + 10·log10(M).
+     Blind to: long codes.
+   - **Transitions — the chip-rate line with a stated Pfa (FI/US 2007).**
+     The cyclic autocorrelation at α = k·f_chip after the nonlinearity
+     (step 2 computes it anyway), tested as Lundén's χ² GLRT; when the chip
+     rate is unknown the *maximum over the scanned rates* uses the
+     max-statistic CDF, so a scan over a thousand candidate rates still
+     reports a true Pfa. Long code or short, one user or many. Blind to:
+     nothing periodic in its chips — but a CW tone lights it (step 0).
+   - **Correlation — no noise power needed (SG 2008; US 2012 for the
+     Kraken).** One channel: Zeng & Liang's CAV test on L lags (threshold
+     from L, Ns, Pfa alone; holds Pfa under 0.5–2 dB of noise uncertainty
+     where a radiometer collapses; needs ≥ 2 samples per chip or shaped
+     chips — at one rectangular sample per chip it is blind, and says so).
+     Five channels: Urriza–Cabric's canonical-correlation cyclic test
+     (threshold from the channel count alone, immune to spatially coloured
+     noise, ≈ 20× cheaper than SCF combining) and the MME eigenvalue test
+     on the spatial covariance (Tracy–Widom threshold). The conjugate
+     cycle at 2·f_c is present for BPSK chips and absent for QPSK chips,
+     which classifies the chip modulation for free. ATK-side wiring in
+     atkdf; the kernel supplies the covariance accumulation and the tests.
+   - **Secondary indicators, display only:** a Jarque–Bera fourth-order
+     score (ES 2025) — PSK chips are non-Gaussian, Gaussian-looking chips
+     defeat it, which is itself a hint; and the cyclic-energy fraction
+     (US 2026) as a meter, never a decision.
+   - **Symbol period under a long code** — the variance of the windowed
+     correlation as a function of the window start is periodic in the
+     symbol period (FR 2002; a 2020 Springer WPC paper does it from
+     covariance norms over trial window lengths). That gives Rs, hence
+     G = Rc/Rs, which classifies the link (a 20 dB-gain telemetry link is
+     not a 43 dB CDMA pilot). Report "spread: chip rate found, no period"
+     for long codes and stop at step 2 — honestly, the long-code case is
+     detected and measured, never recovered.
+2. **Chip rate.**
+   - **The line scan.** Phase 3's `atkdsp_cyclic` tests *candidate* rates
+     with one Goertzel each; chip rates are a continuum (0.0384, 0.511, 1,
+     1.023, 1.2288, 2, 3.84, 11 Mc/s and every proprietary one), so B6 adds
+     `atkdsp_cyclic_scan`: the same segmentation, mean removal and Hann,
+     but an FFT of the nonlinearity output over the segment, accumulated
+     over segments as level and coherence per bin, the χ² test of step 1
+     per bin with the max-statistic Pfa for the scan, then the line's
+     exact frequency from the bin's segment-to-segment phase (the phase-3
+     method; 0.1 Hz at 100 ms segments). Nonlinearities as in phase 3: |x|²
+     and DM for shaped chips, x² and x⁴ for BPSK/QPSK chips (a line at 2×
+     or 4× the carrier offset names the chip modulation and gives the
+     offset), FDIFF for GFSK/MSK chips. Harmonics confirm (any clock line
+     has them); a BOC signal shows the subcarrier line and the chip line
+     both.
+   - **The spectrum's own evidence.** Rectangular chips put sinc² nulls at
+     ±Rc in the PSD and the autocorrelation's τ = 0 peak is a triangle
+     2Tc wide; RRC-shaped chips show the roll-off edge at Rc(1 + α)/2.
+     Cheap, coarse, and the cross-check the line scan is held to. Once a
+     code is in hand, the chip rate read off the denoised eigenvector (CN
+     2017, IET) is a third cross-check.
+3. **Period, length and symbols per period.** The period from step 1's
+   peak spacing, refined by the parabolic peak; L = period × Rc (a
+   maximal-length code gives 2ⁿ − 1: 31, 63, 127, 511, 1023; a Gold code
+   the same lengths; Barker 11 or 13; 802.15.4 gives 32 at 16 µs). The
+   sign pattern of R at successive multiples of the period says whether a
+   data symbol spans one period (signs random) or many (signs equal in runs
+   of 20 for GPS). Chip timing comes from the chip-rate line's phase; the
+   window offset from the CFO-robust covariance-norm search
+   `argmax_θ ‖R_y(θ)‖_F` (FR 2002).
+4. **The code (short codes, one user).**
+   - **Before trusting an eigenvector, the identifiability rule (US
+     2007, Rao–Edelman):** with m samples per period and n periods, the
+     signal eigenvalue must exceed σ²(1 + √(m/n)); below that no eigen
+     method can see it. The kernel computes the minimum n for the measured
+     SNR and refuses with "need N more periods" instead of returning a
+     garbage vector; the MME ratio with its Tracy–Widom threshold (SG
+     2009) is the acceptance test.
+   - **Wide-window eigenvector (FR 2000; CN 2012 as an SVD).** Windows of
+     2N overlapping by N; the principal eigenvector v (length 2N) holds one
+     contiguous code; k_max = argmax_k Σ_{i=k}^{k+N−1} |v(i)|²; the chips
+     are sign(v(k_max..k_max+N−1)). No two-vector sign ambiguity, and the
+     timing comes free. Power iteration for the top two vectors (C99
+     needs no LAPACK for two); **PAST subspace tracking** (CN 2012;
+     Atlantis 2015) at O(N) per window when N is in the thousands.
+   - **The carrier offset, estimated on the eigenvector (BE 2015).** An
+     offset α cycles/sample turns v into diag(e^{j2παi})·v_clean; a
+     single-tone estimate on v² (BPSK) attains the Cramér–Rao bound at
+     −8 dB on the eigenvector where the raw signal's square needs +12 dB.
+     Derotate, re-sign. |α| < 0.25 for BPSK; outside that, step 2's x²
+     line gives the coarse offset first.
+   - **Decision-directed refinement — alternating sign-despread (CN
+     2021, the k-means paper), with our vote margin (ATK):** despread
+     every period with the estimate, decide the symbol, multiply back,
+     take a majority vote per chip across all periods, iterate; O(M·L) per
+     pass. The vote margin per chip is reported, because the next step
+     needs to know which chips it may trust. A code verified across
+     data-modulated periods uses the MBAPDI / GLRT combiners (ES 2018),
+     not Σ|y|² (the worst choice) nor the differential form (breaks with
+     bits).
+   - **The generator polynomial, through chip errors (FR 2004, Mitton /
+     Cluzeau).** Berlekamp–Massey (D2) names an m-sequence's LFSR from 2n
+     error-free chips and lies on one wrong chip (the linear-complexity
+     profile's jump is the tell, and `atkdsp_bm_profile` reports it). So
+     BM runs only on chips the vote margin certifies; otherwise the
+     parity-check counting statistic Z_Q = Σ(−1)^{parity} over the
+     candidate primitive polynomials of degree r (60 candidates at r = 10),
+     Z > k√N with N ≈ k²/ε^{2w} chips, ε = 1 − 2·(chip error rate) — ≈ 95
+     chips at 10 % errors for a trinomial, a Walsh–Hadamard batch over the
+     low-degree candidates — and a few fast-correlation-attack flip passes
+     when the error rate is above ≈ 5 %. A Gold code shows linear
+     complexity 2n, a Kasami ≈ 2.5n; either way the generator(s) are
+     named, or the result says "L chips recovered, generator not
+     confirmed, vote margin X" and hands the chips over anyway.
+   - **Code sets** (802.15.4, CCK, 8DR): k-means on the aligned windows
+     (k = 16 for 802.15.4 is known; otherwise the eigenvalue count says how
+     many), the cluster centres' signs are the codebook, matched against
+     the published sets in `reference.py`.
+   - **QPSK chips and two users on one period (CN 2023, Fast-ICA):** the
+     symbol × chip matrix is an instantaneous two-source mixture; a
+     kurtosis fixed point with deflation separates the I and Q codes (or
+     two synchronous users), cheaper than the EVD when symbols < chips;
+     needs symbol-aligned windows (step 3's θ search) and the CFO removed
+     (≤ 10⁻⁴ cycles per chip). Reported to −10 dB at 750 symbols.
+   - **Several users on one code family** (GPS): the eigen-decomposition
+     gives a subspace, not a code; ICA separates users with different data
+     in principle (the 2023 result; a 2019 Lancaster method does whole
+     multi-rate CDMA systems with triple-correlation tables — reference
+     only), but at GPS's SNR and Doppler spread it is a research item. The
+     plan says so and the GPS code comes from step 5 instead.
+   - **GFSK chips:** FM-demodulate first (phase 3's FDIFF path), then the
+     eigenvector of the demodulated chip waveform. The data bit inverts the
+     chips, which negates the frequency, so the covariance has the same
+     ±structure as BPSK.
+5. **Acquire, track, despread — known codes and recovered ones alike.**
+   - `atkdsp_dsss_acquire`: parallel code-phase search — the FFT of one
+     code period of signal times the conjugate FFT of the code, at each
+     Doppler bin; the GLRT statistic Γ = 2K·S_max/P_in with its CFAR
+     threshold γ = −ln(1 − (1 − Pfa)^{1/N_cells}) (each normalised cell is
+     Exp(1) under H0; χ² with 2d dof for d non-coherent dwells — GNSS-SDR's
+     form), the peak-to-second-peak ratio reported beside it; Doppler bin
+     width 0.5–0.7 of 1/T_coh (DE 2011: narrower bins raise the global
+     false-alarm rate), a second pass at an eighth of the step around the
+     peak; coherent over one period, non-coherent over k periods for the
+     weak case with the MBAPDI combiner (ES 2018) across unknown data
+     bits; delay-multiply bit stripping (CN 2020) before a long coherent
+     accumulation as an option. Returns code phase (sub-chip by parabola),
+     Doppler, C/N₀.
+   - `atkdsp_dsss_track`: an early–prompt–late DLL for code phase, a
+     Costas / arctan PLL for carrier (or FLL-assisted), one handle per
+     code, chunk-invariant; outputs the despread symbols at Rs plus C/N₀
+     (M2M4 as the estimator, NWPR beside it, with a validity flag below
+     25 dB-Hz where both bias low by ≈ 8 dB — literature E4), lock state
+     and the code-phase and Doppler histories. The despread symbols go to
+     C1's chain for the data (or to the 406 SGB decoder, or to GPS's 50
+     bit/s navigation message — ATK side).
+   - `atkdsp_dsss_pd_monitor` — the power-distortion monitor (US 2017/
+     2018, Humphreys's group; real-data validated on TEXBAT): received
+     power over 200 ms and the symmetric-difference distortion of the
+     correlation peak at ±0.15 chip (Rayleigh under H0, σ² = 8τ_d),
+     classified clean / multipath / spoof / jam; the 11-tap maximum-
+     likelihood residual as the upgrade. This is the RF detector
+     `gnss_status.py` has been waiting for.
+   - **The code catalogue** in `reference.py`: GPS C/A (G1/G2 taps per
+     PRN, IS-GPS-200), GLONASS, Barker-11/13, the 802.15.4 sixteen, the
+     IS-95 short PN and UMTS primary scrambling generators, T.018's SGB
+     generator and start states (read T.018 first, as INTERCEPT_IDEAS_PLAN
+     says). DSM PN tables only where the source licence allows. A
+     recovered code is added to the session's catalogue with its evidence
+     and provenance, so it is acquired and tracked the same way from then
+     on.
 
 **Honest limits.**
-- Long codes (GPS P(Y), CDMA long codes, anything whose period spans many
-  symbols) are *detected* — steps 1 and 2 still work — but not recovered,
-  and the result says so.
+- Long codes (GPS P(Y), CDMA traffic, anything whose period spans many
+  symbols) are *detected and measured* (chip rate, symbol rate, gain) but
+  not recovered, and the result says so.
+- Blind code recovery needs one user, a short code and a clean band: it is
+  the spread-spectrum bug case. GPS is many users under the floor; its
+  value is in step 5, and in step 1's "there is spread energy at 1.023
+  Mc/s with a 1 ms period" as the blind cross-check.
+- Every operating point quoted from the literature is simulation or a
+  wired SDR bench (the power-distortion monitor is the one exception);
+  ours are measured in the harness against a planted known-good emitter,
+  and the kernel reports its own measured rates, not the papers'.
+- The polynomial step is exact or it says why not: the vote margin and the
+  linear-complexity profile are the honesty mechanisms; the
+  parity-check statistic needs a chip error rate under ≈ 30 % to be
+  practical at all.
+- GFSK chips with 8DR derived codes: the chip rate and the hop pattern
+  are the identification; the data path is a known-code one.
+- A CW tone correlates at every lag and lights every nonlinearity: step 0
+  is not optional when one is present.
+- C/N₀-only spoofing detection is weak (Jammertest 2024: meaconing caught
+  0–3 % on GPS C/N₀ alone); the distortion monitor is the detector, C/N₀
+  the supporting evidence.
 - Frequency hopping is not DSSS. Hops show up in B1/B2 instead.
 
 ```c
-int       atkdsp_dsss_fluct(const atkdsp_cf32 *iq, size_t n, size_t win, size_t max_lag, float *rho);
-ptrdiff_t atkdsp_dsss_chiprate(const atkdsp_cf32 *iq, size_t n, double fs,
-                               double rc_lo, double rc_hi, atkdsp_line *peaks, size_t cap);
-int       atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, double fs, double rc,
-                           double period_samples, int8_t *chips, size_t cap, float *quality);
+/* provenance — a fixed table in the header; every result struct and describe() carries an index into it */
+typedef struct { const char *name, *authors, *year, *venue, *country; } atkdsp_method_info;   /* country: "CN", "FR", "ATK", ... */
+ATKDSP_API const atkdsp_method_info *atkdsp_method(int method_id);
+
+/* blind path — streaming handles, chunk-invariant (rule 3) */
+atkdsp_dsss_det *atkdsp_dsss_det_create(double fs, size_t win, size_t max_lag, int nwin_min, double pfa, int handles);
+                       /* handles: bitmask REPETITION | TRANSITION | CORRELATION; fused LLR, per-handle verdicts */
+int   atkdsp_dsss_det_process(atkdsp_dsss_det *h, const atkdsp_cf32 *x, size_t n);
+int   atkdsp_dsss_det_read(const atkdsp_dsss_det *h, atkdsp_dsss_det_result *out);
+                       /* rho(tau), floor, peaks, period, symbol period, per-handle statistics + Pfa, which handle fired, method ids */
+atkdsp_cyclic_scan *atkdsp_cyclic_scan_create(double fs, int nonlin, size_t seg_len, int nseg, double f_lo, double f_hi, double pfa);
+                       /* ... process / read: every line in [f_lo, f_hi) with level, coherence, chi2 statistic, exact frequency, harmonics */
+int   atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, double fs, double rc, double period_s,
+                       int chip_mod, int method, int8_t *chips, size_t cap, atkdsp_dsss_code_result *out);
+                       /* method: EIGEN_WIDE | PAST | KMEANS_REFINE | FASTICA (each with its provenance);
+                          out: L, start, cfo, identifiability margin, quality, vote margin per chip (min/mean),
+                               generator polynomial + how it was found (BM | PARITY_COUNT | none), LC profile verdict */
+/* known-code path — serves GPS, SGB, Wi-Fi, Zigbee and every recovered code */
+int   atkdsp_dsss_acquire(const atkdsp_cf32 *iq, size_t n, double fs, const int8_t *code, size_t L, double rc,
+                          double dop_lo, double dop_hi, double dop_step, int ncoh, int nnoncoh, int combiner, double pfa,
+                          atkdsp_dsss_acq *out);       /* code phase, doppler, Gamma + its Pfa, peak ratio, C/N0 + validity */
+atkdsp_dsss_trk *atkdsp_dsss_trk_create(double fs, const int8_t *code, size_t L, double rc, double code_phase, double doppler);
+ptrdiff_t atkdsp_dsss_trk_process(atkdsp_dsss_trk *h, const atkdsp_cf32 *x, size_t n, atkdsp_cf32 *symbols, size_t cap);
+int   atkdsp_dsss_pd_monitor(const atkdsp_dsss_trk *h, atkdsp_dsss_pd *out);   /* power, distortion, verdict: clean / multipath / spoof / jam */
+/* multi-channel: covariance accumulation, MME / CCA cyclic tests under atkdsp_eig_* (shared with atkdf) */
+/* + describe / stats on every handle (rule 5) */
 ```
 
 **Acceptance.**
-- Synthetic BPSK and QPSK DSSS (L = 31, 127, 1023) at −5, −10 and −15 dB
-  in-band SNR:
-  - detection at the design Pfa;
-  - chip rate within 0.1 %;
-  - the period exact;
-  - the code recovered (up to sign) for short codes;
-  - Berlekamp–Massey names the m-sequence's polynomial.
-- Noise, and a strong narrowband carrier, produce nothing.
-- **Real signal: GPS L1 C/A**, off Bill's HackRF with antenna power on and
-  an active patch antenna:
-  - the 1.023 Mchip/s chip rate and the 1 ms period found blind (expected);
-  - recovering one satellite's PRN from the eigenvector is a stretch goal,
-    because several satellites overlap at different Dopplers. The codes are
-    published (IS-GPS-200), so the answer can be checked.
+- Synthetic BPSK, QPSK, O-QPSK (half-sine) and GFSK-chip DSSS, L = 11, 31,
+  127, 1023, at −5, −10, −15 and −20 dB in-band SNR, with and without a
+  CW tone 30 dB up:
+  - each handle's false-alarm rate on noise inside the binomial band at
+    its stated Pfa, including the chip-rate *scan* (a thousand candidate
+    rates) and the fused verdict;
+  - detection at each SNR recorded per handle (the table the UI shows),
+    against Burel's sizing law;
+  - chip rate within 0.1 % and the chip modulation named;
+  - the period exact; symbols per period right;
+  - the code recovered (up to sign/phase), the identifiability refusal
+    firing exactly when Rao–Edelman says it must, the vote margin
+    reported;
+  - the generator named by BM on certified chips and by parity-check
+    counting at 10 % and 25 % planted chip errors, refused honestly at
+    40 %;
+  - the 802.15.4 codebook recovered as 16 clusters and named;
+  - the long-code case reports chip rate, symbol rate and gain and says
+    "not recovered".
+- Noise, a strong narrowband carrier, analog FM, OFDM (the cp_probe case)
+  produce nothing from the DSSS detector; the OFDM case is named as OFDM.
+- Known-code: acquisition finds a planted code at −25 dB with k non-
+  coherent periods at its stated Pfa, tracking holds it through a 1 Hz/s
+  Doppler ramp, the despread symbols decode, and the C/N₀ estimate is
+  within 1 dB above 25 dB-Hz and flagged below.
+- **Real, tier 1 — 802.11b beacons** off the HackRF at 2.4 GHz (any AP, 20
+  MSPS): blind detection, 11.000 Mc/s, the 1 µs period, Barker-11 recovered
+  up to sign, DBPSK symbols despread. The honest first real test: one
+  user, short code, strong signal.
+- **Real, tier 2 — an 802.15.4 device** (a Zigbee bulb or Thread sensor):
+  2 Mc/s, 16 µs, the sixteen sequences.
+- **Real, tier 3 — GPS L1 C/A** off the HackRF with antenna power and an
+  active patch antenna: blind — 1.023 Mc/s and the 1 ms period from under
+  the floor (the fluctuation detector with thousands of windows); known —
+  every visible PRN acquired with Doppler and C/N₀ (the published codes
+  check the answer), and tracking's 50 bit/s stream (the nav message is
+  ATK-side); the power-distortion monitor reads "clean" on the open-sky
+  capture and "multipath" beside the house. The 1 ms period is also the
+  BOC cross-check: Galileo E1 shows its subcarrier line beside it. (The
+  TEXBAT recordings, if obtainable, are the spoofing acceptance.)
+- **Real, if a transmitter is at hand — a DSM2/DSMX radio**: chip rate 1
+  Mc/s from FDIFF, the GFSK chip class named, DSMX's 23-channel hop seen as
+  bursts in B1/B2, DSM2's two channels static.
+- **Multi-channel**: on the Kraken, a DSSS emitter planted 6 dB under the
+  single-channel floor detected by the CCA and MME tests at their stated
+  Pfa, its chips classified BPSK/QPSK by the conjugate cycle, and a
+  bearing from despread-then-MUSIC (atkdf) within atkdf's usual error.
+- The cost at 20 MSPS is recorded on Bill's PC (the fluctuation detector
+  is one FFT per window; the line scan one FFT per segment; the
+  eigenvector two power iterations per update).
 
-**Uses.** A DSSS instrument on the Signals bench; Bug Sniffer
-(spread-spectrum bugs hide under the floor); Drone Discovery; the
-fingerprint features (C5 — chip-rate error is a clock fingerprint).
+**Uses.**
+- A spread-spectrum instrument on the Signals bench: detect → chip rate →
+  period → code → despread, each stage with its evidence and provenance,
+  and a known-code acquisition panel with the catalogue. The method menu
+  is grouped by provenance (Bill's rule).
+- Bug Sniffer: spread-spectrum bugs hide under the floor; the blind path
+  is for them, and the Kraken's correlation tests find them before a chip
+  is known.
+- GNSS status (`gnss_status.py` has DENIED and UNTRUSTED states that "a
+  detector said so", and today no RF detector): acquisition across all
+  PRNs plus the power-distortion monitor give the RF evidence — no SV
+  acquired with a clear sky and a raised floor is DENIED; a distortion
+  verdict of spoof, or too many SVs at the same C/N₀ with one common
+  Doppler relationship, is UNTRUSTED. The ADS-B NACp layer stays the area
+  picture; this is the local one.
+- Drone Discovery: link identification by chip rate, chip modulation and
+  hop pattern (1 Mc/s GFSK chips over 23 channels is a DSMX; 2 Mc/s O-QPSK
+  is 802.15.4; a 250 kHz–1.6 MHz chirp is LoRa / ELRS).
+- atkdf: despread-then-DF — correlate each Kraken channel with the known
+  or recovered code before MUSIC, and the bearing gets the processing
+  gain. A DSSS emitter under the floor then gets a bearing.
+- The fingerprint features (C5): chip-rate error is a clock fingerprint;
+  the code itself (which PN, which start state) is an identity.
+- 406 SGB (INTERCEPT_IDEAS_PLAN §I2) can use step 5 if numpy is too slow,
+  as that plan allows.
+
+### B6b. Chirp spread spectrum — LoRa and its relatives
+
+Not DSSS, but the spread-spectrum signal Bill will meet most (Cricket is
+LoRa; ELRS and Crossfire fly drones; Meshtastic is everywhere), so it
+belongs beside B6 and shares its bench. A LoRa symbol is one linear chirp
+across the bandwidth, cyclically shifted by the symbol value; 2^SF values
+per symbol; a preamble of 8 unshifted up-chirps, two sync chirps, two and a
+quarter down-chirps.
+
+- **Detect and name (SF, BW):** multiply the signal by the conjugate base
+  up-chirp for each candidate (SF 5–12 × BW 7.8 kHz–1.6 MHz, a small grid)
+  and FFT over one symbol: a LoRa signal collapses to a single bin per
+  symbol; the preamble gives the same bin eight times — the coherence test
+  again. Noise collapses to nothing. Report SF, BW, the carrier offset
+  (from the up/down-chirp pair) and the symbol timing. (An STFT
+  instantaneous-frequency classifier in the literature works only above
+  −5 dB; the dechirp is the detector.)
+- **Demodulate:** the bin index per symbol is the symbol; gray mapping,
+  de-interleave, Hamming decode and de-whiten per the open LoRa
+  descriptions (gr-lora, LoRa-SDR; read before writing — the exact
+  interleaver and whitening were reverse-engineered and differ by SF and
+  header mode). Cricket's own packets are the acceptance oracle, with
+  the LoRa header's CRC as the proof.
+- **Honest:** ELRS runs a modified LoRa at 2.4 GHz and FLRC (not chirp)
+  at its highest rates; the detector names chirp parameters, and a
+  protocol decode is per-protocol, later.
+
+```c
+atkdsp_css_probe *atkdsp_css_probe_create(double fs, const atkdsp_css_cand *cands, int ncand, double pfa);
+/* process / read: per candidate (SF, BW): level, coherence, offset, timing; flags DETECT / PREAMBLE */
+ptrdiff_t atkdsp_css_demod(const atkdsp_cf32 *iq, size_t n, double fs, int sf, double bw, double offset,
+                           double t_sym0, uint16_t *symbols, size_t cap);   /* raw symbol values */
+```
+
+**Acceptance.** Synthetic LoRa at every SF/BW at −10 dB (LoRa's own
+operating region — SF 12 demodulates at −20 dB), the right (SF, BW) and
+nothing else; noise and DSSS produce nothing; real: Cricket's own frames
+off the HackRF, symbols matching what Cricket sent, header CRC good.
+
+**Uses.** Drone Discovery (ELRS / Crossfire control links named by their
+chirp parameters); Cricket self-test and range work; Bug Sniffer (LoRa
+trackers); the Signals bench.
+
+> **What this revision changed, and why.** (1) A table of the real
+> signals, because the first draft designed for the textbook BPSK short
+> code and most of what Bill will meet is not that: GFSK chips (DSM), MSK
+> chips (802.15.4, SGB), codebooks (802.15.4, CCK), many users (GPS),
+> long codes (CDMA). (2) The known-code path — acquire, track, despread,
+> a published-code catalogue and the power-distortion monitor — is now a
+> first-class deliverable; it is where GPS, 406 SGB, Wi-Fi and Zigbee get
+> their value, and it is the second half of the blind path anyway. (3)
+> Detection is three handles fused (ours), each with a threshold that
+> states its Pfa and needs no noise-power estimate where the literature
+> offers one — the first draft had one handle and "a line above the
+> floor". (4) A line *scan* (FFT) for the chip rate with a true Pfa over
+> the scan, since chip rates are a continuum and phase 3's per-candidate
+> Goertzel cannot search one. (5) Long codes get a symbol-period
+> estimator and a processing-gain figure instead of only "detected".
+> (6) The eigen step done as the literature does it now: an
+> identifiability rule before trusting it, the wide-window cut instead of
+> two-vector alignment, the carrier offset estimated on the eigenvector,
+> PAST for long periods, alternating-sign refinement with a vote margin,
+> Fast-ICA for QPSK chips. (7) The generator polynomial through chip
+> errors by parity-check counting, with Berlekamp–Massey only on certified
+> chips — the first draft would have named wrong polynomials. (8) The
+> Kraken's five channels as a detector (CCA, MME) and despread-then-DF,
+> which is the piece that turns "there is a spread bug" into a bearing.
+> (9) Real acceptance in tiers that can actually be run from Nokesville
+> with a HackRF — 802.11b first, Zigbee second, GPS third — rather than
+> GPS alone, which is the hardest case (many users, 18 dB under) and the
+> one blind recovery cannot do. (10) The GNSS DENIED / UNTRUSTED states
+> get their RF detector, the one method in the review with real-data
+> validation. (11) Provenance as a field of every method, per Bill's
+> rule. (12) B6b for LoRa, which is the spread spectrum Bill owns an
+> emitter of.
+
+### B6c. Undertow — the below-the-floor spread-spectrum watch (new, 2026-10-29)
+
+*Bill, the same evening: "a new, innovative technique that can look for
+unknown DSSS with unknown chip rates and unknown bandwidths … what hasn't
+anyone done … which techniques have never been put together … the best,
+below the noise floor DSSS auto-detection possible, that can record and
+catalog DSSS signals." This is the answer. Working name Undertow — what
+moves under the surface. The claims of novelty are made against the
+literature read today (`docs/DSSS_LITERATURE.md`), not against everything
+ever written; where a piece is known, the source is named, and the
+novelty is the assembly. Provenance tag for the whole: **ATK**, with each
+borrowed part tagged where it is used.*
+
+**Why the literature stops where it does.** Every blind DSSS detector in
+the review is a single-receiver, single-band method: it is handed a
+channel already centred on the signal at roughly the chip-rate bandwidth,
+and it decides. None searches frequency and bandwidth; none integrates
+longer than a capture; none uses a second receiver; none feeds what it
+found back into a matched filter on the data it just looked at; none
+keeps what it found. And they share a physical ceiling. Burel's statistic,
+the cyclic line and the eigen methods are all **fourth-order** — they
+square the signal (or a correlation of it) before averaging — so their
+deflection grows as SNR² · √(N·L): each dB of input costs four dB of
+output, as the thesis's law says. A **second-order** detector — one that
+correlates the signal with an independent copy of itself — grows as
+SNR · √N. At −20 dB in-band, SNR² is −40 dB; for a 1023-chip code the
+fourth-order path gives back √L ≈ 32 of that and still loses by ≈ 10 dB
+in deflection; for a 31-chip bug it loses by ≈ 25 dB. The only
+second-order blind detector is the radiometer, and it is useless because
+it needs the noise floor to a tenth of a dB (the SNR wall; literature A8).
+**Undertow's centre is a second-order detector with no SNR wall: the
+correlation radiometer** — two receivers whose noise is independent, so
+the averaged cross-spectrum of the two has a floor that falls as 1/√N
+instead of a fixed floor with ripple. Radio astronomy has run on this for
+seventy years (an interferometer sees sources a total-power radiometer
+cannot); `DSP_EXPANSION_PLAN.md` Part C lists the correlation radiometer
+for exactly that reason; **nothing in the DSSS literature uses it**. ATK
+has the receivers: any two whose samples can be put on one time axis —
+a B210's pair, an SM200 beside a BB60C on one 10 MHz, two remote nodes on
+Cricket's GPS timing, the Kraken's five channels below 1.7 GHz (the
+receivers subsection below says what each tier gives).
+Around that centre, four more pieces, each a combination that has not
+been made.
+
+**The six pieces.**
+
+1. **The scale-space survey — where, and how wide.** A dyadic polyphase
+   bank (A4's channelizer at bandwidths fs/2, fs/4, … down to ≈ 20 kHz)
+   turns the unknown (f_c, Rc) into a search over cells (channel, scale).
+   In each cell, three cheap statistics are accumulated:
+   - the small-lag autocorrelation |R(τ)| for τ up to a few chips at that
+     scale — for white noise its mean is zero off τ = 0, for a DSSS signal
+     it is the chip waveform's triangle (rectangular chips) or its RRC
+     curve, whose width *is* Tc and whose height is P_s: a blind estimate
+     of chip rate and signal power with no code, at any carrier offset
+     (the offset rotates R's phase, not its magnitude);
+   - the α-spectrum of the cell after |x|², x² and x⁴: lines at the chip
+     rate and its harmonics, at 2× and 4× the carrier offset;
+   - the baseline-relative PSD shape, with B5's learned floor removed, fit
+     against the chip-shape family (sinc², RRC, GFSK, BOC split).
+   **The scale constraint is the new part:** at the cell whose bandwidth
+   matches the signal, the chip-rate line must fall in a known window of
+   relative frequency (α ∈ [B/2, B] for the shapes above), the ACF triangle
+   must be one to two samples wide, and the PSD bump must fill the cell. A
+   line anywhere else in that cell is some other emitter's symbol clock.
+   The feature is a scale-space extremum — the way a blob detector finds a
+   spot at its own size — and it cuts the false-alarm space from "every
+   bin of every α-spectrum" to one window per cell. The three statistics
+   are then one χ²-tested verdict per cell (literature A4's max-statistic
+   form gives the true Pfa over the whole survey).
+2. **The long watch with drift compensation — how long.** Below the floor,
+   time is the only free gain, and the first draft threw it away by
+   working per capture. Undertow accumulates each cell's statistics for
+   minutes to hours, and the sizing is Burel's law in reverse: the UI says
+   "at this rate, −22 dB shows in six minutes". The catch, and the new
+   piece: over minutes the code period in samples *drifts* (1 ppm of chip
+   clock over 1000 s is a whole GPS period; Doppler does the same to a
+   satellite), so the period peak smears across lags and the gain is lost.
+   Radar solved this for migrating targets — the Keystone transform, or
+   simply accumulating in a (lag, lag-rate) plane and taking the maximum
+   along the drift lines. Nobody applies it to blind period detection.
+   With it, the fluctuation statistic integrates coherently for as long as
+   the emitter is on; a million 1 ms windows on a 1023-chip code puts the
+   Burel deflection at −25 dB in-band well above threshold on paper, and
+   the measured number is what the acceptance records.
+3. **The correlation radiometer — the second-order centre.** For every
+   receiver pair, the averaged cross-spectrum ⟨X₁(f)·X₂*(f)⟩ over the
+   survey band. Independent noise averages to zero; a common signal
+   leaves its spectral shape — the sinc² bump, the RRC edge, the BOC
+   split — on a floor that keeps falling. Three things come out at once:
+   detection with a stated Pfa (literature F1's canonical-correlation
+   test for the calibrated verdict; it does not care that the two front
+   ends' noise is coloured differently), the **bandwidth and shape** read
+   off the cross-spectrum directly, and the **phase slope across the bump
+   = the time difference of arrival** — a hyperbola on the map before a
+   chip of the code is known, and with three nodes a fix with its CEP.
+   What the DSSS papers never had is the second receiver; what the
+   cooperative-sensing papers never did is read the shape and the TDOA
+   from the same cross-spectrum and hand them to a code-recovery chain.
+   Honest conditions: the two antennas must see the same signal (a bug
+   sweep does; two nodes a kilometre apart see the same satellite but not
+   the same bug), common-mode spurs (LO leakage, DC, a shared supply) cross-
+   correlate and are masked by a learned noise-only cross-spectrum
+   baseline (F2's whitening generalised to pairs), and antenna coupling
+   adds a small correlated noise term that the same baseline removes.
+4. **Bootstrap despreading — the loop that learns.** The ring (A3) holds
+   the last minutes of the survey. The moment a cell's verdict fires, the
+   accumulated windows already hold the code's eigenvector (B6 step 4, the
+   literature's wide-window form with the identifiability check), and
+   that estimate becomes a **matched filter run backwards over the ring**:
+   acquisition and tracking (B6 step 5) on the recorded history, which
+   returns the full processing gain G on a signal that was only
+   marginally detected — a −20 dB blind detection despread with a
+   recovered 1023-chip code is a +10 dB symbol stream. The despread
+   symbols certify periods, certified periods refine the chips (the vote
+   margin), refined chips sharpen the matched filter: the turbo principle
+   applied to blind DSSS, which the iterative-estimation papers do within
+   one capture and never with a recorder and a tracker in the loop. The
+   loop ends with the generator polynomial (B6's parity-check counting)
+   and the code entering the catalogue as *known* — from then on this
+   emitter is found by acquisition at known-code sensitivity, 10–15 dB
+   below where blind detection first saw it. The system gets better at
+   finding what it has seen.
+5. **The consistency lattice — the false-alarm killer and the fingerprint.**
+   Five quantities are estimated by independent statistics: Tc from the
+   ACF triangle, Rc from the PSD nulls, Rc from the cyclic line, T from
+   the period peak, and the carrier offset from the x² / x⁴ lines. They
+   must agree: T·Rc must be an integer L, preferably one of the code-
+   length families (2ⁿ − 1 for m-sequences and Gold, Barker 11/13,
+   802.15.4's 32, GPS's 1023, GLONASS's 511, Galileo's 4·1023, CDMA's
+   2¹⁵, UMTS's 38400 — a boost, not a requirement, since a proprietary
+   bug may use any length); and the **common-oscillator test**: a
+   transmitter derives carrier and chip clock from one reference, so the
+   carrier's fractional error (offset / f_c) equals the chip rate's
+   (ΔRc / Rc) to within the receiver's own reference error. A detection
+   whose five numbers agree is a detection; one whose numbers disagree is
+   two emitters, an OFDM prefix (B4), or noise. The same ppm pair,
+   stable over sessions, is the emitter's **fingerprint** (C5) — the
+   crystal does not change when the channel does.
+6. **The catalogue and the recorder — "record and catalog".** Each emitter
+   gets a dossier under `rf_data` (never C:\, never AppData): f_c, Rc,
+   chip shape and modulation, T, L, the chips with their vote margins,
+   the generator polynomial if named, symbol rate and G, the ppm pair,
+   first and last seen, the occupancy schedule (B5 keeps it — the Bug
+   Sniffer park-mode trigger is "a catalogued or new spread emitter came
+   up"), bearings (atkdf, despread-then-DF) and TDOA hyperbolas, C/N₀
+   history, the provenance of every method that contributed, and I/Q
+   snippets at detection and at best SNR. The catalogue is the known-code
+   list the next session starts from, and the thing a report is written
+   from.
+
+**What is new, stated carefully.** Against the literature read today:
+(a) the scale-constrained cyclic line in a dyadic bank — wideband
+cyclostationary sensing exists (the strip spectral correlation
+analyser), but not the constraint that makes the line's position a
+function of the cell, which is what turns a survey-wide scan into a
+Pfa-stated detector; (b) Keystone / lag-rate accumulation for a blind
+period peak — radar's method, not applied to DSSS; (c) the correlation
+radiometer with shape and TDOA read from the cross-spectrum, feeding a
+code-recovery chain — interferometry's method, not in the DSSS literature;
+(d) the bootstrap loop over a recorder with a tracker in it; (e) the
+consistency lattice with the common-oscillator test as the decision rule
+(the ppm pair is known in transmitter fingerprinting; as a *detection*
+consistency test it is not). Each piece alone is a modest step; together
+they change what the floor means: with two receivers and an hour,
+Undertow's design point is **−25 dB in-band for a 31-chip bug** (the
+fourth-order path alone cannot get there), and anything it has seen once
+is found again at known-code sensitivity.
+
+**The receivers Undertow runs on — common timing across radios (Bill,
+20:23: "the KrakenSDR is less than ideal, so make sure it supports multiple
+receivers on a common timing sync — USRPs, Signal Hounds, even Airspys").**
+Agreed, and the Kraken's weakness is not coherence but reach: 2.4 MSPS,
+8 bits, nothing above 1.766 GHz, so no 2.4 GHz bugs, no 5.8 GHz drone
+links, no 11 Mc/s Wi-Fi. The correlation radiometer needs two receivers
+whose noise is independent and whose samples can be put on one time
+axis; it does not need them to be the same radio, or to share an LO.
+Three sync tiers, each honest about what it gives (ATK's
+`SDR_SUPPORT_PLAN.md` already grades radios by driver family and proves
+coherence in Radio Check step 7; this adds the across-units case):
+
+| Tier | What is shared | Radios | What Undertow gets |
+|---|---|---|---|
+| **1 — sample-coherent** | one sample clock and one LO across channels | KrakenSDR (5); USRP B210 / X310 two-channel (atkuhd already streams the B210 pair); bladeRF 2.0 micro RX1+RX2; Pluto 2r2t; LimeSDR | everything: the cross-spectrum integrates coherently without limit, and DF (MUSIC) works — once Radio Check step 7 has proven it |
+| **2 — reference-locked** | a 10 MHz reference between separate units, plus a PPS or trigger for the sample start | USRP N210 / X310 / N3xx with a GPSDO or external REF + PPS (UHD's clock and time sources: the textbook multi-unit case); B210 with REF IN + PPS IN; **Signal Hound SM200** (10 MHz in; GPS-disciplined, timestamped I/Q on the B/C models — the best wideband option, 40–160 MHz spans to 20 GHz) and BB60C (10 MHz ref in); bladeRF 2.0 (REF IN + trigger); HackRF One (CLKIN 10 MHz); Airspy R2 (an external 10 MHz clock input, per Airspy's documentation — confirm on the unit; the Mini has none) | the sample *rates* agree exactly, so no rate drift; the sample *start* is aligned to about a sample by the PPS, the rest by a reference emitter; each unit's LO phase is unknown and wanders slowly (two synthesizers on one 10 MHz are frequency-locked, not phase-locked) — the cross-spectrum's phase slope (TDOA) is unaffected, coherent integration is limited by the wander unless phase-referenced (below); DF across units needs a per-retune phase calibration |
+| **3 — free-running** | nothing but what the signal and GPS give | RTL dongles, HackRF without CLKIN, Airspy Mini, SDRplay, and every `atk_client` remote node | sample-rate offset (tens of ppm, drifting), time offset, LO offset (1 ppm at 2.4 GHz is 2.4 kHz) and LO wander, all to be measured — three ways to do it, below; with them, the correlation radiometer still works, in phase-stable blocks |
+
+The alignment is a kernel job (`atkdsp_align_*`), because every pair needs
+it and Tier 1 is only the case where the numbers are zero:
+
+- **GPS-stamped starts and PPS-measured clocks.** A node with a PPS
+  (Cricket's T-Beam already gives one to every `atk_client`; a GPSDO gives
+  one to a fixed site) timestamps the capture start to the PPS edge and
+  measures its own sample clock against PPS over minutes (the ppm the
+  GNSS-denied plan already learns for Cricket's holdover). That fixes
+  time offset to a few samples and sample-rate offset to a fraction of a
+  ppm; the kernel resamples one stream by (1 + ε) (A2's exact-rate
+  resampler) and shifts it in time. LO offset and wander remain.
+- **The reference emitter — differential alignment.** A strong emitter
+  both receivers hear (a broadcast carrier, a pager, a repeater's pilot,
+  or Bill's own known-good emitter) is cross-correlated between the two
+  streams: its lag gives the residual time offset, the lag's drift gives
+  the sample-rate offset, its cross-spectrum frequency gives the LO
+  offset, and — the piece radio astronomy adds — **its cross-spectrum
+  phase, tracked over time, is the LO wander between the units, so
+  applying its conjugate to the whole band cancels that wander:** VLBI's
+  phase referencing on a calibrator source, which turns two free-running
+  receivers into a coherently integrating pair for as long as the
+  reference is heard. `CUED_DF_PLAN.md` already noted the same idea from
+  Leffke et al. (AMOS 2024, after Kawase) for a two-site interferometer;
+  this is where it is used. It needs no GPS at all, which is the case the
+  GNSS-denied plan worried about.
+- **GPS as the common clock.** Where a node can capture L1 (an RTL with a
+  bias-tee and a patch antenna can), B6 step 5's acquisition of any
+  visible PRN gives that node's absolute time and its sample-clock error
+  from the code phase and the code Doppler — every node disciplined to
+  the same satellites, with no PPS wiring and no shared reference. The
+  known-code path pays for itself here.
+
+**What each receiver count buys (Bill, 20:27: "two- and four-channel
+SDRs, and what is the most we can do with just a bladeRF by itself?").**
+Design points, to be measured, for a 31-chip short code (the bug case)
+and a 1023-chip one (the GPS case), ten minutes of watch, a stationary
+emitter, drift compensated:
+
+| Receivers | Second-order centre? | Blind depth, design point | Also |
+|---|---|---|---|
+| **one** (Bill's bladeRF 1.0: one channel, 300 MHz–3.8 GHz, 28 MHz analog, 40 MSPS 12-bit) | no — fourth-order only | ≈ −18 dB in-band for 31 chips, ≈ −23 dB for 1023, from Burel's law with 6·10⁵ windows (4·SNR + 10·log M + 20·log L − 3 against a 4σ floor); the scale-space survey over one 28 MHz slice at a time | **the known-code path is single-receiver and loses nothing**: GPS at −18 dB in 2 MHz is routine, Wi-Fi Barker, Zigbee, 406 SGB; bootstrap despreading gives the full G once a code is in hand; the catalogue, the consistency lattice and B5's floor all work. Not reachable: 5.8 GHz, HF, and anything the fourth-order wall hides |
+| **two channels, one box** (B210, bladeRF 2.0 micro RX1+RX2, Pluto 2r2t, Lime) | yes — one pair, sample-coherent | ≈ −25 dB for 31 chips (the correlation radiometer's SNR·√N law with independent noise), deeper for long codes | one interferometric baseline: a bearing with a left/right ambiguity (not a hyperbola — the baseline is the antenna spacing), 3 dB of array gain, **one spatial null** (C4 in space: a CW tone 30 dB up nulled before any statistic); TDOA for geolocation needs the two antennas apart, which one box can do with cable runs of tens of metres |
+| **four channels** (X310 with two TwinRX, N310, two B210s on one 10 MHz, or a 2.0 micro pair) | yes — six pairs | the same depth as two channels plus 6 dB of array gain and √6 more independent pairs in the eigenvalue test; the per-pair MME / CCA tests become one 4×4 cross-spectral-matrix test | unambiguous azimuth DF with a planar layout, MUSIC resolving up to three emitters, three spatial nulls, and **despread-then-DF** — a bearing on a bug under the floor |
+| **five** (Kraken) | yes — ten pairs, below 1.766 GHz only | as four, at 2.4 MSPS and 8 bits | the DF array it already is |
+| **two sites** (any two of the above, tiers 2–3, aligned as described) | yes | as the pair | **TDOA hyperbolas** and, with three sites, a fix with its CEP; the reference emitter makes it work without GPS |
+
+The bladeRF 1.0 by itself is therefore a complete single-receiver Undertow
+— survey, long watch, bootstrap, catalogue, and every known-code
+instrument — and what it cannot do is exactly the second-order centre and
+spatial work: that needs a second channel, and the cheapest step up is a
+bladeRF 2.0 micro (two coherent channels to 6 GHz, 56 MHz) or a B210 on
+the atkuhd path that already streams both channels.
+
+ATK side, for `SDR_SUPPORT_PLAN.md`'s radio record: four fields —
+`ref_in_10mhz`, `pps_or_trigger_in`, `timestamped_stream`,
+`multi_unit_sync_tier` — and a **Radio Check step 8**: two units on one
+reference (or two free-running units with a reference emitter), the
+measured time offset, rate offset, LO offset and LO wander over ten
+minutes, and the tier they earn. The multi-unit DAQ (open N receivers of
+any family, emit one timestamped multi-stream into the ring) is the
+generalisation of atkdaq, on the ATK side; the kernel supplies the
+alignment, the pair cross-spectra and the tests. Undertow's own
+acceptance then runs on three pairs — a B210's two channels (tier 1), a
+B210 with an SM200 or BB60C on one 10 MHz (tier 2), and two HackRFs on
+nothing (tier 3) — and records the depth each pair reaches on the planted
+emitter. The order of preference for a two-receiver bug sweep is what the
+table implies: SM200 pair or B210 pair, then any two reference-locked
+units, then anything with a reference emitter in the band; the Kraken
+stays the DF array below 1.7 GHz.
+
+**Where a neural network belongs.** Bill remembered the CNN papers; they
+are read in `docs/DSSS_LITERATURE.md` §K. On raw I/Q a network learns the
+same fourth-order features the classical statistics compute, beats only
+the one-capture autocorrelation test (by 3–4 dB, in simulation, mostly
+without a stated false-alarm rate), and cannot cross the second-order line
+that needs a second receiver. So in Undertow a network sits *above* the
+kernel: an optional learned fuser over the per-cell statistics, trained
+on the harness's synthetic signals in ATK's Python (TorchSig-style),
+calibrated by a noise score pool (the one good idea in that line, **CN
+2025**, NUDT), tagged **ATK** for the fuser itself, and judged by the same
+three numbers as every other handle. Never inside the C library.
+
+**Honest limits.** One receiver loses the second-order centre: single-
+receiver Undertow is the scale-space survey plus the long watch — still
+new, still fourth-order, so −15 to −20 dB with patience, not −25. A moving
+emitter or a hopping one breaks the long watch (hops are B1/B2's). Two
+receivers must see the same signal, and a learned noise-only cross-
+spectrum is a precondition, not an option. Bootstrap despreading needs a
+short code and one user; for long codes the catalogue entry is "chip rate,
+symbol rate, gain, shape, TDOA" and stays honest about it. Everything
+above the floor that Undertow finds, B6's plain chain finds faster;
+Undertow is for what the chain cannot see.
+
+```c
+/* the survey — one handle per receiver (or receiver pair), streaming over the ring */
+atkdsp_undertow *atkdsp_undertow_create(double fs, int nscales, double f_lo, double f_hi, int nrx, double pfa,
+                                        const atkdsp_undertow_cfg *cfg);     /* cfg: window, max lag-rate, baseline source, handles */
+int   atkdsp_undertow_process(atkdsp_undertow *u, const atkdsp_cf32 *const *x, size_t n);   /* nrx streams, same clock */
+int   atkdsp_undertow_baseline(atkdsp_undertow *u, const atkdsp_cf32 *const *x, size_t n);  /* noise-only learning (floor, cross-spectrum) */
+ptrdiff_t atkdsp_undertow_read(const atkdsp_undertow *u, atkdsp_undertow_hit *hits, size_t cap);
+      /* per hit: f_c, Rc (three estimates + agreement), Tc, shape, T, L, carrier offset, ppm pair, per-statistic
+         values with their Pfa, which handles fired, TDOA per pair with its error, time-to-detect, method provenance */
+int   atkdsp_undertow_bootstrap(atkdsp_undertow *u, const atkdsp_ring *ring, int hit, atkdsp_dsss_code_result *code,
+                                atkdsp_dsss_trk **trk);  /* eigenvector -> acquire/track over the ring -> refined code */
+/* catalogue I/O is ATK-side Python (rf_data); the kernel exports a hit as a versioned byte blob, like B5's state */
+```
+
+**Acceptance — the honest way to measure depth.** Bill's rule: always
+against a known-good emitter. A planted emitter he controls — a CYRF6936
+module or an 802.11b card into a step attenuator, and Cricket for LoRa —
+walked down in 2 dB steps until Undertow stops; the recorded depth, the
+time-to-detect at each step, and the false-alarm rate on the empty band
+over a night are the three numbers the section is judged by, per handle
+and fused, with one receiver and with two. Then: the planted emitter at a
+depth the blind chain cannot see, found, bootstrapped, catalogued, powered
+off, powered on an hour later at 10 dB less — found by acquisition from
+the catalogue. GPS as the free satellite case: every visible PRN's TDOA
+between two nodes against the ephemeris. And the lattice's refusals:
+an OFDM signal, two overlapping emitters and a CW tone each produce a
+disagreement, not a detection.
+
+**Uses.** Bug Sniffer's park mode and sweep (the design case: a spread bug
+under the floor, found, fingerprinted, bearing and hyperbola on the map);
+Drone Discovery (an unknown control link catalogued by chip rate and ppm
+pair before anyone knows the vendor); the Signals bench (the survey view
+— cells lit by their verdict, colour by which handle fired, provenance in
+the tooltip); atkdf (despread-then-DF and the TDOA layer); the fingerprint
+features (C5); the long-term baseline (B5) as its memory.
 
 ---
 
@@ -1558,7 +2307,8 @@ checked first).
 | 3b | **C3's data bursts:** MDC-1200, FleetSync I/II | S–M | Reverse-engineered framing: real recordings before trust |
 | 4 | **Engine:** A1 float32 FFT, A2 fused mixer, A4 channelizer | L | Before the wider SDRs (B210, Signal Hound); the channelizer feeds C3 on many channels at once |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
-| 6 | **Below the floor:** B6 DSSS, C4 strong-signal removal | M–L | Uses B4, D2 and C1 |
+| 6 | **Below the floor:** B6 spread spectrum (blind path, known-code path, the GNSS monitor), B6b LoRa, C4 strong-signal removal | L | Uses B4, D2 and C1; B6 revised 2026-10-29 against the literature (`docs/DSSS_LITERATURE.md`) |
+| 6b | **Undertow:** B6c — the scale-space survey, the long watch, the correlation radiometer, bootstrap despreading, the catalogue | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
 | 7 | **The long watch and identity:** B5 occupancy + baseline, C5 fingerprint features | M | Uses B2, C2 and C3 |
 | 8 | **Intercept audio:** F1, F2, and the F3 wiring into the Workshop | M | Independent; the Workshop's radio door is waiting for it |
 | 9 | **Propagation:** E1 ITM | M | Independent; moves up if DF footprints are wanted sooner |

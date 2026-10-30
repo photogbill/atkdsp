@@ -699,6 +699,31 @@ int main(void) {
         atkdsp_pfb_destroy(pf); free(px); free(po);
     }
 
+    /* §28a the overlap-save extractor: an in-band tone comes out at unit gain */
+    {
+        const double fs = 2.4e6, off = 300e3, bw = 50e3, outr = 50e3;
+        atkdsp_osx *ox = atkdsp_osx_create(fs, 4096, 80.0, 1);
+        int ch = ox ? atkdsp_osx_add(ox, off, bw, outr) : -1;
+        const size_t nn = 4096 * 40;
+        atkdsp_cf32 *ix = (atkdsp_cf32 *)malloc(nn * sizeof *ix);
+        for (size_t i = 0; i < nn; ++i) {
+            const double ph = 2.0 * ATK_SMOKE_PI * (off + 7e3) / fs * (double)i;
+            ix[i].re = (float)cos(ph); ix[i].im = (float)sin(ph);
+        }
+        const size_t cap = ox && ch >= 0 ? atkdsp_osx_out_max(ox, ch, nn) : 0;
+        atkdsp_cf32 *oc = (atkdsp_cf32 *)malloc((cap ? cap : 1) * sizeof *oc);
+        atkdsp_cf32 *outs[1] = { oc };
+        size_t counts[1] = { 0 };
+        ptrdiff_t ns = (ox && ch >= 0) ? atkdsp_osx_process(ox, ix, nn, outs, counts, cap) : -1;
+        double mag = 0.0; const size_t k0 = 300;
+        if (ns > 0 && counts[0] > k0 + 500)
+            for (size_t i = k0; i < k0 + 500; ++i) mag += sqrt((double)oc[i].re * oc[i].re + (double)oc[i].im * oc[i].im);
+        mag /= 500.0;
+        CHECK(ox != NULL && ch == 0 && ns > 0 && fabs(mag - 1.0) < 1e-2,
+              "osx: an in-band tone extracted at unit gain");
+        atkdsp_osx_destroy(ox); free(ix); free(oc);
+    }
+
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);
     printf("%d failure(s)\n", fails);
     return fails ? 1 : 0;

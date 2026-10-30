@@ -94,7 +94,43 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.19.0 (ABI 20)
+## What is in v0.20.0 (ABI 21)
+
+**The channelizer, part 2 — the overlap-save extractor** of `docs/ATKDSP_PLAN.md`
+§A4 (tool a). The second of the channelizer's two tools: arbitrary channels at
+arbitrary centres, for operator-chosen targets, decoder-clocked bursts, and
+off-grid rasters — the complement to v0.19.0's uniform PFB grid. Header §28a,
+twin in `reference.py` §28a, 6 more tests in `tests/test_channelizer.py` (22
+total), a smoke line. Built and checked here on Linux (and under ASan + UBSan);
+the Windows run is `build.bat /only atkdsp /test`.
+
+| | what | how |
+|---|---|---|
+| **extract** | `atkdsp_osx` | one forward FFT of size `nfft` per block (overlap-save, overlap `nfft/2`); each channel rolls its centre to baseband, multiplies by its filter's frequency response, and **folds to `nfft/decim` before one small inverse FFT** — the small transform *is* the integer decimation (one FFT serves every channel). Then the arbitrary resampler lands each channel on its own `out_rate` |
+| **manage** | `_add` / `_retune` / `_remove` | channels come and go between blocks on stable slot indices; each owns its filter, its inverse plan and its per-element resamplers, so adding, retuning or removing one leaves **every other channel bit-identical** |
+| **coherent, N elements** | `atkdsp_osx_process_n` | the same channels across N element streams on one block clock (W4), so an operator-chosen or decoder-clocked target can be direction-found too — a plane wave's inter-element phase is preserved to the channel output |
+
+Measured (Linux, gcc; `tests/test_channelizer.py`):
+
+| check | result |
+|---|---|
+| an in-band tone | extracted at **unit gain**, landed exactly on `out_rate` (matches a DDC of the same channel) |
+| a tone outside the channel | **−111 dB** (≥ 80 dB stopband) |
+| C against the twin, with the resampler chain | C == twin to **5.8e-7** relative (float32) |
+| add / retune / remove a second channel | the first channel's output stays **bit-identical** |
+| streaming chunk invariance | **bit-identical** however the input is split |
+| a planted plane wave, 5 elements | inter-element phase preserved to **0.008°** (W4, R7 ≤ 0.1°); elements bit-identical on identical input |
+
+**Honest limits.** Simulation, measured against planted truth. The "matches a
+DDC" check is on an in-band tone (both are unit-gain in band and agree to ~1e-4
+after group-delay alignment); the two use different anti-alias filters, so it is
+amplitude/phase fidelity in the passband, not a tap-for-tap match. Decimation is
+by powers of two (the fold requires `decim | nfft/2`); the arbitrary resampler
+takes it the rest of the way to any `out_rate`. The channelizer's two tools are
+now both in: the PFB grid (§28b, v0.19.0) and this extractor (§28a). W3 (the
+channel-grid CFAR gate) remains atkdf-side wiring, not a kernel here.
+
+## What was in v0.19.0 (ABI 20)
 
 **The channelizer, part 1 — the DF-everything grid** of `docs/ATKDSP_PLAN.md`
 §A4, built to the direction-finding contract in

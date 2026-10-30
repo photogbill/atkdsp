@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 20
-#define ATKDSP_VERSION_STRING "0.19.0"
+#define ATKDSP_ABI_VERSION 21
+#define ATKDSP_VERSION_STRING "0.20.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -130,6 +130,13 @@ extern "C" {
  * and power (atkdsp_pfb_channel_power) DF accumulates, sample bookkeeping
  * (atkdsp_pfb_block_origin / _group_delay) and the per-window cal hook
  * (atkdsp_pfb_set_cal). The overlap-save extractor (§28a) is a later ABI. */
+/* 20 -> 21: the channelizer, part 2 (§28a) — the overlap-save extractor
+ * atkdsp_osx: arbitrary channels at arbitrary centres from one forward FFT per
+ * block (the small inverse transform is the integer decimation), each landed on
+ * its own out_rate by the arbitrary resampler. Channels add/retune/remove
+ * between blocks without disturbing the others; the N-element form
+ * (atkdsp_osx_process_n) keeps them phase-coherent for DF (R1-R3, W4). The two
+ * channelizer tools (PFB grid §28b, extractor §28a) are now both present. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -3050,22 +3057,23 @@ ATKDSP_API int              atkdsp_lattice(const atkdsp_lattice_in *in, atkdsp_l
 
 /* ==== THE CHANNELIZER (v0.19.0, ABI 20) ==================================
  * docs/ATKDSP_PLAN.md §A4, and docs/CHANNELIZER_DF_REQUIREMENTS.md for the
- * multi-element (DF) contract. The plan has two tools; this ABI ships the
- * one DF is blocked on:
+ * multi-element (DF) contract. Two tools, both present:
  *
  *   (b) the POLYPHASE FILTERBANK (§28b) — a uniform grid, every channel at
  *       once, 2x oversampled so a signal on a channel edge is not lost. For
  *       "DF everything", the watchlist, Bug Sniffer's cueing, occupancy.
  *
- * It runs N element streams on ONE block clock (the _process_n form), the
+ *   (a) the OVERLAP-SAVE EXTRACTOR (§28a) — arbitrary channels at arbitrary
+ *       centres from one forward FFT per block; the small inverse transform is
+ *       the decimation, then the arbitrary resampler lands each channel on its
+ *       own out_rate. Channels add/retune/remove between blocks without
+ *       disturbing the others. For operator targets, decoder-clocked bursts.
+ *
+ * Both run N element streams on ONE block clock (the _process_n forms), the
  * required path for direction finding: the per-element phase reference is a
  * function only of the parameters and the sample index, so a plane wave's
  * inter-element phases survive to the channel output (the bearing). W1/W2 are
- * the per-channel covariance and power DF accumulates on that output.
- *
- * Still to come (a later ABI): the OVERLAP-SAVE EXTRACTOR (§28a) — arbitrary
- * channels at arbitrary centres, for operator targets and decoder-clocked
- * bursts. Its algorithm is proven (reference prototype); it is not in this ABI.
+ * the per-channel covariance and power DF accumulates on the PFB output.
  *
  * The twin is python/atkdsp/reference.py §28; the kernel is src/channelizer.c.
  */
@@ -3127,6 +3135,40 @@ ATKDSP_API void        atkdsp_pfb_cov_reset(atkdsp_cf32 *R, uint32_t *counts, un
 ATKDSP_API void        atkdsp_pfb_channel_power(const atkdsp_cf32 *out, unsigned nel,
                                                 unsigned nchan, size_t m,
                                                 float *pwr, float *mean_pwr);
+
+/* ---- 28a. overlap-save extractor (arbitrary channels) ----------------- */
+typedef struct atkdsp_osx atkdsp_osx;
+/* One forward FFT of size `nfft` per block (power of two; the overlap is
+ * nfft/2). atten_db is each channel's stopband; max_nel the most element
+ * streams a _process_n call carries (1 for the plain path, up to 32). */
+ATKDSP_API atkdsp_osx *atkdsp_osx_create(double fs, size_t nfft, double atten_db,
+                                         unsigned max_nel);
+ATKDSP_API void        atkdsp_osx_destroy(atkdsp_osx *x);
+ATKDSP_API void        atkdsp_osx_reset(atkdsp_osx *x);
+/* add a channel at offset_hz, bandwidth bw_hz, landed on out_rate; returns the
+ * channel slot index (>=0, stable across add/remove) or ATKDSP_E_*. retune
+ * moves one, remove frees its slot — neither disturbs the other channels. */
+ATKDSP_API int         atkdsp_osx_add(atkdsp_osx *x, double offset_hz, double bw_hz, double out_rate);
+ATKDSP_API int         atkdsp_osx_retune(atkdsp_osx *x, int ch, double offset_hz);
+ATKDSP_API int         atkdsp_osx_remove(atkdsp_osx *x, int ch);
+ATKDSP_API int         atkdsp_osx_channels(const atkdsp_osx *x);   /* slot count (incl. holes) */
+ATKDSP_API double      atkdsp_osx_chan_rate(const atkdsp_osx *x, int ch);  /* out_rate, 0 if free */
+/* an upper bound on the samples one channel yields for n input samples — size
+ * each output buffer at least this. */
+ATKDSP_API size_t      atkdsp_osx_out_max(const atkdsp_osx *x, int ch, size_t n);
+/* single element: outs[ch] (one pointer per channel slot, NULL for a slot you
+ * don't want) each receive out_counts[ch] samples, cap_each each. A free slot
+ * writes out_counts[ch]=0. Returns the slot count, or ATKDSP_E_*. */
+ATKDSP_API ptrdiff_t   atkdsp_osx_process(atkdsp_osx *x, const atkdsp_cf32 *in, size_t n,
+                                          atkdsp_cf32 *const *outs, size_t *out_counts,
+                                          size_t cap_each);
+/* N elements, ONE block clock: outs is [nel][nslots] (element el, slot ch at
+ * outs[el*nslots + ch]); out_counts is [nslots] (same for every element). */
+ATKDSP_API ptrdiff_t   atkdsp_osx_process_n(atkdsp_osx *x, const atkdsp_cf32 *const *ins,
+                                            unsigned nel, size_t n,
+                                            atkdsp_cf32 *const *outs, size_t *out_counts,
+                                            size_t cap_each);
+ATKDSP_API int         atkdsp_osx_describe(const atkdsp_osx *x, char *buf, size_t cap);
 
 #ifdef __cplusplus
 }

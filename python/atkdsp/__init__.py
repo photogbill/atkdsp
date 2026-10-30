@@ -53,7 +53,7 @@ __all__ = [
 #: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
 #:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
 #:    window's bin correlation) and block_code_id's fixed_bits.
-ABI_VERSION = 20
+ABI_VERSION = 21
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -3622,6 +3622,27 @@ def _bind_pfb(lib) -> None:
 _BIND_EXTRA.append(_bind_pfb)
 
 
+def _bind_osx(lib) -> None:
+    P = C.POINTER
+    vp, sz, u, d, i = C.c_void_p, C.c_size_t, C.c_uint, C.c_double, C.c_int
+    pcf, ppcf, psz = P(_Cf32), P(P(_Cf32)), P(C.c_size_t)
+    lib.atkdsp_osx_create.argtypes = [d, sz, d, u]; lib.atkdsp_osx_create.restype = vp
+    lib.atkdsp_osx_destroy.argtypes = [vp]; lib.atkdsp_osx_destroy.restype = None
+    lib.atkdsp_osx_reset.argtypes = [vp]; lib.atkdsp_osx_reset.restype = None
+    lib.atkdsp_osx_add.argtypes = [vp, d, d, d]; lib.atkdsp_osx_add.restype = i
+    lib.atkdsp_osx_retune.argtypes = [vp, i, d]; lib.atkdsp_osx_retune.restype = i
+    lib.atkdsp_osx_remove.argtypes = [vp, i]; lib.atkdsp_osx_remove.restype = i
+    lib.atkdsp_osx_channels.argtypes = [vp]; lib.atkdsp_osx_channels.restype = i
+    lib.atkdsp_osx_chan_rate.argtypes = [vp, i]; lib.atkdsp_osx_chan_rate.restype = d
+    lib.atkdsp_osx_out_max.argtypes = [vp, i, sz]; lib.atkdsp_osx_out_max.restype = sz
+    lib.atkdsp_osx_process.argtypes = [vp, pcf, sz, ppcf, psz, sz]; lib.atkdsp_osx_process.restype = C.c_ssize_t
+    lib.atkdsp_osx_process_n.argtypes = [vp, ppcf, u, sz, ppcf, psz, sz]; lib.atkdsp_osx_process_n.restype = C.c_ssize_t
+    lib.atkdsp_osx_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_osx_describe.restype = i
+
+
+_BIND_EXTRA.append(_bind_osx)
+
+
 def method(method_id: int):
     """(name, authors, year, country) or None — the twin of atkdsp_method()."""
     p = load().atkdsp_method(int(method_id))
@@ -4184,3 +4205,82 @@ def pfb_channel_power(out, nel, nchan):
 
 
 __all__ += ["Pfb", "pfb_cov_accumulate", "pfb_cov_reset", "pfb_channel_power"]
+
+
+class Osx:
+    """Overlap-save extractor (atkdsp_osx): arbitrary channels at arbitrary
+    centres, each landed on its own out_rate. add/retune/remove between calls
+    without disturbing the others; process_n runs N elements phase-coherently.
+    Twin: atkdsp.reference.Osx."""
+
+    def __init__(self, fs, nfft=4096, atten_db=80.0, max_nel=1):
+        self._lib = load()
+        self._p = self._lib.atkdsp_osx_create(float(fs), int(nfft), float(atten_db), int(max_nel))
+        if not self._p:
+            raise AtkDspError("osx_create: check fs>0, nfft a power of two >= 64")
+        self.max_nel = int(max_nel)
+
+    def __del__(self):
+        p = getattr(self, "_p", None)
+        if p:
+            self._lib.atkdsp_osx_destroy(p); self._p = None
+
+    def reset(self):
+        self._lib.atkdsp_osx_reset(self._p)
+
+    def add(self, offset_hz, bw_hz, out_rate):
+        ch = self._lib.atkdsp_osx_add(self._p, float(offset_hz), float(bw_hz), float(out_rate))
+        return _check(ch if ch >= 0 else int(ch), "osx_add")
+
+    def retune(self, ch, offset_hz):
+        _check(self._lib.atkdsp_osx_retune(self._p, int(ch), float(offset_hz)), "osx_retune")
+
+    def remove(self, ch):
+        _check(self._lib.atkdsp_osx_remove(self._p, int(ch)), "osx_remove")
+
+    def channels(self):
+        return int(self._lib.atkdsp_osx_channels(self._p))
+
+    def chan_rate(self, ch):
+        return float(self._lib.atkdsp_osx_chan_rate(self._p, int(ch)))
+
+    def out_max(self, ch, n):
+        return int(self._lib.atkdsp_osx_out_max(self._p, int(ch), int(n)))
+
+    def describe(self):
+        buf = C.create_string_buffer(256)
+        n = self._lib.atkdsp_osx_describe(self._p, buf, 256)
+        return buf.value.decode() if n > 0 else ""
+
+    def process_n(self, ins, nel):
+        nel = int(nel)
+        arrs = [np.ascontiguousarray(np.asarray(ins[e]).ravel(), np.complex64) for e in range(nel)]
+        n = arrs[0].size
+        ns = self.channels()
+        active = [self.chan_rate(ci) > 0 for ci in range(ns)]
+        cap_each = max([self.out_max(ci, n) for ci in range(ns) if active[ci]], default=0)
+        bufs = [[(np.zeros(cap_each, np.complex64) if active[ci] else None) for ci in range(ns)]
+                for _ in range(nel)]
+        ptrs = (C.POINTER(_Cf32) * (nel * ns))()
+        for e in range(nel):
+            for ci in range(ns):
+                ptrs[e * ns + ci] = _cfp(bufs[e][ci]) if active[ci] else None
+        counts = (C.c_size_t * ns)() if ns else (C.c_size_t * 1)()
+        inarr = (C.POINTER(_Cf32) * nel)(*[_cfp(a) for a in arrs])
+        got = self._lib.atkdsp_osx_process_n(self._p, inarr, nel, n, ptrs, counts, cap_each)
+        _check(got if got >= 0 else int(got), "osx_process_n")
+        cnts = [int(counts[ci]) for ci in range(ns)]
+        outs = [None] * ns
+        for ci in range(ns):
+            if active[ci]:
+                m = cnts[ci]
+                outs[ci] = (np.array([bufs[e][ci][:m] for e in range(nel)], np.complex64)
+                            if m else np.zeros((nel, 0), np.complex64))
+        return outs, cnts
+
+    def process(self, x):
+        outs, cnts = self.process_n([x], 1)
+        return [o[0] if o is not None else None for o in outs], cnts
+
+
+__all__ += ["Osx"]

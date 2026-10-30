@@ -191,3 +191,87 @@ def test_set_cal_applies_once():
     # element 0 unchanged, element 1 rotated by the cal
     assert np.allclose(y1[0], y0[0], atol=1e-5)
     assert np.allclose(y1[1], y0[1] * np.exp(1j * np.deg2rad(90.0)), atol=1e-4)
+
+
+# ---- §28a the overlap-save extractor ---------------------------------------
+OSX_NFFT = 4096
+OSX_OFF = 300e3
+OSX_BW = 50e3
+OSX_RATE = 50e3
+
+
+def test_osx_twin_in_band_tone_unit_gain():
+    x = _tone(OSX_OFF + 7e3, OSX_NFFT * 50)
+    o = ref.Osx(FS, OSX_NFFT); ci = o.add(OSX_OFF, OSX_BW, OSX_RATE)
+    y, cnt = o.process(x)
+    mag = np.abs(y[ci][300:800]).mean()
+    assert abs(mag - 1.0) < 1e-3, mag
+    # lands on out_rate: ~ n*out_rate/fs samples
+    assert abs(cnt[ci] - (x.size * OSX_RATE / FS)) < 4 * (OSX_NFFT / (FS / OSX_RATE))
+
+
+def test_osx_twin_stopband():
+    x = _tone(OSX_OFF + 150e3, OSX_NFFT * 50)        # well outside a 50 kHz channel
+    o = ref.Osx(FS, OSX_NFFT); ci = o.add(OSX_OFF, OSX_BW, OSX_RATE)
+    y, _ = o.process(x)
+    rej = 20 * np.log10(np.abs(y[ci][300:800]).mean() + 1e-20)
+    assert rej < -80.0, f"stopband only {rej:.1f} dB"
+
+
+@needs_lib
+def test_osx_c_matches_twin():
+    x = _tone(OSX_OFF + 7e3, OSX_NFFT * 50, noise=0.01, seed=11)
+    oc = atkdsp.Osx(FS, OSX_NFFT); ci = oc.add(OSX_OFF, OSX_BW, OSX_RATE); yc, cc = oc.process(x)
+    ot = ref.Osx(FS, OSX_NFFT); ti = ot.add(OSX_OFF, OSX_BW, OSX_RATE); yt, ct = ot.process(x)
+    assert cc[ci] == ct[ti]
+    m = min(len(yc[ci]), len(yt[ti]))
+    rel = np.max(np.abs(yc[ci][:m] - yt[ti][:m])) / (np.max(np.abs(yt[ti][:m])) + 1e-20)
+    assert rel < 1e-4, f"OSX C!=twin {rel:.2e}"
+
+
+@needs_lib
+def test_osx_c_chunk_invariance_is_exact():
+    x = _tone(OSX_OFF + 7e3, OSX_NFFT * 50, noise=0.01, seed=12)
+    yW = atkdsp.Osx(FS, OSX_NFFT); w = yW.add(OSX_OFF, OSX_BW, OSX_RATE)
+    whole = yW.process(x)[0][w]
+    p = atkdsp.Osx(FS, OSX_NFFT); pc = p.add(OSX_OFF, OSX_BW, OSX_RATE)
+    outs = []
+    for seg in (x[:7000], x[7000:7001], x[7001:50000], x[50000:]):
+        r, _ = p.process(seg)
+        if r[pc] is not None and r[pc].size:
+            outs.append(r[pc])
+    split = np.concatenate(outs)
+    m = min(len(whole), len(split))
+    assert np.array_equal(whole[:m], split[:m])
+
+
+@needs_lib
+def test_osx_add_remove_retune_leaves_others_bit_identical():
+    x = _tone(OSX_OFF + 7e3, OSX_NFFT * 40, noise=0.01, seed=13)
+    ref_osx = atkdsp.Osx(FS, OSX_NFFT); r0 = ref_osx.add(OSX_OFF, OSX_BW, OSX_RATE)
+    y_ref = ref_osx.process(x)[0][r0]
+    # a second channel present, then removed mid-stream — channel 0 unaffected
+    o = atkdsp.Osx(FS, OSX_NFFT); c0 = o.add(OSX_OFF, OSX_BW, OSX_RATE); c1 = o.add(OSX_OFF + 200e3, OSX_BW, OSX_RATE)
+    y_pre = o.process(x[: x.size // 2])[0][c0]
+    o.remove(c1)
+    y_post = o.process(x[x.size // 2:])[0][c0]
+    y = np.concatenate([y_pre, y_post])
+    m = min(len(y_ref), len(y))
+    assert np.array_equal(y_ref[:m], y[:m])
+
+
+@needs_lib
+def test_osx_multi_element_phase_coherent():
+    phi = np.deg2rad(31.0)
+    base = _tone(OSX_OFF + 7e3, OSX_NFFT * 60)
+    o = atkdsp.Osx(FS, OSX_NFFT, max_nel=5); ci = o.add(OSX_OFF, OSX_BW, OSX_RATE)
+    outs, _ = o.process_n([base * np.exp(1j * e * phi) for e in range(5)], 5)
+    y = outs[ci]
+    ph = np.angle(y[:, 200:-50].mean(1)); ph = ph - ph[0]
+    planted = np.array([e * phi for e in range(5)])
+    err = np.rad2deg(np.max(np.abs(np.angle(np.exp(1j * (ph - planted))))))
+    assert err < 0.1, f"OSX W4 inter-element phase {err:.3e} deg"
+    # identical input on all elements -> bit-identical outputs
+    o2 = atkdsp.Osx(FS, OSX_NFFT, max_nel=5); o2.add(OSX_OFF, OSX_BW, OSX_RATE)
+    yy = o2.process_n([base] * 5, 5)[0][0]
+    assert all(np.array_equal(yy[0], yy[e]) for e in range(5))

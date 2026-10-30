@@ -11416,3 +11416,139 @@ def pfb_channel_power(out, nel, nchan):
     pwr = (np.abs(out[:nel]) ** 2).mean(axis=2)          # (nel, nchan)
     mean_pwr = pwr.mean(axis=0)                           # (nchan,)
     return pwr.astype(np.float32), mean_pwr.astype(np.float32)
+
+
+# ============================================================================
+# §28a  THE OVERLAP-SAVE EXTRACTOR  (v0.20.0, ABI 21)
+# Twin of atkdsp_osx (src/channelizer.c). Arbitrary channels at arbitrary
+# centres: one forward FFT of size nfft per block (overlap ov=nfft/2); per
+# channel, roll to baseband, multiply by the channel filter's freq response,
+# FOLD to nfft/decim and inverse-FFT (the small ifft is the integer
+# decimation), discard the ov/decim transient, then an ArbResampler lands it on
+# out_rate. Channels share the one FFT; each owns its filter + per-element
+# resamplers, so add/retune/remove never disturbs the others. The N-element
+# process keeps them phase-coherent for DF (W4).
+# ============================================================================
+
+class Osx:
+    def __init__(self, fs, nfft=4096, atten_db=80.0, max_nel=1):
+        self.fs = float(fs)
+        self.nfft = int(nfft)
+        if self.nfft & (self.nfft - 1):
+            raise ValueError("osx: nfft must be a power of two")
+        self.atten = float(atten_db)
+        self.max_nel = int(max_nel)
+        self.ov = self.nfft // 2
+        self.hop = self.nfft - self.ov
+        self.chans = []            # slot -> dict or None
+        self.reset()
+
+    def reset(self):
+        self.hist = [np.zeros(self.ov, np.complex128) for _ in range(self.max_nel)]
+        self.pending = [np.zeros(0, np.complex128) for _ in range(self.max_nel)]
+        for c in self.chans:
+            if c:
+                for rs in c["rs"]:
+                    if rs is not None:
+                        rs.reset()
+
+    def _pick_decim(self, bw, out_rate):
+        target = max(out_rate, 1.25 * bw)
+        decim = 1
+        while True:
+            nd = decim * 2
+            if self.fs / nd < target or self.ov % nd != 0 or self.nfft % nd != 0:
+                break
+            decim = nd
+        return decim
+
+    def add(self, offset_hz, bw, out_rate):
+        decim = self._pick_decim(bw, out_rate)
+        chan_rate = self.fs / decim
+        fp = 0.5 * bw
+        fstop = min(chan_rate - 0.5 * bw, 0.5 * self.fs)
+        h = design_lowpass(fp, fstop, self.atten, self.fs)
+        if len(h) > self.ov + 1:
+            h = h[: self.ov + 1]; h = h / np.sum(h)
+        H = np.fft.fft(h.astype(np.float64), self.nfft)
+        rs = []
+        for _ in range(self.max_nel):
+            rs.append(ArbResampler(chan_rate, out_rate, self.atten)
+                      if abs(chan_rate - out_rate) > 1e-6 * out_rate else None)
+        ch = dict(offset=float(offset_hz), bw=float(bw), out_rate=float(out_rate),
+                  decim=decim, chan_rate=chan_rate, H=H, ntaps=len(h))
+        ch["rs"] = rs
+        for i, c in enumerate(self.chans):
+            if c is None:
+                self.chans[i] = ch
+                return i
+        self.chans.append(ch)
+        return len(self.chans) - 1
+
+    def retune(self, ch, offset_hz):
+        if 0 <= ch < len(self.chans) and self.chans[ch]:
+            self.chans[ch]["offset"] = float(offset_hz)
+            return 0
+        return -1
+
+    def remove(self, ch):
+        if 0 <= ch < len(self.chans) and self.chans[ch]:
+            self.chans[ch] = None
+            return 0
+        return -1
+
+    def channels(self):
+        return len(self.chans)
+
+    def chan_rate(self, ch):
+        c = self.chans[ch] if 0 <= ch < len(self.chans) else None
+        return c["out_rate"] if c else 0.0
+
+    def _bin(self, offset):
+        return int(round(offset / self.fs * self.nfft))
+
+    def process_n(self, ins, nel):
+        nel = int(nel)
+        if nel < 1 or nel > self.max_nel:
+            raise ValueError("osx: nel")
+        xs = [np.asarray(ins[e], np.complex128).ravel() for e in range(nel)]
+        n = xs[0].size
+        for e in range(nel):
+            self.pending[e] = np.concatenate([self.pending[e], xs[e]])
+        nslots = len(self.chans)
+        raw = [[[] for _ in range(nel)] if c else None for c in self.chans]
+        while self.pending[0].size >= self.hop:
+            for e in range(nel):
+                block = np.concatenate([self.hist[e], self.pending[e][:self.hop]])
+                X = np.fft.fft(block)
+                for ci, c in enumerate(self.chans):
+                    if c is None:
+                        continue
+                    s = self._bin(c["offset"])
+                    Y = np.roll(X, -s) * c["H"]
+                    M = self.nfft // c["decim"]
+                    Yf = Y.reshape(c["decim"], M).sum(axis=0)
+                    ys = np.fft.ifft(Yf) / c["decim"]
+                    raw[ci][e].append(ys[self.ov // c["decim"]:])
+                self.hist[e] = block[self.hop:]
+                self.pending[e] = self.pending[e][self.hop:]
+        outs = [None] * nslots
+        counts = [0] * nslots
+        for ci, c in enumerate(self.chans):
+            if c is None:
+                continue
+            per_el = []
+            for e in range(nel):
+                d = np.concatenate(raw[ci][e]) if raw[ci][e] else np.zeros(0, np.complex128)
+                if c["rs"][e] is not None and d.size:
+                    d = c["rs"][e].process(d)
+                per_el.append(d)
+            m = min(len(a) for a in per_el) if per_el else 0
+            counts[ci] = m
+            outs[ci] = np.array([a[:m] for a in per_el], np.complex128) if m else \
+                       np.zeros((nel, 0), np.complex128)
+        return outs, counts
+
+    def process(self, x):
+        outs, counts = self.process_n([x], 1)
+        return [o[0] if o is not None else None for o in outs], counts

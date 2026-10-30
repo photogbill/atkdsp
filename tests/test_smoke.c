@@ -671,6 +671,34 @@ int main(void) {
         #undef URAND
     }
 
+    /* §28 the channelizer: a tone at a channel centre lands in that channel */
+    {
+        const unsigned nch = 64, K = 8;
+        const double fs = 2.4e6, sp = fs / (double)nch;
+        atkdsp_pfb *pf = atkdsp_pfb_create(fs, nch, 2, K, 80.0, 1);
+        const size_t nn = (size_t)nch * 60;
+        atkdsp_cf32 *px = (atkdsp_cf32 *)malloc(nn * sizeof *px);
+        for (size_t i = 0; i < nn; ++i) {
+            const double ph = 2.0 * ATK_SMOKE_PI * 10.0 * sp / fs * (double)i;   /* channel 10 */
+            px[i].re = (float)cos(ph); px[i].im = (float)sin(ph);
+        }
+        const size_t hop = nch / 2, m = nn / hop;
+        atkdsp_cf32 *po = (atkdsp_cf32 *)malloc((size_t)nch * m * sizeof *po);
+        ptrdiff_t got = pf ? atkdsp_pfb_process(pf, px, nn, po, (size_t)nch * m) : -1;
+        int best = -1; double bestp = -1.0;
+        for (unsigned k = 0; got > 0 && k < nch; ++k) {
+            double s = 0.0;
+            for (ptrdiff_t i = got / 4; i < got; ++i) {
+                const atkdsp_cf32 v = po[(size_t)k * got + i];
+                s += (double)v.re * v.re + (double)v.im * v.im;
+            }
+            if (s > bestp) { bestp = s; best = (int)k; }
+        }
+        CHECK(pf != NULL && got > 0 && best == 10,
+              "pfb: a tone at a channel centre lands in that channel");
+        atkdsp_pfb_destroy(pf); free(px); free(po);
+    }
+
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);
     printf("%d failure(s)\n", fails);
     return fails ? 1 : 0;

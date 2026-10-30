@@ -53,7 +53,7 @@ __all__ = [
 #: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
 #:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
 #:    window's bin correlation) and block_code_id's fixed_bits.
-ABI_VERSION = 19
+ABI_VERSION = 20
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -3595,6 +3595,33 @@ def _bind_dsss(lib) -> None:
 _BIND_EXTRA.append(_bind_dsss)
 
 
+def _bind_pfb(lib) -> None:
+    P = C.POINTER
+    vp, sz, u, d, i64 = C.c_void_p, C.c_size_t, C.c_uint, C.c_double, C.c_int64
+    pcf, ppcf = P(_Cf32), P(P(_Cf32))
+    lib.atkdsp_pfb_create.argtypes = [d, u, u, u, d, u]; lib.atkdsp_pfb_create.restype = vp
+    lib.atkdsp_pfb_destroy.argtypes = [vp]; lib.atkdsp_pfb_destroy.restype = None
+    lib.atkdsp_pfb_reset.argtypes = [vp]; lib.atkdsp_pfb_reset.restype = None
+    lib.atkdsp_pfb_nchan.argtypes = [vp]; lib.atkdsp_pfb_nchan.restype = u
+    lib.atkdsp_pfb_out_rate.argtypes = [vp]; lib.atkdsp_pfb_out_rate.restype = d
+    lib.atkdsp_pfb_out_hops.argtypes = [vp, sz]; lib.atkdsp_pfb_out_hops.restype = sz
+    lib.atkdsp_pfb_process.argtypes = [vp, pcf, sz, pcf, sz]; lib.atkdsp_pfb_process.restype = C.c_ssize_t
+    lib.atkdsp_pfb_process_n.argtypes = [vp, ppcf, u, sz, pcf, sz]; lib.atkdsp_pfb_process_n.restype = C.c_ssize_t
+    lib.atkdsp_pfb_block_origin.argtypes = [vp, i64]; lib.atkdsp_pfb_block_origin.restype = i64
+    lib.atkdsp_pfb_group_delay.argtypes = [vp]; lib.atkdsp_pfb_group_delay.restype = d
+    lib.atkdsp_pfb_set_cal.argtypes = [vp, pcf, u]; lib.atkdsp_pfb_set_cal.restype = C.c_int
+    lib.atkdsp_pfb_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_pfb_describe.restype = C.c_int
+    lib.atkdsp_pfb_cov_accumulate.argtypes = [pcf, u, u, sz, P(C.c_uint8), pcf, P(C.c_uint32)]
+    lib.atkdsp_pfb_cov_accumulate.restype = None
+    lib.atkdsp_pfb_cov_reset.argtypes = [pcf, P(C.c_uint32), u, u, P(C.c_uint8)]
+    lib.atkdsp_pfb_cov_reset.restype = None
+    lib.atkdsp_pfb_channel_power.argtypes = [pcf, u, u, sz, P(C.c_float), P(C.c_float)]
+    lib.atkdsp_pfb_channel_power.restype = None
+
+
+_BIND_EXTRA.append(_bind_pfb)
+
+
 def method(method_id: int):
     """(name, authors, year, country) or None — the twin of atkdsp_method()."""
     p = load().atkdsp_method(int(method_id))
@@ -4046,3 +4073,114 @@ __all__ += ["method", "gps_ca", "barker", "ieee802154_chips", "primitive_polys",
             "ACQ_NPDI", "ACQ_MBAPDI", "ACQ_DETECT", "TRK_LOCK", "TRK_VALID_CN0", "TRK_DISTORTED",
             "CSS_DETECT", "CSS_PREAMBLE", "XS_DETECT", "XS_TDOA", "ALIGN_FOUND", "LAT_AGREE_RC",
             "LAT_INTEGER_L", "LAT_FAMILY", "LAT_ONE_CLOCK", "LAT_CONSISTENT"]
+
+
+# -- §28 the channelizer ------------------------------------------------------
+class Pfb:
+    """Oversampled polyphase filterbank (atkdsp_pfb). nchan channels on a
+    uniform grid spaced fs/nchan, `oversample`x (output rate = oversample *
+    spacing). process_n runs N element streams on one block clock, the DF path.
+    Twin: atkdsp.reference.Pfb."""
+
+    def __init__(self, fs, nchan, oversample=2, taps_per_poly=12, atten_db=80.0, max_nel=1):
+        self._lib = load()
+        self._p = self._lib.atkdsp_pfb_create(float(fs), int(nchan), int(oversample),
+                                              int(taps_per_poly), float(atten_db), int(max_nel))
+        if not self._p:
+            raise AtkDspError("pfb_create: check fs>0, nchan>=2, nchan%%oversample==0")
+        self.nchan = int(nchan)
+        self.max_nel = int(max_nel)
+
+    def __del__(self):
+        p = getattr(self, "_p", None)
+        if p:
+            self._lib.atkdsp_pfb_destroy(p)
+            self._p = None
+
+    def reset(self):
+        self._lib.atkdsp_pfb_reset(self._p)
+
+    def out_rate(self):
+        return self._lib.atkdsp_pfb_out_rate(self._p)
+
+    def group_delay(self):
+        return self._lib.atkdsp_pfb_group_delay(self._p)
+
+    def block_origin(self, hop_index):
+        return int(self._lib.atkdsp_pfb_block_origin(self._p, int(hop_index)))
+
+    def set_cal(self, table, nel):
+        if table is None:
+            _check(self._lib.atkdsp_pfb_set_cal(self._p, None, 0), "pfb_set_cal")
+            return
+        t = np.ascontiguousarray(np.asarray(table, np.complex64)).reshape(int(nel), self.nchan)
+        _check(self._lib.atkdsp_pfb_set_cal(self._p, _cfp(t), int(nel)), "pfb_set_cal")
+
+    def describe(self):
+        buf = C.create_string_buffer(256)
+        n = self._lib.atkdsp_pfb_describe(self._p, buf, 256)
+        return buf.value.decode() if n > 0 else ""
+
+    def process_n(self, ins, nel):
+        nel = int(nel)
+        arrs = [np.ascontiguousarray(np.asarray(ins[e]).ravel(), np.complex64) for e in range(nel)]
+        n = arrs[0].size
+        for a in arrs:
+            if a.size != n:
+                raise AtkDspError("pfb: elements must be equal length")
+        m = self._lib.atkdsp_pfb_out_hops(self._p, n)
+        out = np.zeros(nel * self.nchan * m, np.complex64)
+        inarr = (C.POINTER(_Cf32) * nel)(*[_cfp(a) for a in arrs])
+        got = self._lib.atkdsp_pfb_process_n(self._p, inarr, nel, n, _cfp(out), out.size)
+        _check(got if got >= 0 else int(got), "pfb_process_n")
+        return out[: nel * self.nchan * got].reshape(nel, self.nchan, got)
+
+    def process(self, x):
+        return self.process_n([x], 1)[0]
+
+
+def pfb_cov_accumulate(out, nel, nchan, gate, R, counts):
+    """W1 (atkdsp_pfb_cov_accumulate): R[k] += sum_i y_k y_k^H over gated
+    channels; counts[k] += m. out is (nel,nchan,m) complex64; R is
+    (nchan,nel,nel) complex64; counts is (nchan,) uint32. R and counts are
+    updated in place (pass contiguous arrays). Twin: reference.pfb_cov_accumulate."""
+    lib = load()
+    o = np.ascontiguousarray(out, np.complex64)
+    nel = int(nel); nchan = int(nchan); m = o.shape[2] if o.ndim == 3 else 0
+    if not (R.flags["C_CONTIGUOUS"] and R.dtype == np.complex64):
+        raise AtkDspError("pfb_cov_accumulate: R must be contiguous complex64")
+    if not (counts.flags["C_CONTIGUOUS"] and counts.dtype == np.uint32):
+        raise AtkDspError("pfb_cov_accumulate: counts must be contiguous uint32")
+    gp = None
+    if gate is not None:
+        g = np.ascontiguousarray(gate, np.uint8)
+        gp = g.ctypes.data_as(C.POINTER(C.c_uint8))
+    lib.atkdsp_pfb_cov_accumulate(_cfp(o.reshape(-1)), nel, nchan, m, gp,
+                                  _cfp(R.reshape(-1)), counts.ctypes.data_as(C.POINTER(C.c_uint32)))
+
+
+def pfb_cov_reset(R, counts, nel, nchan, gate=None):
+    lib = load()
+    gp = None
+    if gate is not None:
+        g = np.ascontiguousarray(gate, np.uint8)
+        gp = g.ctypes.data_as(C.POINTER(C.c_uint8))
+    lib.atkdsp_pfb_cov_reset(_cfp(R.reshape(-1)), counts.ctypes.data_as(C.POINTER(C.c_uint32)),
+                             int(nel), int(nchan), gp)
+
+
+def pfb_channel_power(out, nel, nchan):
+    """W2 (atkdsp_pfb_channel_power): returns (pwr[nel,nchan], mean_pwr[nchan])
+    float32. Twin: reference.pfb_channel_power."""
+    lib = load()
+    o = np.ascontiguousarray(out, np.complex64)
+    nel = int(nel); nchan = int(nchan); m = o.shape[2] if o.ndim == 3 else 0
+    pwr = np.zeros(nel * nchan, np.float32)
+    meanp = np.zeros(nchan, np.float32)
+    lib.atkdsp_pfb_channel_power(_cfp(o.reshape(-1)), nel, nchan, m,
+                                 pwr.ctypes.data_as(C.POINTER(C.c_float)),
+                                 meanp.ctypes.data_as(C.POINTER(C.c_float)))
+    return pwr.reshape(nel, nchan), meanp
+
+
+__all__ += ["Pfb", "pfb_cov_accumulate", "pfb_cov_reset", "pfb_channel_power"]

@@ -11257,3 +11257,162 @@ def lattice(in_: dict) -> dict:
     if (out["flags"] & LAT_AGREE_RC) and (out["flags"] & LAT_INTEGER_L):
         out["flags"] |= LAT_CONSISTENT
     return out
+
+
+# ============================================================================
+# §28  THE CHANNELIZER  (v0.19.0, ABI 20)
+# Twin of src/channelizer.c. atkdsp.h §28; docs/ATKDSP_PLAN.md §A4 and
+# docs/CHANNELIZER_DF_REQUIREMENTS.md. Two kernels (PFB uniform grid, OSX
+# overlap-save extractor), each single- and multi-element, plus the W1
+# per-channel covariance and W2 power accumulators DF runs on the output.
+# ============================================================================
+
+def _kaiser_beta(atten_db):
+    A = float(atten_db)
+    if A > 50.0:   return 0.1102 * (A - 8.7)
+    if A >= 21.0:  return 0.5842 * (A - 21.0) ** 0.4 + 0.07886 * (A - 21.0)
+    return 0.0
+
+
+def pfb_prototype(nchan, taps_per_poly, atten_db):
+    """The PFB prototype lowpass: length nchan*taps_per_poly, cutoff half a
+    channel spacing, Kaiser window, unit DC gain, scaled by nchan so the
+    channel passband gain is ~1 after the length-nchan FFT. C computes this
+    identically (src/channelizer.c)."""
+    L = int(nchan) * int(taps_per_poly)
+    fc = 1.0 / (2.0 * nchan)
+    n = np.arange(L) - (L - 1) / 2.0
+    h = 2.0 * fc * np.sinc(2.0 * fc * n)
+    h = h * np.kaiser(L, _kaiser_beta(atten_db))
+    h = h / np.sum(h)
+    return (h * nchan).astype(np.float64)
+
+
+class Pfb:
+    """Twin of atkdsp_pfb: an oversampled polyphase filterbank. nchan channels
+    on a uniform grid spaced fs/nchan, `oversample`x (output rate =
+    oversample * spacing, hop = nchan/oversample), 2 by default. The per-block
+    bin rotation re-references each oversampled block's FFT to a common origin,
+    so a plane wave's inter-element phase survives to the channel output."""
+
+    def __init__(self, fs, nchan, oversample=2, taps_per_poly=12, atten_db=80.0, max_nel=1):
+        self.fs = float(fs)
+        self.nchan = int(nchan)
+        self.os = int(oversample)
+        self.K = int(taps_per_poly)
+        self.atten = float(atten_db)
+        self.max_nel = int(max_nel)
+        if not self.fs > 0 or self.nchan < 2 or self.nchan % self.os != 0:
+            raise ValueError("pfb: fs, nchan, oversample")
+        if self.K < 2 or self.max_nel < 1:
+            raise ValueError("pfb: taps_per_poly, max_nel")
+        self.h = pfb_prototype(self.nchan, self.K, self.atten)
+        self.L = len(self.h)
+        self.hop = self.nchan // self.os
+        self.ov = self.L - self.hop
+        self.spacing = self.fs / self.nchan
+        self.cal = None            # [nel][nchan] complex, or None
+        self.reset()
+
+    def reset(self):
+        # one history tail per element (ov samples), and one shared block clock
+        self.hist = [np.zeros(self.ov, np.complex128) for _ in range(self.max_nel)]
+        self.pending = [np.zeros(0, np.complex128) for _ in range(self.max_nel)]
+        self.b = 0                 # global hop index (drives the bin rotation)
+
+    def out_rate(self):
+        return self.os * self.spacing
+
+    def group_delay(self):
+        return (self.L - 1) / 2.0
+
+    def block_origin(self, hop_index):
+        # input-sample index of the first sample of this hop's window; the
+        # sample it is centred on = block_origin + group_delay
+        return int(hop_index) * self.hop - self.ov
+
+    def set_cal(self, table, nel):
+        if table is None:
+            self.cal = None
+            return 0
+        t = np.asarray(table, np.complex128).reshape(int(nel), self.nchan)
+        self.cal = t.copy()
+        return 0
+
+    def _rot(self, b):
+        k = np.arange(self.nchan)
+        return np.exp(2j * np.pi * k * ((b * self.hop) % self.nchan) / self.nchan)
+
+    def process_n(self, ins, nel):
+        """ins: list of nel complex arrays, sample-aligned, equal length.
+        Returns out[nel][nchan][m] as a numpy array (nel, nchan, m)."""
+        nel = int(nel)
+        if nel < 1 or nel > self.max_nel:
+            raise ValueError("pfb: nel")
+        xs = [np.asarray(ins[e], np.complex128).ravel() for e in range(nel)]
+        n = xs[0].size
+        for e in range(nel):
+            if xs[e].size != n:
+                raise ValueError("pfb: element length mismatch")
+            self.pending[e] = np.concatenate([self.pending[e], xs[e]])
+        blocks = [[] for _ in range(nel)]
+        while self.pending[0].size >= self.hop:
+            rot = self._rot(self.b)
+            for e in range(nel):
+                block = np.concatenate([self.hist[e], self.pending[e][:self.hop]])  # length L
+                seg = block * self.h
+                folded = seg.reshape(self.K, self.nchan).sum(axis=0)
+                X = np.fft.fft(folded) * rot
+                blocks[e].append(X)
+                self.hist[e] = block[self.hop:]            # slide by hop
+                self.pending[e] = self.pending[e][self.hop:]
+            self.b += 1
+        m = len(blocks[0])
+        out = np.zeros((nel, self.nchan, m), np.complex128)
+        for e in range(nel):
+            for i in range(m):
+                out[e, :, i] = blocks[e][i]
+        if self.cal is not None and m:
+            for e in range(min(nel, self.cal.shape[0])):
+                out[e, :, :] *= self.cal[e][:, None]
+        return out
+
+    def process(self, x):
+        """single element: returns out[nchan][m]."""
+        o = self.process_n([x], 1)
+        return o[0]
+
+
+def pfb_cov_accumulate(out, nel, nchan, gate, R, counts):
+    """W1: R[k] += sum_i y_k(i) y_k(i)^H over hops, for gated channels.
+    out is (nel, nchan, m); R is (nchan, nel, nel) complex; counts is (nchan,).
+    Same primitive as the §27 receiver-pair covariance (one Hermitian rank-1
+    accumulate); the eigh is the caller's."""
+    nel = int(nel); nchan = int(nchan)
+    m = out.shape[2] if out.ndim == 3 else 0
+    for k in range(nchan):
+        if gate is not None and not gate[k]:
+            continue
+        y = out[:nel, k, :]                      # (nel, m)
+        R[k] += y @ y.conj().T                   # Hermitian rank-m update
+        counts[k] += m
+
+
+def pfb_cov_reset(R, counts, nel, nchan, gate):
+    for k in range(int(nchan)):
+        if gate is not None and not gate[k]:
+            continue
+        R[k] = 0.0
+        counts[k] = 0
+
+
+def pfb_channel_power(out, nel, nchan):
+    """W2: returns (pwr[nel][nchan], mean_pwr[nchan]) — mean |y|^2 per element
+    per channel, and the across-element mean (the 5-look CFAR statistic)."""
+    nel = int(nel); nchan = int(nchan)
+    m = out.shape[2] if out.ndim == 3 else 0
+    if m == 0:
+        return np.zeros((nel, nchan), np.float32), np.zeros(nchan, np.float32)
+    pwr = (np.abs(out[:nel]) ** 2).mean(axis=2)          # (nel, nchan)
+    mean_pwr = pwr.mean(axis=0)                           # (nchan,)
+    return pwr.astype(np.float32), mean_pwr.astype(np.float32)

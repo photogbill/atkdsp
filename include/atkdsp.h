@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 19
-#define ATKDSP_VERSION_STRING "0.18.0"
+#define ATKDSP_ABI_VERSION 20
+#define ATKDSP_VERSION_STRING "0.19.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -121,6 +121,15 @@ extern "C" {
  * chirp probe (atkdsp_css_probe / atkdsp_css_demod), the receiver-pair
  * kernels (atkdsp_xspec, atkdsp_align), the consistency lattice, and the
  * method provenance table (atkdsp_method) every result carries. */
+/* 19 -> 20: the channelizer, part 1 (§28; docs/ATKDSP_PLAN.md §A4,
+ * docs/CHANNELIZER_DF_REQUIREMENTS.md) — the oversampled polyphase filterbank
+ * atkdsp_pfb: a uniform channel grid, 2x oversampled, N element streams on one
+ * block clock (atkdsp_pfb_process_n) so a plane wave's inter-element phase
+ * survives to the channel output (the DF path). With it the per-channel
+ * covariance (atkdsp_pfb_cov_accumulate, the same Hermitian primitive as §27)
+ * and power (atkdsp_pfb_channel_power) DF accumulates, sample bookkeeping
+ * (atkdsp_pfb_block_origin / _group_delay) and the per-window cal hook
+ * (atkdsp_pfb_set_cal). The overlap-save extractor (§28a) is a later ABI. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -3038,6 +3047,86 @@ typedef struct {
     int32_t  method;
 } atkdsp_lattice_out;         /* 72 bytes */
 ATKDSP_API int              atkdsp_lattice(const atkdsp_lattice_in *in, atkdsp_lattice_out *out);
+
+/* ==== THE CHANNELIZER (v0.19.0, ABI 20) ==================================
+ * docs/ATKDSP_PLAN.md §A4, and docs/CHANNELIZER_DF_REQUIREMENTS.md for the
+ * multi-element (DF) contract. The plan has two tools; this ABI ships the
+ * one DF is blocked on:
+ *
+ *   (b) the POLYPHASE FILTERBANK (§28b) — a uniform grid, every channel at
+ *       once, 2x oversampled so a signal on a channel edge is not lost. For
+ *       "DF everything", the watchlist, Bug Sniffer's cueing, occupancy.
+ *
+ * It runs N element streams on ONE block clock (the _process_n form), the
+ * required path for direction finding: the per-element phase reference is a
+ * function only of the parameters and the sample index, so a plane wave's
+ * inter-element phases survive to the channel output (the bearing). W1/W2 are
+ * the per-channel covariance and power DF accumulates on that output.
+ *
+ * Still to come (a later ABI): the OVERLAP-SAVE EXTRACTOR (§28a) — arbitrary
+ * channels at arbitrary centres, for operator targets and decoder-clocked
+ * bursts. Its algorithm is proven (reference prototype); it is not in this ABI.
+ *
+ * The twin is python/atkdsp/reference.py §28; the kernel is src/channelizer.c.
+ */
+
+/* ---- 28b. polyphase filterbank (the DF-everything grid) ---------------- */
+typedef struct atkdsp_pfb atkdsp_pfb;
+/* nchan channels, uniform spacing fs/nchan, oversample x (output rate =
+ * oversample * fs/nchan; nchan % oversample == 0). taps_per_poly sets the
+ * prototype length (nchan * taps_per_poly); atten_db its stopband. max_nel is
+ * the most element streams a _process_n call may carry (1 for the plain path,
+ * 5 for the Kraken, up to 32). */
+ATKDSP_API atkdsp_pfb *atkdsp_pfb_create(double fs, unsigned nchan, unsigned oversample,
+                                         unsigned taps_per_poly, double atten_db,
+                                         unsigned max_nel);
+ATKDSP_API void        atkdsp_pfb_destroy(atkdsp_pfb *p);
+ATKDSP_API void        atkdsp_pfb_reset(atkdsp_pfb *p);
+ATKDSP_API unsigned    atkdsp_pfb_nchan(const atkdsp_pfb *p);
+ATKDSP_API double      atkdsp_pfb_out_rate(const atkdsp_pfb *p);
+/* hops (output blocks per channel) produced for n input samples in the handle's
+ * current state — the m in the [..][m] layouts below. */
+ATKDSP_API size_t      atkdsp_pfb_out_hops(const atkdsp_pfb *p, size_t n);
+/* single element: out is [nchan][m], channel-major (channel k hop i at k*m+i).
+ * Returns m (>=0), or ATKDSP_E_CAP if cap < nchan*m. */
+ATKDSP_API ptrdiff_t   atkdsp_pfb_process(atkdsp_pfb *p, const atkdsp_cf32 *in, size_t n,
+                                          atkdsp_cf32 *out, size_t cap);
+/* N elements, ONE block clock: ins[el] each n samples, sample-aligned; out is
+ * [nel][nchan][m] (element el, channel k, hop i at (el*nchan + k)*m + i).
+ * Returns m, or ATKDSP_E_CAP if cap < nel*nchan*m. nel <= max_nel. */
+ATKDSP_API ptrdiff_t   atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins,
+                                            unsigned nel, size_t n,
+                                            atkdsp_cf32 *out, size_t cap);
+/* R3 sample bookkeeping: the input sample output hop `hop_index` is centred on,
+ * and the prototype group delay in input samples. */
+ATKDSP_API int64_t     atkdsp_pfb_block_origin(const atkdsp_pfb *p, int64_t hop_index);
+ATKDSP_API double      atkdsp_pfb_group_delay(const atkdsp_pfb *p);
+/* R5 per-window cal: one complex factor per element per channel, [nel][nchan]
+ * (element el, channel k at el*nchan + k), applied once on the channel output.
+ * NULL clears it. nel must equal the nel used in process_n. */
+ATKDSP_API int         atkdsp_pfb_set_cal(atkdsp_pfb *p, const atkdsp_cf32 *table, unsigned nel);
+ATKDSP_API int         atkdsp_pfb_describe(const atkdsp_pfb *p, char *buf, size_t cap);
+
+/* W1. Per-channel covariance accumulate over a process_n output block.
+ * R[k] += sum over hops of y_k y_k^H for every channel k with gate[k] set
+ * (all channels when gate == NULL); counts[k] += m. out is the [nel][nchan][m]
+ * from atkdsp_pfb_process_n. R is [nchan][nel][nel] (channel k's Hermitian
+ * matrix at k*nel*nel, row-major, full matrix written). Same primitive as the
+ * §27 receiver-pair covariance — one Hermitian rank-1 accumulate; the eigh is
+ * the caller's (atkdf). Call atkdsp_pfb_cov_reset to zero a channel at burst
+ * OPEN. */
+ATKDSP_API void        atkdsp_pfb_cov_accumulate(const atkdsp_cf32 *out, unsigned nel,
+                                                 unsigned nchan, size_t m,
+                                                 const uint8_t *gate,
+                                                 atkdsp_cf32 *R, uint32_t *counts);
+ATKDSP_API void        atkdsp_pfb_cov_reset(atkdsp_cf32 *R, uint32_t *counts, unsigned nel,
+                                            unsigned nchan, const uint8_t *gate);
+/* W2. Per-channel per-element mean power over the block: pwr is [nel][nchan]
+ * (mean |y|^2, element el channel k at el*nchan + k), may be NULL. mean_pwr is
+ * [nchan], the across-element mean (the 5-look CFAR statistic), may be NULL. */
+ATKDSP_API void        atkdsp_pfb_channel_power(const atkdsp_cf32 *out, unsigned nel,
+                                                unsigned nchan, size_t m,
+                                                float *pwr, float *mean_pwr);
 
 #ifdef __cplusplus
 }

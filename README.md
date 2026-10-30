@@ -38,7 +38,8 @@ include/atkdsp.h        THE ABI. Read its header comment first.
 src/                    C99 kernels, one file per group (convert, nco, fir,
                         resample, fft, demod, display, detect, ddc, lte*,
                         fsk, dmr_sync, the bitstream files, cfar, burst,
-                        ring, pulses, cyclic, tone_id, dsss_*, css, xspec)
+                        ring, pulses, cyclic, tone_id, dsss_*, css, xspec,
+                        channelizer)
 vendor/pocketfft/       Martin Reinecke's pocketfft (C, BSD-3) — the only
                         third-party code, used through src/fft.c and, for
                         the burst word's spectra, src/burst.c
@@ -50,6 +51,8 @@ tests/test_detection.py    CFAR, the burst word, the ring (v0.16.0)
 tests/test_phase3.py       pulse runs, the cyclic probes, the analog IDs (v0.17.0)
 tests/test_phase6.py       spread spectrum: the blind + known-code paths, LoRa,
                            the receiver pair and the lattice (v0.18.0)
+tests/test_channelizer.py  the polyphase filterbank, its coherent N-element
+                           form, and the W1/W2 accumulators (v0.19.0)
 tests/test_ring_stress.c   the ring under threads; ring_bench.bat runs it
                         as Bill's 40 MSPS bench
 bench/                  the measurement above
@@ -91,7 +94,52 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.18.0 (ABI 19)
+## What is in v0.19.0 (ABI 20)
+
+**The channelizer, part 1 — the DF-everything grid** of `docs/ATKDSP_PLAN.md`
+§A4, built to the direction-finding contract in
+`docs/CHANNELIZER_DF_REQUIREMENTS.md`. Header §28, twin in `reference.py` §28,
+16 tests in `tests/test_channelizer.py`, a smoke line. Built and checked here
+on Linux (and under ASan + UBSan); the Windows run is
+`build.bat /only atkdsp /test` from ATK.
+
+This is the kernel ATK's DF engine (`atkdf`) is blocked on: it splits the
+KrakenSDR's (or any array's) coherent element streams into channels so DF can
+run on every active channel at once — "DF everything" — without a per-hop
+retune. The overlap-save extractor (§A4's other tool, for operator-chosen and
+decoder-clocked targets) is a later ABI; its algorithm is proven.
+
+| | what | how |
+|---|---|---|
+| **the grid** | `atkdsp_pfb` | an oversampled polyphase filterbank: `nchan` channels on a uniform grid spaced `fs/nchan`, 2× oversampled so a signal on a channel edge appears in both neighbours and is never lost (R4). One Kaiser-windowed-sinc prototype, folded and FFT'd per hop, with a per-block bin rotation that re-references each oversampled block to a common time origin |
+| **coherent, N elements** | `atkdsp_pfb_process_n` | N element streams on **one** block clock, one FFT plan, one prototype, one block counter (R1). The per-element phase reference is a function only of the parameters and the sample index (R2), so a plane wave's inter-element phases — the bearing — survive to the channel output. Sample bookkeeping (`_block_origin`/`_group_delay`, R3) and a per-window cal hook (`_set_cal`, R5) |
+| **W1 covariance** | `atkdsp_pfb_cov_accumulate` | the per-channel 5×5 (up to N×N) Hermitian covariance DF integrates over a burst — the **same primitive** as the §27 receiver-pair covariance, one Hermitian rank-1 accumulate; the eigendecomposition stays the caller's (`atkdf`). A gate and reset so one burst integrates into one estimate |
+| **W2 power** | `atkdsp_pfb_channel_power` | per-channel per-element mean power, and the across-element mean — the 5-look statistic the channel-grid CFAR runs on |
+
+Measured (Linux, gcc; `tests/test_channelizer.py`):
+
+| check | result |
+|---|---|
+| the filterbank, a tone at a channel centre | lands in that channel only, neighbours **93 dB** down (R4 ≥ 80) |
+| a tone on a channel edge | appears in both neighbours at the crossover, far channels −113 dB — edge-safe, not lost |
+| C against the twin, uneven blocks (1 … 65537 samples) | C == twin to **4.7e-8** relative (float32) |
+| streaming chunk invariance | the channel streams are **bit-identical** however the input is split |
+| a planted plane wave, 5 elements | inter-element phase preserved to **8.7e-6°** (R7 ≤ 0.1°) |
+| identical input on all elements | outputs **bit-identical across elements** (R7) |
+| W1 covariance, W2 power | C == twin to 3.6e-6 / 1.1e-7; R is Hermitian; the gate and reset touch only gated channels |
+| sanitizers | `tests/test_channelizer.py` clean under ASan + UBSan |
+
+**Honest limits.** Simulation, measured in our harness against planted truth,
+not hardware. This release is the **PFB only**: the overlap-save extractor
+(arbitrary off-grid channels) is a later ABI — its algorithm is proven in the
+reference prototype but not yet in C. W3 (the burst tracker running on the
+channel-grid powers, turning the gate on and off per channel) is wiring on the
+`atkdf` side over W2 + the existing CFAR, not a new kernel here. The band-edge
+guard channels (R4) are the caller's to mark from the prototype rolloff. The
+per-window cal is a channel-*centre* factor; it leaves ≤ 0.4° at the channel
+edges by construction (R7), which is the channelizer's residual, not the cal's.
+
+## What was in v0.18.0 (ABI 19)
 
 **Phase 6a — spread spectrum** of `docs/ATKDSP_PLAN.md` (§B6, §B6b, §B6c),
 and the part of the Undertow idea (§B6c) that does not wait for the

@@ -495,6 +495,21 @@ shows RAM.
 
 > **DF requirements (2026-10-29):** before building, read `docs/CHANNELIZER_DF_REQUIREMENTS.md` — the multi-element (N coherent streams, one block clock) form, sample-index bookkeeping, the per-channel covariance accumulator and channel-grid powers that make this kernel the KrakenSDR "DF everything" engine. Nothing there changes the ABI below; it adds `_process_n` forms and three small outputs. The receiver-pair covariance/eigh of §B6c and the channelizer's W1 are the **same primitive** — one Hermitian rank-1 accumulate plus one `eigh` — not one API: xspec keeps the frequency axis, W1 collapses it.
 
+> **Part 1 BUILT (2026-10-29)** — atkdsp v0.19.0 / ABI 20, tool (b) the PFB.
+> The uniform 2× oversampled filterbank, its multi-element coherent form
+> (`atkdsp_pfb_process_n`, R1–R3), the per-window cal hook (R5), and the W1
+> covariance + W2 power accumulators DF runs on the output. Header §28, twin in
+> `reference.py` §28, `src/channelizer.c`, 16 tests in `tests/test_channelizer.py`,
+> a smoke line; whole suite (1014) + smoke pass on Linux, also under ASan + UBSan.
+> Verified against the DF contract: C == twin 4.7e-8; centre-channel rejection
+> 93 dB; **inter-element phase 8.7e-6°** (R7 ≤ 0.1°); elements bit-identical on
+> identical input; chunk invariance exact. ATK's `dsp_native.py` needs ABI 20.
+> **Not in this release:** tool (a) the overlap-save extractor (its algorithm is
+> proven in the reference prototype — `osx_proto.py` — but not yet in C; a later
+> ABI), the band-edge guard marking (caller-side, R4), and W3 (the channel-grid
+> CFAR gate, wiring on the `atkdf` side over W2 + the existing CFAR). The Windows
+> run is owed (`build.bat /only atkdsp /test`).
+
 Two tools, because there are two jobs.
 
 **(a) Overlap-save extractor — arbitrary channels from ONE forward FFT per
@@ -2348,6 +2363,7 @@ checked first).
 | 3 | **Small, high value:** C3 analog IDs, B4 cyclic probes, B3 pulse runs **(BUILT 2026-10-29 — v0.17.0 / ABI 18, with the CFAR ρ² table and the fixed-bits fix; MDC-1200 / FleetSync are 3b)** | M | ID-tagged analog bearings, waterfall captions, live PDWs |
 | 3b | **C3's data bursts:** MDC-1200, FleetSync I/II | S–M | Reverse-engineered framing: real recordings before trust |
 | 4 | **Engine:** A1 float32 FFT, A2 fused mixer, A4 channelizer | L | Before the wider SDRs (B210, Signal Hound); the channelizer feeds C3 on many channels at once |
+| A4a ✅ v0.19.0 | **Channelizer part 1:** the PFB (uniform grid, coherent N-element `_process_n`), W1 covariance, W2 power — the DF-everything core (BUILT 2026-10-29) | M | `atkdf` is blocked on it; overlap-save extractor (A4b) is a later ABI |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
 | 6a ✅ v0.18.0 | **Spread spectrum:** B6 blind + known-code paths, B6b LoRa, B6c's receiver pair / align / lattice (BUILT 2026-10-29) | L | Uses B4, D2; the survey + catalogue of B6c wait for A4 and B5 |
 | 6 | **Below the floor (rest):** B6c's scale-space survey and catalogue, C4 strong-signal removal, MDC/FleetSync (3b), the learned fuser | M–L | After A4 (the channelizer) and B5 (the baseline) |

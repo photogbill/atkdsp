@@ -53,7 +53,7 @@ __all__ = [
 #: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
 #:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
 #:    window's bin correlation) and block_code_id's fixed_bits.
-ABI_VERSION = 18
+ABI_VERSION = 19
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -3383,3 +3383,666 @@ __all__ += ["TONE_CTCSS", "TONE_DCS", "TONE_DTMF", "TONE_TONE", "TONE_START", "T
             "TONE_F_REVERSE_BURST", "TONE_F_TURNOFF", "TONE_F_NONSTANDARD", "TONE_F_CORRECTED",
             "TONE_F_FLUSHED", "TONE_EN_CTCSS", "TONE_EN_DCS", "TONE_EN_DTMF", "TONE_EN_TONE",
             "TONE_EN_ALL", "TONE_KINDS", "dcs_encode", "dcs_decode", "ToneId"]
+
+
+# ============================================================================
+# §25-27 spread spectrum bindings (src/dsss_det.c, dsss_code.c, dsss_acq.c,
+# css.c, xspec.c, dsss_codes.c). Twins: reference.py §25-27.
+# ============================================================================
+def _struct_dict(s):
+    """A ctypes result struct -> dict with the twin's keys; int arrays -> lists."""
+    out = {}
+    for n, t in s._fields_:
+        v = getattr(s, n)
+        if isinstance(v, C.Array):
+            out[n] = [int(x) for x in v]
+        elif t in (C.c_int32, C.c_uint32, C.c_int, C.c_uint64, C.c_int64):
+            out[n] = int(v)
+        elif isinstance(v, bytes):
+            out[n] = v.decode(errors="replace")
+        else:
+            out[n] = float(v)
+    return out
+
+
+class _MethodInfo(C.Structure):
+    _fields_ = [("name", C.c_char_p), ("authors", C.c_char_p), ("year", C.c_char_p),
+                ("venue", C.c_char_p), ("country", C.c_char_p)]
+
+
+class _DsssDetCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("win", C.c_int32), ("max_lag", C.c_int32),
+                ("nwin_min", C.c_int32), ("handles", C.c_int32), ("pfa", C.c_double),
+                ("cav_lags", C.c_int32), ("min_peaks", C.c_int32), ("period_min", C.c_int32),
+                ("reserved", C.c_int32 * 4)]
+
+
+class _DsssDetResult(C.Structure):
+    _fields_ = [("period", C.c_double), ("period_s", C.c_double), ("peak_z", C.c_double),
+                ("peak_ratio", C.c_double), ("floor_mean", C.c_double), ("floor_std", C.c_double),
+                ("fluct_log10_pfa", C.c_double), ("cav_t", C.c_double), ("cav_thr", C.c_double),
+                ("cav_log10_pfa", C.c_double), ("tc_acf", C.c_double), ("ps_acf", C.c_double),
+                ("llr", C.c_double), ("npeaks", C.c_int32), ("nwin", C.c_int32),
+                ("best_lag", C.c_int32), ("flags", C.c_uint32), ("method", C.c_int32 * 4)]
+
+
+class _DsssCounters(C.Structure):
+    _fields_ = [(n, C.c_uint64) for n in ("samples", "windows", "resets", "window_fill")]
+
+
+class _ScanLine(C.Structure):
+    _fields_ = [("freq_hz", C.c_double), ("level", C.c_double), ("coherence", C.c_double),
+                ("level_thr", C.c_double), ("coh_thr", C.c_double), ("log10_pfa", C.c_double),
+                ("bin", C.c_int32), ("flags", C.c_uint32)]
+
+
+class _DsssCodeCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("rc", C.c_double), ("period_s", C.c_double),
+                ("chip_mod", C.c_int32), ("vote_passes", C.c_int32), ("poly_max_degree", C.c_int32),
+                ("no_cfo", C.c_int32), ("pfa", C.c_double), ("reserved", C.c_int32 * 2)]
+
+
+class _DsssCodeResult(C.Structure):
+    _fields_ = [("L", C.c_int32), ("nperiods", C.c_int32), ("periods_needed", C.c_int32),
+                ("start", C.c_int32), ("cfo_hz", C.c_double), ("lambda1", C.c_double),
+                ("lambda2", C.c_double), ("noise_var", C.c_double), ("ident_margin", C.c_double),
+                ("snr_db", C.c_double), ("vote_min", C.c_double), ("vote_mean", C.c_double),
+                ("poly_method", C.c_int32), ("poly_degree", C.c_int32), ("poly", C.c_uint64),
+                ("poly_z", C.c_double), ("lc", C.c_int32), ("lc_plateau", C.c_int32),
+                ("flags", C.c_uint32), ("method", C.c_int32 * 8), ("name", C.c_char * 48)]
+
+
+class _DsssAcqCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("rc", C.c_double), ("L", C.c_int32), ("ncoh", C.c_int32),
+                ("nnoncoh", C.c_int32), ("combiner", C.c_int32), ("dop_lo", C.c_double),
+                ("dop_hi", C.c_double), ("dop_step", C.c_double), ("pfa", C.c_double),
+                ("reserved", C.c_int32 * 2)]
+
+
+class _DsssAcq(C.Structure):
+    _fields_ = [("code_phase", C.c_double), ("doppler_hz", C.c_double), ("gamma", C.c_double),
+                ("gamma_thr", C.c_double), ("log10_pfa", C.c_double), ("peak_ratio", C.c_double),
+                ("cn0_dbhz", C.c_double), ("ncells", C.c_int32), ("ndop", C.c_int32),
+                ("flags", C.c_uint32), ("method", C.c_int32 * 4)]
+
+
+class _DsssTrkCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("rc", C.c_double), ("L", C.c_int32), ("reserved0", C.c_int32),
+                ("code_phase", C.c_double), ("doppler_hz", C.c_double), ("dll_bw_hz", C.c_double),
+                ("pll_bw_hz", C.c_double), ("spacing", C.c_double), ("quality_spacing", C.c_double),
+                ("cn0_periods", C.c_int32), ("reserved1", C.c_int32), ("power_window_s", C.c_double),
+                ("distortion_pfa", C.c_double), ("power_high_db", C.c_double),
+                ("reserved", C.c_int32 * 2)]
+
+
+class _DsssTrkState(C.Structure):
+    _fields_ = [("code_phase", C.c_double), ("doppler_hz", C.c_double), ("cn0_m2m4", C.c_double),
+                ("cn0_nwpr", C.c_double), ("distortion", C.c_double), ("distortion_log10_pfa", C.c_double),
+                ("power_db", C.c_double), ("power_start_db", C.c_double), ("lock", C.c_double),
+                ("periods", C.c_uint64), ("flags", C.c_uint32), ("method", C.c_int32 * 4)]
+
+
+class _CssCand(C.Structure):
+    _fields_ = [("sf", C.c_int32), ("reserved", C.c_int32), ("bw_hz", C.c_double)]
+
+
+class _CssResult(C.Structure):
+    _fields_ = [("level", C.c_double), ("level_thr", C.c_double), ("offset_hz", C.c_double),
+                ("bin", C.c_int32), ("run", C.c_int32), ("nwin", C.c_int32), ("flags", C.c_uint32)]
+
+
+class _XspecResult(C.Structure):
+    _fields_ = [("max_coh", C.c_double), ("coh_thr", C.c_double), ("log10_pfa", C.c_double),
+                ("max_bin", C.c_int32), ("band_lo", C.c_int32), ("band_hi", C.c_int32),
+                ("band_bins", C.c_int32), ("band_coh_mean", C.c_double), ("tdoa_s", C.c_double),
+                ("tdoa_err_s", C.c_double), ("phase0", C.c_double), ("slope_resid", C.c_double),
+                ("navg", C.c_int32), ("flags", C.c_uint32), ("method", C.c_int32 * 2)]
+
+
+class _Align(C.Structure):
+    _fields_ = [("lag", C.c_double), ("lag_err", C.c_double), ("rate_ppm", C.c_double),
+                ("lo_offset_hz", C.c_double), ("peak_ratio", C.c_double), ("snr_db", C.c_double),
+                ("nblocks", C.c_int32), ("flags", C.c_uint32), ("method", C.c_int32 * 2)]
+
+
+class _LatticeIn(C.Structure):
+    _fields_ = [("rc_acf_hz", C.c_double), ("rc_line_hz", C.c_double), ("rc_nominal_hz", C.c_double),
+                ("period_s", C.c_double), ("fc_hz", C.c_double), ("cfo_hz", C.c_double),
+                ("rc_tol", C.c_double), ("ppm_tol", C.c_double), ("rx_ppm", C.c_double)]
+
+
+class _LatticeOut(C.Structure):
+    _fields_ = [("rc_hz", C.c_double), ("rc_spread", C.c_double), ("L", C.c_double),
+                ("L_frac", C.c_double), ("ppm_carrier", C.c_double), ("ppm_chip", C.c_double),
+                ("ppm_diff", C.c_double), ("L_int", C.c_int32), ("family", C.c_int32),
+                ("flags", C.c_uint32), ("method", C.c_int32)]
+
+
+def _bind_dsss(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d, pd = C.c_void_p, C.c_size_t, C.c_int, C.c_double, C.POINTER(C.c_double)
+    i8, u16, pt = C.POINTER(C.c_int8), C.POINTER(C.c_uint16), C.c_long
+    lib.atkdsp_method.argtypes = [i]; lib.atkdsp_method.restype = P(_MethodInfo)
+    # detector
+    lib.atkdsp_dsss_det_defaults.argtypes = [P(_DsssDetCfg), d, i, i]; lib.atkdsp_dsss_det_defaults.restype = None
+    lib.atkdsp_dsss_det_create.argtypes = [P(_DsssDetCfg)]; lib.atkdsp_dsss_det_create.restype = vp
+    lib.atkdsp_dsss_det_destroy.argtypes = [vp]; lib.atkdsp_dsss_det_destroy.restype = None
+    lib.atkdsp_dsss_det_reset.argtypes = [vp]; lib.atkdsp_dsss_det_reset.restype = None
+    lib.atkdsp_dsss_det_process.argtypes = [vp, P(_Cf32), sz]; lib.atkdsp_dsss_det_process.restype = i
+    lib.atkdsp_dsss_det_read.argtypes = [vp, P(_DsssDetResult)]; lib.atkdsp_dsss_det_read.restype = i
+    lib.atkdsp_dsss_det_rho.argtypes = [vp, pd, sz]; lib.atkdsp_dsss_det_rho.restype = pt
+    lib.atkdsp_dsss_det_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_dsss_det_describe.restype = i
+    lib.atkdsp_dsss_det_stats.argtypes = [vp, P(_DsssCounters)]; lib.atkdsp_dsss_det_stats.restype = i
+    lib.atkdsp_cav_threshold.argtypes = [i, d, d]; lib.atkdsp_cav_threshold.restype = d
+    # scan
+    lib.atkdsp_cyclic_scan_create.argtypes = [d, i, i, i, i, d, d, d]; lib.atkdsp_cyclic_scan_create.restype = vp
+    lib.atkdsp_cyclic_scan_destroy.argtypes = [vp]; lib.atkdsp_cyclic_scan_destroy.restype = None
+    lib.atkdsp_cyclic_scan_reset.argtypes = [vp]; lib.atkdsp_cyclic_scan_reset.restype = None
+    lib.atkdsp_cyclic_scan_process.argtypes = [vp, P(_Cf32), sz]; lib.atkdsp_cyclic_scan_process.restype = i
+    lib.atkdsp_cyclic_scan_read.argtypes = [vp, P(_ScanLine), sz]; lib.atkdsp_cyclic_scan_read.restype = pt
+    lib.atkdsp_cyclic_scan_level.argtypes = [vp, P(C.c_float), sz]; lib.atkdsp_cyclic_scan_level.restype = pt
+    lib.atkdsp_cyclic_scan_nbins.argtypes = [vp]; lib.atkdsp_cyclic_scan_nbins.restype = i
+    lib.atkdsp_cyclic_scan_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_cyclic_scan_describe.restype = i
+    lib.atkdsp_cyclic_scan_stats.argtypes = [vp, P(_CyclicCounters)]; lib.atkdsp_cyclic_scan_stats.restype = i
+    # code + codes
+    lib.atkdsp_dsss_code_defaults.argtypes = [P(_DsssCodeCfg), d, d, d]; lib.atkdsp_dsss_code_defaults.restype = None
+    lib.atkdsp_dsss_code.argtypes = [P(_Cf32), sz, P(_DsssCodeCfg), i8, sz, P(_DsssCodeResult)]
+    lib.atkdsp_dsss_code.restype = pt
+    lib.atkdsp_parity_z.argtypes = [i8, i, C.c_uint64, i]; lib.atkdsp_parity_z.restype = d
+    lib.atkdsp_primitive_polys.argtypes = [i, P(C.c_uint64), sz]; lib.atkdsp_primitive_polys.restype = pt
+    lib.atkdsp_gps_ca.argtypes = [i, i8, sz]; lib.atkdsp_gps_ca.restype = pt
+    lib.atkdsp_barker.argtypes = [i, i8, sz]; lib.atkdsp_barker.restype = pt
+    lib.atkdsp_ieee802154_chips.argtypes = [i, i8, sz]; lib.atkdsp_ieee802154_chips.restype = pt
+    # acquire / track
+    lib.atkdsp_acq_threshold.argtypes = [i, d, d]; lib.atkdsp_acq_threshold.restype = d
+    lib.atkdsp_dsss_acq_defaults.argtypes = [P(_DsssAcqCfg), d, d, i]; lib.atkdsp_dsss_acq_defaults.restype = None
+    lib.atkdsp_dsss_acquire.argtypes = [P(_Cf32), sz, i8, P(_DsssAcqCfg), P(_DsssAcq)]
+    lib.atkdsp_dsss_acquire.restype = i
+    lib.atkdsp_dsss_trk_defaults.argtypes = [P(_DsssTrkCfg), d, d, i, d, d]; lib.atkdsp_dsss_trk_defaults.restype = None
+    lib.atkdsp_dsss_trk_create.argtypes = [i8, P(_DsssTrkCfg)]; lib.atkdsp_dsss_trk_create.restype = vp
+    lib.atkdsp_dsss_trk_destroy.argtypes = [vp]; lib.atkdsp_dsss_trk_destroy.restype = None
+    lib.atkdsp_dsss_trk_process.argtypes = [vp, P(_Cf32), sz, P(_Cf32), sz]; lib.atkdsp_dsss_trk_process.restype = pt
+    lib.atkdsp_dsss_trk_read.argtypes = [vp, P(_DsssTrkState)]; lib.atkdsp_dsss_trk_read.restype = i
+    lib.atkdsp_dsss_trk_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_dsss_trk_describe.restype = i
+    lib.atkdsp_dsss_trk_stats.argtypes = [vp, P(_DsssCounters)]; lib.atkdsp_dsss_trk_stats.restype = i
+    # css
+    lib.atkdsp_css_probe_create.argtypes = [d, P(_CssCand), i, i, d]; lib.atkdsp_css_probe_create.restype = vp
+    lib.atkdsp_css_probe_destroy.argtypes = [vp]; lib.atkdsp_css_probe_destroy.restype = None
+    lib.atkdsp_css_probe_reset.argtypes = [vp]; lib.atkdsp_css_probe_reset.restype = None
+    lib.atkdsp_css_probe_process.argtypes = [vp, P(_Cf32), sz]; lib.atkdsp_css_probe_process.restype = i
+    lib.atkdsp_css_probe_read.argtypes = [vp, P(_CssResult)]; lib.atkdsp_css_probe_read.restype = i
+    lib.atkdsp_css_probe_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_css_probe_describe.restype = i
+    lib.atkdsp_css_probe_stats.argtypes = [vp, P(_CyclicCounters)]; lib.atkdsp_css_probe_stats.restype = i
+    lib.atkdsp_css_demod.argtypes = [P(_Cf32), sz, d, i, d, d, d, u16, sz]; lib.atkdsp_css_demod.restype = pt
+    # xspec / align / lattice
+    lib.atkdsp_msc_threshold.argtypes = [i, d, d]; lib.atkdsp_msc_threshold.restype = d
+    lib.atkdsp_xspec_create.argtypes = [d, i, i, d]; lib.atkdsp_xspec_create.restype = vp
+    lib.atkdsp_xspec_destroy.argtypes = [vp]; lib.atkdsp_xspec_destroy.restype = None
+    lib.atkdsp_xspec_reset.argtypes = [vp]; lib.atkdsp_xspec_reset.restype = None
+    lib.atkdsp_xspec_process.argtypes = [vp, P(_Cf32), P(_Cf32), sz]; lib.atkdsp_xspec_process.restype = i
+    lib.atkdsp_xspec_baseline.argtypes = [vp, P(_Cf32), P(_Cf32), sz]; lib.atkdsp_xspec_baseline.restype = i
+    lib.atkdsp_xspec_read.argtypes = [vp, P(_XspecResult)]; lib.atkdsp_xspec_read.restype = i
+    lib.atkdsp_xspec_bins.argtypes = [vp, P(C.c_float), P(C.c_float)]; lib.atkdsp_xspec_bins.restype = i
+    lib.atkdsp_xspec_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_xspec_describe.restype = i
+    lib.atkdsp_xspec_stats.argtypes = [vp, P(_CyclicCounters)]; lib.atkdsp_xspec_stats.restype = i
+    lib.atkdsp_align_estimate.argtypes = [P(_Cf32), P(_Cf32), sz, d, i, i, P(_Align), P(C.c_float), sz]
+    lib.atkdsp_align_estimate.restype = i
+    lib.atkdsp_align_apply.argtypes = [P(_Cf32), sz, d, P(_Align), P(C.c_float), i, P(_Cf32)]
+    lib.atkdsp_align_apply.restype = i
+    lib.atkdsp_lattice.argtypes = [P(_LatticeIn), P(_LatticeOut)]; lib.atkdsp_lattice.restype = i
+
+
+_BIND_EXTRA.append(_bind_dsss)
+
+
+def method(method_id: int):
+    """(name, authors, year, country) or None — the twin of atkdsp_method()."""
+    p = load().atkdsp_method(int(method_id))
+    if not p:
+        return None
+    m = p.contents
+    return (m.name.decode(), m.authors.decode(), m.year.decode(), m.country.decode())
+
+
+DSSS_H_FLUCT, DSSS_H_CAV, DSSS_H_ACF = 1, 2, 4
+DSSS_FLUCT, DSSS_CAV, DSSS_PERIOD, DSSS_WARMUP, DSSS_ACF, DSSS_DETECT = 1, 2, 4, 8, 16, 32
+SCAN_LINE, SCAN_HARMONIC, SCAN_WARMUP = 1, 2, 4
+CHIP_BPSK, CHIP_QPSK, CHIP_OQPSK = 0, 1, 2
+CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED = 1, 2, 4, 8, 16, 32
+POLY_NONE, POLY_BM, POLY_PARITY = 0, 1, 2
+ACQ_NPDI, ACQ_MBAPDI, ACQ_DETECT = 0, 1, 1
+TRK_LOCK, TRK_VALID_CN0, TRK_DISTORTED, TRK_POWER_HIGH = 1, 2, 4, 8
+CSS_DETECT, CSS_PREAMBLE, CSS_WARMUP = 1, 2, 4
+XS_DETECT, XS_WARMUP, XS_TDOA = 1, 2, 4
+ALIGN_FOUND = 1
+LAT_AGREE_RC, LAT_INTEGER_L, LAT_FAMILY, LAT_ONE_CLOCK, LAT_CONSISTENT = 1, 2, 4, 8, 16
+
+
+def _i8(code):
+    a = np.ascontiguousarray(code, np.int8)
+    return a.ctypes.data_as(C.POINTER(C.c_int8)), a
+
+
+def gps_ca(prn: int) -> np.ndarray:
+    buf = (C.c_int8 * 1023)()
+    _check(load().atkdsp_gps_ca(int(prn), buf, 1023), "gps_ca")
+    return np.ctypeslib.as_array(buf).copy()
+
+
+def barker(length: int) -> np.ndarray:
+    buf = (C.c_int8 * 13)()
+    n = _check(load().atkdsp_barker(int(length), buf, 13), "barker")
+    return np.ctypeslib.as_array(buf)[:n].copy()
+
+
+def ieee802154_chips(symbol: int) -> np.ndarray:
+    buf = (C.c_int8 * 32)()
+    _check(load().atkdsp_ieee802154_chips(int(symbol), buf, 32), "ieee802154_chips")
+    return np.ctypeslib.as_array(buf).copy()
+
+
+def primitive_polys(degree: int) -> list:
+    lib = load()
+    n = lib.atkdsp_primitive_polys(int(degree), None, 0)
+    if n < 0:
+        raise AtkDspError("primitive_polys: degree 2..16")
+    buf = (C.c_uint64 * n)()
+    lib.atkdsp_primitive_polys(int(degree), buf, n)
+    return [int(x) for x in buf]
+
+
+def parity_z(chips, poly: int, degree: int) -> float:
+    p, a = _i8(chips)
+    return float(load().atkdsp_parity_z(p, a.size, C.c_uint64(int(poly)), int(degree)))
+
+
+def cav_threshold(lags: int, ns: float, pfa: float) -> float:
+    return float(load().atkdsp_cav_threshold(int(lags), float(ns), float(pfa)))
+
+
+def acq_threshold(dwells: int, ncells: float, pfa: float) -> float:
+    return float(load().atkdsp_acq_threshold(int(dwells), float(ncells), float(pfa)))
+
+
+def msc_threshold(navg: int, nbins: float, pfa: float) -> float:
+    return float(load().atkdsp_msc_threshold(int(navg), float(nbins), float(pfa)))
+
+
+def dsss_det_defaults(fs: float, win: int, max_lag: int) -> dict:
+    return _ref.dsss_det_defaults(fs, win, max_lag)
+
+
+class DsssDet:
+    """Twin-checked binding of atkdsp_dsss_det (atkdsp.h §25)."""
+
+    def __init__(self, cfg: dict):
+        self._lib = load()
+        try:
+            _ref.DsssDet(cfg)
+        except ValueError as e:
+            raise AtkDspError(f"dsss_det_create refused — {e}") from None
+        c = _DsssDetCfg()
+        self._lib.atkdsp_dsss_det_defaults(C.byref(c), float(cfg["fs"]), int(cfg["win"]), int(cfg["max_lag"]))
+        for k in ("nwin_min", "handles", "cav_lags", "min_peaks", "period_min"):
+            if k in cfg:
+                setattr(c, k, int(cfg[k]))
+        if "pfa" in cfg:
+            c.pfa = float(cfg["pfa"])
+        self._h = self._lib.atkdsp_dsss_det_create(C.byref(c))
+        if not self._h:
+            raise AtkDspError("dsss_det_create refused")
+        self._max_lag = int(cfg["max_lag"])
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_dsss_det_destroy(h)
+
+    def reset(self):
+        self._lib.atkdsp_dsss_det_reset(self._h)
+
+    def process(self, x):
+        a = _cf32(x)
+        _check(self._lib.atkdsp_dsss_det_process(self._h, _cfp(a), a.size), "dsss_det_process")
+
+    def read(self) -> dict:
+        r = _DsssDetResult()
+        _check(self._lib.atkdsp_dsss_det_read(self._h, C.byref(r)), "dsss_det_read")
+        return _struct_dict(r)
+
+    def rho(self) -> np.ndarray:
+        buf = (C.c_double * (self._max_lag + 1))()
+        n = _check(self._lib.atkdsp_dsss_det_rho(self._h, buf, self._max_lag + 1), "dsss_det_rho")
+        return np.ctypeslib.as_array(buf)[:n].copy()
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(1024)
+        self._lib.atkdsp_dsss_det_describe(self._h, buf, 1024)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _DsssCounters()
+        self._lib.atkdsp_dsss_det_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+class CyclicScan:
+    """Twin-checked binding of atkdsp_cyclic_scan (atkdsp.h §25)."""
+
+    def __init__(self, fs, nonlin, hard_limit, seg_len, nseg, f_lo, f_hi, pfa):
+        self._lib = load()
+        nl = _nl_code(nonlin)
+        try:
+            _ref.CyclicScan(fs, nl, hard_limit, seg_len, nseg, f_lo, f_hi, pfa)
+        except ValueError as e:
+            raise AtkDspError(f"cyclic_scan_create refused — {e}") from None
+        self._h = self._lib.atkdsp_cyclic_scan_create(float(fs), int(nl), int(hard_limit),
+                                                      int(seg_len), int(nseg), float(f_lo),
+                                                      float(f_hi), float(pfa))
+        if not self._h:
+            raise AtkDspError("cyclic_scan_create refused")
+        self._nb = self._lib.atkdsp_cyclic_scan_nbins(self._h)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_cyclic_scan_destroy(h)
+
+    def reset(self):
+        self._lib.atkdsp_cyclic_scan_reset(self._h)
+
+    def process(self, x):
+        a = _cf32(x)
+        _check(self._lib.atkdsp_cyclic_scan_process(self._h, _cfp(a), a.size), "cyclic_scan_process")
+
+    def read(self, cap: int = 64) -> list:
+        buf = (_ScanLine * int(cap))()
+        n = _check(self._lib.atkdsp_cyclic_scan_read(self._h, buf, int(cap)), "cyclic_scan_read")
+        return [_struct_dict(buf[i]) for i in range(n)]
+
+    def level(self) -> np.ndarray:
+        buf = (C.c_float * self._nb)()
+        n = _check(self._lib.atkdsp_cyclic_scan_level(self._h, buf, self._nb), "cyclic_scan_level")
+        return np.ctypeslib.as_array(buf)[:n].copy()
+
+    def nbins(self) -> int:
+        return int(self._nb)
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(1024)
+        self._lib.atkdsp_cyclic_scan_describe(self._h, buf, 1024)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CyclicCounters()
+        self._lib.atkdsp_cyclic_scan_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+def dsss_code_defaults(fs, rc, period_s) -> dict:
+    return _ref.dsss_code_defaults(fs, rc, period_s)
+
+
+def dsss_code(iq, cfg: dict):
+    """(chips, result) — binding of atkdsp_dsss_code."""
+    lib = load()
+    a = _cf32(iq)
+    c = _DsssCodeCfg()
+    lib.atkdsp_dsss_code_defaults(C.byref(c), float(cfg["fs"]), float(cfg["rc"]), float(cfg["period_s"]))
+    for k in ("chip_mod", "vote_passes", "poly_max_degree", "no_cfo"):
+        if k in cfg:
+            setattr(c, k, int(cfg[k]))
+    if "pfa" in cfg:
+        c.pfa = float(cfg["pfa"])
+    two = int(cfg.get("chip_mod", 0)) != 0
+    sps = c.fs / c.rc
+    L = int(round(c.period_s * c.fs / sps))
+    cap = L * (2 if two else 1) + 2
+    buf = (C.c_int8 * cap)()
+    r = _DsssCodeResult()
+    n = lib.atkdsp_dsss_code(_cfp(a), a.size, C.byref(c), buf, cap, C.byref(r))
+    if n < 0:
+        _check(n, "dsss_code")
+    res = _struct_dict(r)
+    chips = np.ctypeslib.as_array(buf)[: (r.L * (2 if (r.flags & CODE_Q) else 1)) if n else 0].copy()
+    return chips, res
+
+
+def dsss_acq_defaults(fs, rc, L) -> dict:
+    return _ref.dsss_acq_defaults(fs, rc, L)
+
+
+def dsss_acquire(iq, code, cfg: dict) -> dict:
+    lib = load()
+    a = _cf32(iq)
+    p, ca = _i8(code)
+    c = _DsssAcqCfg()
+    lib.atkdsp_dsss_acq_defaults(C.byref(c), float(cfg["fs"]), float(cfg["rc"]), int(cfg["L"]))
+    for k in ("ncoh", "nnoncoh", "combiner"):
+        if k in cfg:
+            setattr(c, k, int(cfg[k]))
+    for k in ("dop_lo", "dop_hi", "dop_step", "pfa"):
+        if k in cfg:
+            setattr(c, k, float(cfg[k]))
+    out = _DsssAcq()
+    _check(lib.atkdsp_dsss_acquire(_cfp(a), a.size, p, C.byref(c), C.byref(out)), "dsss_acquire")
+    return _struct_dict(out)
+
+
+def dsss_trk_defaults(fs, rc, L, code_phase, doppler_hz) -> dict:
+    return _ref.dsss_trk_defaults(fs, rc, L, code_phase, doppler_hz)
+
+
+class DsssTrk:
+    """Binding of atkdsp_dsss_trk (atkdsp.h §25)."""
+
+    def __init__(self, code, cfg: dict):
+        self._lib = load()
+        p, self._code = _i8(code)
+        c = _DsssTrkCfg()
+        self._lib.atkdsp_dsss_trk_defaults(C.byref(c), float(cfg["fs"]), float(cfg["rc"]), int(cfg["L"]),
+                                           float(cfg["code_phase"]), float(cfg["doppler_hz"]))
+        for k in ("dll_bw_hz", "pll_bw_hz", "spacing", "quality_spacing", "power_window_s",
+                  "distortion_pfa", "power_high_db"):
+            if k in cfg:
+                setattr(c, k, float(cfg[k]))
+        if "cn0_periods" in cfg:
+            c.cn0_periods = int(cfg["cn0_periods"])
+        self._h = self._lib.atkdsp_dsss_trk_create(p, C.byref(c))
+        if not self._h:
+            raise AtkDspError("dsss_trk_create refused")
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_dsss_trk_destroy(h)
+
+    def process(self, x, cap: int | None = None) -> np.ndarray:
+        a = _cf32(x)
+        if cap is None:
+            cap = a.size  # at most one prompt per sample
+        buf = (_Cf32 * int(cap))()
+        n = _check(self._lib.atkdsp_dsss_trk_process(self._h, _cfp(a), a.size, buf, int(cap)),
+                   "dsss_trk_process")
+        return np.array([complex(buf[i].re, buf[i].im) for i in range(n)], np.complex64)
+
+    def read(self) -> dict:
+        st = _DsssTrkState()
+        _check(self._lib.atkdsp_dsss_trk_read(self._h, C.byref(st)), "dsss_trk_read")
+        return _struct_dict(st)
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_dsss_trk_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _DsssCounters()
+        self._lib.atkdsp_dsss_trk_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+class CssProbe:
+    """Binding of atkdsp_css_probe (atkdsp.h §26)."""
+
+    def __init__(self, fs, cands, preamble_min, pfa):
+        self._lib = load()
+        cl = [(int(s), float(b)) for (s, b) in cands]
+        try:
+            _ref.CssProbe(fs, cl, preamble_min, pfa)
+        except ValueError as e:
+            raise AtkDspError(f"css_probe_create refused — {e}") from None
+        arr = (_CssCand * len(cl))(*[_CssCand(s, 0, b) for s, b in cl])
+        self._h = self._lib.atkdsp_css_probe_create(float(fs), arr, len(cl), int(preamble_min), float(pfa))
+        if not self._h:
+            raise AtkDspError("css_probe_create refused")
+        self.n = len(cl)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_css_probe_destroy(h)
+
+    def reset(self):
+        self._lib.atkdsp_css_probe_reset(self._h)
+
+    def process(self, x):
+        a = _cf32(x)
+        _check(self._lib.atkdsp_css_probe_process(self._h, _cfp(a), a.size), "css_probe_process")
+
+    def read(self) -> list:
+        buf = (_CssResult * self.n)()
+        _check(self._lib.atkdsp_css_probe_read(self._h, buf), "css_probe_read")
+        return [_struct_dict(buf[i]) for i in range(self.n)]
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_css_probe_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CyclicCounters()
+        self._lib.atkdsp_css_probe_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+def css_demod(iq, fs, sf, bw_hz, offset_hz, t0, cap: int = 1 << 20) -> np.ndarray:
+    lib = load()
+    a = _cf32(iq)
+    buf = (C.c_uint16 * int(cap))()
+    n = _check(lib.atkdsp_css_demod(_cfp(a), a.size, float(fs), int(sf), float(bw_hz), float(offset_hz),
+                                    float(t0), buf, int(cap)), "css_demod")
+    return np.ctypeslib.as_array(buf)[:n].copy()
+
+
+class Xspec:
+    """Binding of atkdsp_xspec (atkdsp.h §27)."""
+
+    def __init__(self, fs, nfft, navg, pfa):
+        self._lib = load()
+        try:
+            _ref.Xspec(fs, nfft, navg, pfa)
+        except ValueError as e:
+            raise AtkDspError(f"xspec_create refused — {e}") from None
+        self._h = self._lib.atkdsp_xspec_create(float(fs), int(nfft), int(navg), float(pfa))
+        if not self._h:
+            raise AtkDspError("xspec_create refused")
+        self._nfft = int(nfft)
+
+    def __del__(self):
+        h, self._h = getattr(self, "_h", None), None
+        if h:
+            self._lib.atkdsp_xspec_destroy(h)
+
+    def reset(self):
+        self._lib.atkdsp_xspec_reset(self._h)
+
+    def process(self, x1, x2):
+        a, b = _cf32(x1), _cf32(x2)
+        _check(self._lib.atkdsp_xspec_process(self._h, _cfp(a), _cfp(b), min(a.size, b.size)),
+               "xspec_process")
+
+    def baseline(self, x1, x2):
+        a, b = _cf32(x1), _cf32(x2)
+        _check(self._lib.atkdsp_xspec_baseline(self._h, _cfp(a), _cfp(b), min(a.size, b.size)),
+               "xspec_baseline")
+
+    def read(self) -> dict:
+        r = _XspecResult()
+        _check(self._lib.atkdsp_xspec_read(self._h, C.byref(r)), "xspec_read")
+        return _struct_dict(r)
+
+    def bins(self):
+        coh = (C.c_float * self._nfft)()
+        ph = (C.c_float * self._nfft)()
+        _check(self._lib.atkdsp_xspec_bins(self._h, coh, ph), "xspec_bins")
+        return np.ctypeslib.as_array(coh).copy(), np.ctypeslib.as_array(ph).copy()
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(512)
+        self._lib.atkdsp_xspec_describe(self._h, buf, 512)
+        return buf.value.decode()
+
+    def stats(self) -> dict:
+        s = _CyclicCounters()
+        self._lib.atkdsp_xspec_stats(self._h, C.byref(s))
+        return {n: int(getattr(s, n)) for n, _t in s._fields_}
+
+
+def align_estimate(x1, x2, fs, max_lag, block: int = 0):
+    """(result, phase) — binding of atkdsp_align_estimate."""
+    lib = load()
+    a, b = _cf32(x1), _cf32(x2)
+    n = min(a.size, b.size)
+    out = _Align()
+    phase = None
+    pp = None
+    if block and block > 0:
+        nb = (n + block - 1) // block
+        phase = (C.c_float * nb)()
+        pp = phase
+    _check(lib.atkdsp_align_estimate(_cfp(a), _cfp(b), n, float(fs), int(max_lag), int(block),
+                                     C.byref(out), pp, len(phase) if phase else 0), "align_estimate")
+    ph = np.ctypeslib.as_array(phase)[: out.nblocks].copy() if phase else None
+    return _struct_dict(out), ph
+
+
+def align_apply(x2, fs, a: dict, phase=None, block: int = 0) -> np.ndarray:
+    lib = load()
+    arr = _cf32(x2)
+    out = (_Cf32 * arr.size)()
+    st = _Align(lag=a["lag"], lag_err=a.get("lag_err", 0.0), rate_ppm=a["rate_ppm"],
+                lo_offset_hz=a["lo_offset_hz"], peak_ratio=a.get("peak_ratio", 0.0),
+                snr_db=a.get("snr_db", 0.0), nblocks=a.get("nblocks", 0), flags=a.get("flags", 0))
+    pp = None
+    if phase is not None and block > 0:
+        pa = np.ascontiguousarray(phase, np.float32)
+        pp = pa.ctypes.data_as(C.POINTER(C.c_float))
+    _check(lib.atkdsp_align_apply(_cfp(arr), arr.size, float(fs), C.byref(st), pp, int(block), out),
+           "align_apply")
+    return np.array([complex(out[i].re, out[i].im) for i in range(arr.size)], np.complex64)
+
+
+def lattice(in_: dict) -> dict:
+    lib = load()
+    li = _LatticeIn()
+    for k in ("rc_acf_hz", "rc_line_hz", "rc_nominal_hz", "period_s", "fc_hz", "cfo_hz",
+              "rc_tol", "ppm_tol", "rx_ppm"):
+        if k in in_:
+            setattr(li, k, float(in_[k]))
+    out = _LatticeOut()
+    _check(lib.atkdsp_lattice(C.byref(li), C.byref(out)), "lattice")
+    return _struct_dict(out)
+
+
+__all__ += ["method", "gps_ca", "barker", "ieee802154_chips", "primitive_polys", "parity_z",
+            "cav_threshold", "acq_threshold", "msc_threshold", "dsss_det_defaults", "DsssDet",
+            "CyclicScan", "dsss_code_defaults", "dsss_code", "dsss_acq_defaults", "dsss_acquire",
+            "dsss_trk_defaults", "DsssTrk", "CssProbe", "css_demod", "Xspec", "align_estimate",
+            "align_apply", "lattice", "DSSS_H_FLUCT", "DSSS_H_CAV", "DSSS_H_ACF", "DSSS_FLUCT",
+            "DSSS_CAV", "DSSS_PERIOD", "DSSS_WARMUP", "DSSS_ACF", "DSSS_DETECT", "SCAN_LINE",
+            "SCAN_HARMONIC", "CHIP_BPSK", "CHIP_QPSK", "CHIP_OQPSK", "CODE_IDENTIFIABLE", "CODE_CFO",
+            "CODE_POLY", "CODE_NAMED", "CODE_Q", "CODE_REFUSED", "POLY_BM", "POLY_PARITY",
+            "ACQ_NPDI", "ACQ_MBAPDI", "ACQ_DETECT", "TRK_LOCK", "TRK_VALID_CN0", "TRK_DISTORTED",
+            "CSS_DETECT", "CSS_PREAMBLE", "XS_DETECT", "XS_TDOA", "ALIGN_FOUND", "LAT_AGREE_RC",
+            "LAT_INTEGER_L", "LAT_FAMILY", "LAT_ONE_CLOCK", "LAT_CONSISTENT"]

@@ -24,6 +24,7 @@ set(ATKDSP_SOURCES
   src/crc.c src/crc_recover.c src/gf2.c src/coderec.c
   src/cfar.c src/burst.c src/ring.c
   src/pulses.c src/cyclic.c src/tone_id.c
+  src/dsss_det.c src/dsss_codes.c src/dsss_code.c src/dsss_acq.c src/css.c src/xspec.c
   vendor/pocketfft/pocketfft.c)
 
 add_library(atkdsp SHARED ${ATKDSP_SOURCES})

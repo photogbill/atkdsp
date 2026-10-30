@@ -611,6 +611,66 @@ int main(void) {
         free(au);
     }
 
+    /* ---- §25-27 spread spectrum (v0.18.0, ABI 19) ---------------------------- */
+    {
+        /* a 31-chip m-sequence (x^5+x^2+1), 4 samples/chip, BPSK data, at -6 dB */
+        const int r = 5, sps = 4, L = 31, N = L * sps, nsym = 4000;
+        int8_t code[31]; int st5[5] = {1, 0, 0, 0, 0};
+        for (int k = 0; k < L; ++k) {           /* taps bit0,bit2 -> x^5+x^2+1 */
+            code[k] = (int8_t)(1 - 2 * st5[0]);
+            int fb = st5[0] ^ st5[2];
+            for (int i = 0; i < 4; ++i) st5[i] = st5[i + 1];
+            st5[4] = fb;
+        }
+        atkdsp_cf32 *sx = (atkdsp_cf32 *)malloc((size_t)N * nsym * sizeof *sx);
+        unsigned rs = 12345u;
+        #define URAND (rs = rs * 1103515245u + 12345u, ((double)(rs >> 8) / 16777216.0))
+        for (int s = 0; s < nsym; ++s) {
+            const double d = (URAND > 0.5) ? 1.0 : -1.0;
+            for (int c = 0; c < L; ++c)
+                for (int j = 0; j < sps; ++j) {
+                    atkdsp_cf32 *v = &sx[(size_t)(s * L + c) * sps + j];
+                    v->re = (float)(d * code[c]); v->im = 0.0f;
+                }
+        }
+        double pw = 0.0; const size_t ns = (size_t)N * nsym;
+        for (size_t i = 0; i < ns; ++i) pw += (double)sx[i].re * sx[i].re;
+        pw /= ns;
+        const double sg = sqrt(pw / (2.0 * pow(10.0, -6.0 / 10.0)));
+        for (size_t i = 0; i < ns; ++i) {       /* Box-Muller noise */
+            const double u1 = URAND + 1e-12, u2 = URAND;
+            const double rr = sqrt(-2.0 * log(u1));
+            sx[i].re += (float)(sg * rr * cos(2.0 * ATK_SMOKE_PI * u2));
+            sx[i].im += (float)(sg * rr * sin(2.0 * ATK_SMOKE_PI * u2));
+        }
+        /* detector finds the period */
+        atkdsp_dsss_det_config dc; atkdsp_dsss_det_defaults(&dc, 1.0, 16 * N, 3 * N);
+        atkdsp_dsss_det *det = atkdsp_dsss_det_create(&dc);
+        atkdsp_dsss_det_result dr;
+        atkdsp_dsss_det_process(det, sx, ns);
+        atkdsp_dsss_det_read(det, &dr);
+        CHECK(det != NULL && (dr.flags & ATKDSP_DSSS_DETECT) && fabs(dr.period - N) <= 1.0,
+              "dsss_det: the 31-chip code's period found at -6 dB");
+        atkdsp_dsss_det_destroy(det);
+        /* code recovered and named */
+        atkdsp_dsss_code_config cc; atkdsp_dsss_code_defaults(&cc, 1.0, 1.0 / sps, (double)N);
+        int8_t chips[31]; atkdsp_dsss_code_result cres;
+        ptrdiff_t gl = atkdsp_dsss_code(sx, ns, &cc, chips, 31, &cres);
+        CHECK(gl == L && (cres.flags & ATKDSP_CODE_NAMED) && strstr(cres.name, "m-sequence (31)") != NULL,
+              "dsss_code: the 31-chip m-sequence recovered and named");
+        free(sx);
+        /* the method table resolves, with a country tag */
+        const atkdsp_method_info *mi = atkdsp_method(ATKDSP_METHOD_BUREL_FLUCT);
+        CHECK(mi != NULL && mi->country != NULL && strcmp(mi->country, "FR") == 0,
+              "method table: Burel's detector tagged FR");
+        /* known codes: GPS PRN 1 balance and Barker-11 */
+        int8_t ca[1023]; int ones = 0;
+        CHECK(atkdsp_gps_ca(1, ca, 1023) == 1023, "gps_ca: PRN 1 generated");
+        for (int i = 0; i < 1023; ++i) ones += ca[i] < 0;
+        CHECK(ones == 512, "gps_ca: PRN 1 is balanced (512 ones)");
+        #undef URAND
+    }
+
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);
     printf("%d failure(s)\n", fails);
     return fails ? 1 : 0;

@@ -150,6 +150,48 @@ drift compensation, bootstrap despreading over the ring, a consistency
 lattice, and the catalogue. The §G rows for phase 6 grow accordingly.
 Nothing of it is built.
 
+**Phase 6a is BUILT (2026-10-29)** — atkdsp v0.18.0 / ABI 19 (§B6 the blind
+path and the known-code path, §B6b LoRa, and the part of §B6c Undertow that
+does not need the channelizer or the baseline: the receiver-pair cross-
+spectrum, the alignment, and the consistency lattice). The fused three-handle
+detector, the chip-rate scan, blind code recovery (wide-window eigenvector,
+Rao–Edelman, carrier offset, vote, the polynomial through chip errors),
+acquisition and tracking with C/N₀ and the power-distortion monitor, the LoRa
+probe, and the provenance table are all in. Header §25–27, twins in
+`reference.py` §25–27, 44 tests in `tests/test_phase6.py`, smoke lines; the
+whole suite and the smoke test pass on Linux, also under ASan + UBSan. Every
+method carries its provenance (country included), so ATK groups the method
+menu by origin per Bill's rule. ATK's `dsp_native.py` now expects ABI 19.
+Not in this release: the scale-space survey and the catalogue (wait for A4
+and B5), MDC-1200 / FleetSync (phase 3b), C4 strong-signal removal, and the
+learned fuser (`docs/DSSS_LITERATURE.md` §K). The Windows run is owed
+(`build.bat /only atkdsp /test`).
+
+**What building phase 6a changed in this plan** (the README and
+`docs/DSSS_LITERATURE.md` have the detail):
+- The detector's thresholds are the chi-square tail of the Gamma-distributed
+  fluctuation statistic, not a Gaussian: at a few tens of windows a Gaussian
+  threshold false-alarms tens of percent. Measured to its Pfa.
+- Code recovery is sign-invariant (the eigenvector's sign is arbitrary; the
+  bits fed to Berlekamp–Massey from −code are the complement, of linear
+  complexity r+1), and names by parity-check counting whenever BM does not
+  cleanly name — so one chip error does not defeat the naming.
+- Acquisition is per-period PCPS (one period correlated at a time, coherent-
+  summed), so the peak-to-second-peak is real; the earlier whole-block form
+  gave equal peaks at every period offset.
+- Tracking's carrier loop is a Costas two-quadrant arctan (data-bit
+  insensitive) with a velocity-integrator 2nd-order filter; it despreads at
+  zero bit errors to −10 dB.
+- The receiver-pair align finds the lag by a block-non-coherent cross-
+  correlation (robust to a large LO offset that decorrelates one long sum)
+  and reads the LO from the block-summed product (which kills the band
+  carrier the signal×noise cross terms ride).
+- The receiver-pair covariance/eigh of §B6c and the channelizer-DF's W1
+  (`docs/CHANNELIZER_DF_REQUIREMENTS.md`) are the same primitive — one
+  Hermitian rank-1 accumulate plus one `eigh`, not one shared API. xspec
+  keeps the frequency axis; W1 collapses it. Unify at that primitive when
+  the channelizer is built.
+
 Written against atkdsp v0.13.0 / ABI 14. The recommended order is §G; the
 order is Bill's call.
 
@@ -451,7 +493,7 @@ shows RAM.
 
 ### A4. The channelizer (roadmap #1)
 
-> **DF requirements (2026-10-29):** before building, read `docs/CHANNELIZER_DF_REQUIREMENTS.md` — the multi-element (N coherent streams, one block clock) form, sample-index bookkeeping, the per-channel covariance accumulator and channel-grid powers that make this kernel the KrakenSDR "DF everything" engine. Nothing there changes the ABI below; it adds `_process_n` forms and three small outputs.
+> **DF requirements (2026-10-29):** before building, read `docs/CHANNELIZER_DF_REQUIREMENTS.md` — the multi-element (N coherent streams, one block clock) form, sample-index bookkeeping, the per-channel covariance accumulator and channel-grid powers that make this kernel the KrakenSDR "DF everything" engine. Nothing there changes the ABI below; it adds `_process_n` forms and three small outputs. The receiver-pair covariance/eigh of §B6c and the channelizer's W1 are the **same primitive** — one Hermitian rank-1 accumulate plus one `eigh` — not one API: xspec keeps the frequency axis, W1 collapses it.
 
 Two tools, because there are two jobs.
 
@@ -2307,7 +2349,8 @@ checked first).
 | 3b | **C3's data bursts:** MDC-1200, FleetSync I/II | S–M | Reverse-engineered framing: real recordings before trust |
 | 4 | **Engine:** A1 float32 FFT, A2 fused mixer, A4 channelizer | L | Before the wider SDRs (B210, Signal Hound); the channelizer feeds C3 on many channels at once |
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
-| 6 | **Below the floor:** B6 spread spectrum (blind path, known-code path, the GNSS monitor), B6b LoRa, C4 strong-signal removal | L | Uses B4, D2 and C1; B6 revised 2026-10-29 against the literature (`docs/DSSS_LITERATURE.md`) |
+| 6a ✅ v0.18.0 | **Spread spectrum:** B6 blind + known-code paths, B6b LoRa, B6c's receiver pair / align / lattice (BUILT 2026-10-29) | L | Uses B4, D2; the survey + catalogue of B6c wait for A4 and B5 |
+| 6 | **Below the floor (rest):** B6c's scale-space survey and catalogue, C4 strong-signal removal, MDC/FleetSync (3b), the learned fuser | M–L | After A4 (the channelizer) and B5 (the baseline) |
 | 6b | **Undertow:** B6c — the scale-space survey, the long watch, the correlation radiometer, bootstrap despreading, the catalogue | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
 | 7 | **The long watch and identity:** B5 occupancy + baseline, C5 fingerprint features | M | Uses B2, C2 and C3 |
 | 8 | **Intercept audio:** F1, F2, and the F3 wiring into the Workshop | M | Independent; the Workshop's radio door is waiting for it |

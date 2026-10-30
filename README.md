@@ -38,7 +38,7 @@ include/atkdsp.h        THE ABI. Read its header comment first.
 src/                    C99 kernels, one file per group (convert, nco, fir,
                         resample, fft, demod, display, detect, ddc, lte*,
                         fsk, dmr_sync, the bitstream files, cfar, burst,
-                        ring, pulses, cyclic, tone_id)
+                        ring, pulses, cyclic, tone_id, dsss_*, css, xspec)
 vendor/pocketfft/       Martin Reinecke's pocketfft (C, BSD-3) — the only
                         third-party code, used through src/fft.c and, for
                         the burst word's spectra, src/burst.c
@@ -48,6 +48,8 @@ tests/test_smoke.c      C-only proof the DLL is sane (no Python needed)
 tests/test_cross_check.py  every kernel vs its twin, in uneven blocks
 tests/test_detection.py    CFAR, the burst word, the ring (v0.16.0)
 tests/test_phase3.py       pulse runs, the cyclic probes, the analog IDs (v0.17.0)
+tests/test_phase6.py       spread spectrum: the blind + known-code paths, LoRa,
+                           the receiver pair and the lattice (v0.18.0)
 tests/test_ring_stress.c   the ring under threads; ring_bench.bat runs it
                         as Bill's 40 MSPS bench
 bench/                  the measurement above
@@ -89,7 +91,60 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
    display kernels, and fast-math deletes the tests for it. Found the hard
    way on day one.
 
-## What is in v0.17.0 (ABI 18)
+## What is in v0.18.0 (ABI 19)
+
+**Phase 6a — spread spectrum** of `docs/ATKDSP_PLAN.md` (§B6, §B6b, §B6c),
+and the part of the Undertow idea (§B6c) that does not wait for the
+channelizer or the long-term baseline. Header §25–27, twins in
+`reference.py` §25–27, 44 tests in `tests/test_phase6.py`, smoke lines for
+the detector, code recovery, the method table and the GPS code. Built and
+checked here on Linux; the Windows run is `build.bat /only atkdsp /test`
+from ATK. `docs/DSSS_LITERATURE.md` is the reading behind it.
+
+Every result carries the **provenance** of the methods that made it
+(`atkdsp_method()` — authors, year, venue, country), so ATK can group an
+instrument's method menu by origin: methods from Chinese journals are
+identifiable, and so are ours (Bill's rule).
+
+| | what | how |
+|---|---|---|
+| **blind detect** | `atkdsp_dsss_det` | three handles on the same windows, fused: Burel's fluctuation-of-correlation detector (**FR** 2000) finds a short code's period from under the floor (−13 dB at 50 windows, deeper with the long watch); Zeng & Liang's covariance test (**SG** 2008) is a presence gate that needs no noise-power estimate; the autocorrelation triangle gives the chip length. The thresholds are the chi-square tail of the Gamma-distributed statistic (not a Gaussian — at a few tens of windows that would false-alarm tens of percent), measured to its Pfa. Long codes: the period is absent and the result says so |
+| **chip rate** | `atkdsp_cyclic_scan` | every line in a band after a nonlinearity (phase 3's set), with a true Pfa over the whole scan (the max statistic over bins, **FI/US** 2007) — the search phase 3's per-candidate Goertzel could not do |
+| **the code** | `atkdsp_dsss_code` | the wide-window eigenvector (**FR** 2000 / **CN** 2012) with the Rao–Edelman identifiability refusal (**US** 2007: it says how many periods it would need rather than return noise), the carrier offset taken off the eigenvector (**BE** 2015), a decision-directed vote with a per-chip margin (**CN** 2021 + ours), and the generator polynomial by Berlekamp–Massey or, through chip errors, parity-check counting over the primitive polynomials (**FR**/**CH**). Names an m-sequence, a Gold code or a Barker code, sign-invariantly |
+| **known codes** | `atkdsp_dsss_acquire`, `atkdsp_dsss_trk` | the parallel code-phase search (**ES**/**DK**) with the GLRT threshold and MBAPDI across unknown data bits (**ES** 2018); a DLL/Costas-PLL tracking loop with C/N₀ (M2M4 + NWPR) and the power-distortion monitor behind the GNSS DENIED/UNTRUSTED states (**US** 2017/18). GPS C/A, Barker, 802.15.4 codes built in |
+| **LoRa** | `atkdsp_css_probe`, `atkdsp_css_demod` | dechirp per candidate (SF, BW); a preamble is the up-chirp bin recurring over the recent windows; raw symbols out |
+| **receiver pair** | `atkdsp_xspec`, `atkdsp_align`, `atkdsp_lattice` | the averaged cross-spectrum of two receivers (the second-order centre of Undertow), its coherence (magnitude-squared coherence test) and the TDOA from the phase slope; the alignment of two free-running streams (lag, rate, LO offset, and the per-block LO-wander track for VLBI-style phase referencing); the consistency lattice with the common-oscillator test |
+
+Measured (Linux, gcc; `tests/test_phase6.py`):
+
+| check | result |
+|---|---|
+| the detector on m-sequences L = 31–511, 2–8 samples/chip, −5 to −10 dB | the period found within a sample; C equals the twin (period, statistics, ρ(τ)) in uneven blocks |
+| the detector on noise at Pfa 1e-2 | the fused DETECT fires ~2 % of 200 captures — the chi-square threshold is calibrated |
+| blind code recovery, BPSK, L = 31/127, −3 to −12 dB | the code recovered up to sign and shift, named "m-sequence (L) …" with its polynomial; C == twin exactly (chips, name, margin, poly); the polynomial named through 5–10 % planted chip errors by parity counting |
+| Rao–Edelman | refuses a deep, too-short capture with the period count it would need, instead of noise |
+| acquisition, a known code at −3 to −10 dB with Doppler | code phase, Doppler and a real peak-to-second-peak; C == twin (γ to 1e-3, phase to 1e-3) |
+| tracking, GPS-scale, data bits + 25 Hz offset, 0 to −10 dB | locks and despreads at **zero bit errors**, C/N₀ within ~1 dB; C == twin to 6e-8 |
+| LoRa SF 7–8 | the preamble detected on the right SF and not the wrong one; the demod inverts the modulator; C == twin |
+| the receiver pair, a common band delayed 7 samples | detected, TDOA within half a sample; C == twin; independent noise stays quiet |
+| align, a wide common band with an LO offset | the lag found through a large offset (block-non-coherent), the LO measured at a modest one; C == twin |
+| known codes | GPS C/A balanced (512 ones), all generated; 802.15.4's sixteen and Barker; C == twin |
+| sanitizers | the smoke test and the whole suite clean under ASan + UBSan |
+
+**Honest limits.** Every operating point here is simulation (the
+power-distortion spoof monitor is the one method in the literature with
+real-data validation); the numbers are measured in our harness against a
+planted known-good emitter, not quoted from the papers, and the real
+acceptance is Bill's — 802.11b Barker first, Zigbee, then GPS. Blind code
+recovery needs one user, a short code and a clean band (the spread-bug
+case); long codes are detected and measured, not recovered. The align LO
+*estimate* is accurate for a modest offset; a large one is carried by the
+lag (robust) and the phase-referencing track. The scale-space survey and
+the catalogue of Undertow (§B6c) wait for the channelizer (A4) and the
+baseline (B5); this release is single-cell. MDC-1200 / FleetSync and the
+neural fuser are not here.
+
+## What was in v0.17.0 (ABI 18)
 
 **Phase 3 — "small, high value"** of `docs/ATKDSP_PLAN.md` (§B3, §B4, §C3),
 and two corrections phase 2 left owed. Header §22–24, twins in

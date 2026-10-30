@@ -33,6 +33,25 @@ the multi-element guarantees below.
 
 ## 2. Hard requirements (coherence — a bearing error if violated)
 
+**R7. Numerical statement — the test the rest exist to pass.** *Stated first
+because R1–R6 are only the mechanisms that make this come out right; this is the
+single pass/fail for the channelizer as a DF front end.* float32 is fine. Four
+cross-checks, all in `sim`, no hardware:
+
+- **Bit-identical elements.** Identical input on all N elements → outputs
+  bit-identical across elements. Flushes out any per-element state (R1/R2).
+- **Planted plane wave, on-centre.** A plane wave across 5 synthetic elements,
+  emitter at a channel centre → the inter-element phases at the channel output
+  equal the planted phases within **0.1°** once the group delay (R3) is removed.
+- **Planted plane wave, off-centre.** The same emitter moved to a channel
+  *edge* → phases still within **0.4°**. Channel-centre calibration (R5) leaves
+  up to ≤ 0.4° of residual at the edges by construction, so a failure *here* is
+  the channelizer's (prototype rolloff, oversample ratio, bin rotation), **not
+  R5's** — do not chase it in the cal table.
+- **Extractor retune.** With the overlap-save extractor (W4), add / retune /
+  remove one channel → every other channel's output on every element stays
+  bit-identical. The retune must not perturb the coherent set.
+
 **R1. Multi-element processing with ONE block alignment.** Either an explicit
 API —
 
@@ -48,12 +67,15 @@ ptrdiff_t atkdsp_osx_process_n(atkdsp_osx *x, const atkdsp_cf32 *const *ins,
                                size_t *out_counts, size_t cap_each);
 ```
 
-— or a documented, tested guarantee that N separate instances created with
-identical parameters and fed sample-aligned input produce outputs with
-identical block boundaries and an identical phase reference (no per-instance
-state that depends on anything but the parameters and the sample index). The
-explicit API is preferred: it is one FFT plan, one prototype, one block
-counter, and it makes R2 true by construction.
+— is **required**, not one of two options. `atkdsp_pfb_process_n` /
+`atkdsp_osx_process_n` are one FFT plan, one prototype, one block counter across
+all N elements, and they make R2 true by construction. The earlier "N separate
+single-element instances with identical parameters" fallback is **withdrawn** as
+a shipped path: it leaves the phase reference to luck (any per-instance state
+keyed on anything but the parameters and the sample index becomes a per-element
+phase error straight onto the bearing), and it cannot be made coherent by
+construction. N separate instances are acceptable only inside the numpy twin as
+a reference cross-check, never in the DLL path atkdf runs.
 
 **R2. Same prototype filter, same per-block bin rotation, on every element.**
 The §A4 phase-continuity correction ("a per-block bin-rotation correction")
@@ -79,6 +101,15 @@ aliased. Spacing selectable: 12.5 kHz, 6.25 kHz, 25 kHz, and generic. At
 ≥ 4 × 4800 Phase 1 — enough for `dmr_sync.c` and the P25 sync correlators to
 run on the channel output directly).
 
+**Band-edge rule.** The outermost channels of the 2.4 MHz window sit in the
+analog front end's and the PFB prototype's transition band — both their stopband
+rejection *and* their inter-element phase match are degraded there, so they
+cannot carry a trustworthy bearing. The grid must mark the outer guard channels
+(the transition-band fraction of the span — state the exact count from the
+prototype's rolloff, order a few channels each edge at the Kraken) **not
+DF-valid**, and the DF-everything gate (W2/W3) must skip them. A target that
+lands in a guard channel is a retune cue for the scheduler, not a bearing.
+
 **R5. Per-channel calibration hook (or an explicit statement that DF does it
 after).** atkdaq's receiver calibration is a complex weight plus a fractional-
 delay phase SLOPE per element (`atkdf.calibration.band_factors`). On a
@@ -88,15 +119,21 @@ multiply per output sample. Either accept the table (`atkdsp_pfb_set_cal(p,
 const atkdsp_cf32 *table)`) or leave it to Python; both are fine, but say
 which, so it is applied exactly once.
 
+**Per-window, and when it is rebuilt.** The `(nel × nchan)` table is valid only
+for the *window the Kraken is currently sitting in*. Key it on the frame
+header's **passport** (the header's tuner / gain / window identity block) and
+rebuild it whenever that passport changes — i.e. on every scheduler retune to a
+new window. The reference-emitter calibration path is only for re-applying a
+*cached* cal to a window already characterised; it never substitutes for a
+rebuild when the passport changes. One complex multiply per output sample either
+way. Note the division of labour with R7: this is a channel-*centre* cal, so it
+cannot fix the ≤ 0.4° edge residual — that is the channelizer's job, not the
+table's.
+
 **R6. No data-dependent state in the channel path.** No AGC, no DC tracking,
 no per-channel normalisation inside the PFB/extractor — `dc_track` and `agc`
 (ABI 13) break inter-element phase and amplitude and belong downstream of the
 covariance, never upstream. Chunk invariance (§A4) must hold per element.
-
-**R7. Numerical statement.** float32 is fine. Cross-check: identical input on
-all N elements → outputs bit-identical across elements; a planted plane wave
-across 5 synthetic elements → the inter-element phases at the channel output
-equal the planted phases within 0.1° after the group delay is accounted for.
 
 ## 3. Strongly wanted (each is small; together they are the DF-everything engine)
 
@@ -120,11 +157,32 @@ active channel per report interval, which is nothing. Without W1 the Python
 side forms R from the channel streams itself (numpy, fine for the Kraken,
 marginal for a 16-element array at 20 MHz).
 
+*Same primitive as Undertow.* W1's accumulate-then-`eigh` is the **same
+primitive** as the receiver-pair covariance/eigh in atkdsp §B6c (Undertow) — one
+Hermitian rank-1 accumulate plus one `eigh`. Unify them at that primitive, not
+behind one shared API: Undertow's cross-spectrum keeps the frequency axis (it is
+hunting an unknown spread signal across frequency), W1 collapses it (it already
+knows the channel). One numerical core, two callers.
+
+*At N ≥ 8 elements, W2 and W3 are a hard dependency of W1, not a nicety.* The
+full-occupancy covariance cost in the sizing table is only affordable because
+the gate keeps the active-channel count low. At the Kraken's 5 elements you can
+brute-force every channel; by 8+ elements the gate (W2 powers → W3 OPEN/CLOSE)
+is what keeps W1 on one core at all. Build W2/W3 **with** W1, not after it.
+
 **W2. Per-channel, per-element power per block** (mean |y|²): feeds the
 channel-grid CFAR (`atk/core/cue_detector.py` runs today on display bins),
 the DF-everything gate, and the per-channel level display that shows a dead
 or swapped antenna on one channel before anything else does
 (`doa.band_snapshots` returns `channel_db` for this reason).
+
+The channel-grid CFAR's statistic is the **5-element mean** power — that is
+`looks × 5` (five independent looks per channel per block, one from each
+element), and the extra looks are what buy the threshold its margin. It does
+**not** need a retuned hysteresis layered on top: the looks, not a hand-tuned
+open/close gap, are what make the gate stable. (The burst tracker's existing
+hysteresis, ABI 17, stays as-is; W2 feeds it cleaner looks, it does not retune
+it.)
 
 **W3. Burst edges on the channel grid, with sample indices.** If the CFAR /
 burst tracker (ABI 17) can run on W2's channel powers and report OPEN /
@@ -141,9 +199,13 @@ overlap-save extractor at an arbitrary centre; it needs the same R1–R3
 guarantees. Retuning or adding one extractor channel must leave the others
 bit-identical on every element (§A4's acceptance, extended to N).
 
-**W5. Nothing for TDMA.** P25 Phase 2 slots are separated downstream from the
-sync correlator's timing; the channelizer only has to keep the output rate
-≥ 2 × symbol rate (R4 does).
+**W5. Nothing for TDMA — handled downstream.** P25 Phase 2 slots are separated
+downstream from the sync correlator's timing; the channelizer only has to keep
+the output rate ≥ 2 × symbol rate (R4 does). Forward reference: the slot /
+steering split lives in `dmr_sync.c` and the P25 sync correlators running *on the
+channel output* (the pipeline in §6, and `ATK\docs\DF_P25_IMPROVEMENT_PLAN.md`),
+which hand atkdf a sync-aided steering vector per slot. The channelizer feeds
+them; it does not slot.
 
 ## 4. Sizing, so nothing is over-built
 

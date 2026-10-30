@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 18
-#define ATKDSP_VERSION_STRING "0.17.0"
+#define ATKDSP_ABI_VERSION 19
+#define ATKDSP_VERSION_STRING "0.18.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -110,6 +110,17 @@ extern "C" {
  * window's bin correlation; atkdsp_cfar_alpha takes it, and atkdsp_cfar_n_eff
  * / atkdsp_cfar_window_rho2 are new), and atkdsp_blockid gained fixed_bits
  * (a payload's constant positions, set aside before a code is named). */
+/* 18 -> 19: phase 6a (§25-27; docs/ATKDSP_PLAN.md §B6, §B6b, §B6c) — spread
+ * spectrum: the blind path (atkdsp_dsss_det: Burel's fluctuation detector
+ * with the long watch and the covariance test; atkdsp_cyclic_scan: every
+ * line in a band with a stated Pfa over the scan; atkdsp_dsss_code: the
+ * code from the wide-window eigenvector with the identifiability rule, the
+ * carrier offset on the eigenvector, the vote margin and the generator
+ * polynomial through chip errors), the known-code path (atkdsp_dsss_acquire,
+ * atkdsp_dsss_trk with C/N0 and the correlation-peak quality monitor), the
+ * chirp probe (atkdsp_css_probe / atkdsp_css_demod), the receiver-pair
+ * kernels (atkdsp_xspec, atkdsp_align), the consistency lattice, and the
+ * method provenance table (atkdsp_method) every result carries. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -2403,6 +2414,630 @@ ATKDSP_API int             atkdsp_dcs_code(int index, int *octal);
  * ATKDSP_E_DECODE. */
 ATKDSP_API uint32_t        atkdsp_dcs_encode(int octal);
 ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int *code, int *alias);
+
+
+/* ---- 25. Spread spectrum: the blind path and the known-code path (§B6, v0.18.0)
+ * docs/ATKDSP_PLAN.md §B6 and docs/DSSS_LITERATURE.md are the specification;
+ * the twin is reference.py §25. Every result carries the PROVENANCE of the
+ * methods that produced it — an index into atkdsp_method(), which names
+ * the authors, year, venue and country — so ATK can group an instrument's
+ * method menu by origin (Bill's rule: methods from Chinese journals are
+ * identifiable, and so are ours). The ids are stable ABI.
+ *
+ * Three honest statements this section relies on (the plan has the
+ * argument): every single-receiver blind detector here is fourth-order —
+ * its output SNR moves four dB for every dB of input, bought back at
+ * 10 log10(windows) — so the long watch is the only free gain and the
+ * receiver pair (§27) is the only second-order one; a code that never
+ * repeats within the watch is detected and measured (chip rate) but not
+ * recovered, and its symbol period is not observable from second-order
+ * statistics, so no number is invented for it; and every threshold below
+ * states a Pfa that tests/test_phase6.py measures on noise, the phase-3
+ * way, so the kernel reports its own measured behaviour, not a paper's.
+ *
+ * atkdsp_dsss_det — the detector, one handle per stream, streaming over
+ * windows of `win` samples cut on the global index (chunk-invariant):
+ *   FLUCT  Burel's fluctuation-of-correlation statistic (FR 2000): per
+ *          window the autocorrelation r_m(tau) for tau <= max_lag, and the
+ *          running mean rho(tau) = <|r_m(tau)|^2> over the windows so far.
+ *          White noise gives a flat floor at the estimator's own variance;
+ *          a code that repeats every T samples gives peaks at tau = kT,
+ *          whatever the carrier offset (it rotates r's phase, not its
+ *          magnitude) and without chip timing. The floor's mean and spread
+ *          are read robustly off the lags themselves (median / MAD), each
+ *          lag's z-score is reported, the threshold is Bonferroni over the
+ *          lags tested, and a PERIOD needs >= min_peaks equally spaced peaks
+ *          (the thesis's periodicity test — it is what takes the false
+ *          alarms out). The period is refined by the parabolic peak and a
+ *          least-squares fit over the harmonics.
+ *          The LONG WATCH is the running mean itself: it never stops, and a
+ *          clock offset or Doppler does not smear the period peak, because
+ *          it MOVES the lag (the period in samples changes by the ppm) and
+ *          does not walk it — one period is a short lag, so 3 ppm on 2048
+ *          samples is 0.006 of a sample. (The plan's first draft proposed a
+ *          lag-rate plane for this; building it showed it is not needed
+ *          here. Where drift does walk things is the code phase in a long
+ *          coherent despread — the tracker's loop handles that — and the
+ *          rate offset between two receivers — atkdsp_align handles that.)
+ *   CAV    Zeng & Liang's covariance-absolute-value test (SG 2008) on the
+ *          same lag products: T1 = mean |r(|n-m|)| over an L x L Toeplitz
+ *          covariance, T2 = r(0); signal when T1/T2 > gamma, gamma from
+ *          (L, samples, Pfa) alone — NO noise-power input, and it holds its
+ *          Pfa where a radiometer collapses on floor uncertainty. It needs
+ *          correlated signal samples (>= 2 per chip, or shaped chips): at
+ *          one rectangular sample per chip it is blind, and says so.
+ *   ACF    the chip-shape estimate: |r(tau)| at small lags is the chip
+ *          waveform's own autocorrelation (a triangle for rectangular chips),
+ *          so a line through |rho|^(1/2) over the first lags gives the chip
+ *          length tc_acf (samples) and the signal power ps_acf — a blind
+ *          chip-rate estimate at any carrier offset, rectangular chips assumed
+ *          (shaped chips read wider).
+ *   The verdict fuses the handles as a sum of -ln(Pfa-equivalents) (llr);
+ *   flags say which handle fired. Long codes: FLUCT sees nothing, CAV and
+ *   the chip-rate scan still do; the result then has no period, honestly.
+ *
+ * atkdsp_cyclic_scan — every line in [f_lo, f_hi) after a nonlinearity (the
+ * §23 set), with a true Pfa over the whole scan. Segments of seg_len on the
+ * global index, mean removed, periodic Hann, one FFT per segment, the last
+ * nseg segments' phasors kept per bin; per bin the §23 statistics (level is
+ * Exp(1) for white input, coherence the line-versus-hump test), the
+ * per-bin Pfa divided by the number of bins scanned (the max statistic over
+ * independent bins, FI/US 2007), the line's exact frequency from the
+ * segment-to-segment phase, and a HARMONIC flag when 2f is a line too.
+ * Lines come out strongest first. Chip rates are a continuum — this is the
+ * search §23's per-candidate Goertzel cannot do.
+ *
+ * atkdsp_dsss_code — the code, from a capture, given the chip rate and the
+ * period (from the two above); short codes, one user:
+ *   1. Windows of two periods overlapping by one (the wide window, FR 2000;
+ *      CN 2012 as an SVD): the principal eigenvector by power iteration on
+ *      the data (no covariance matrix is formed; C99 needs no LAPACK), a
+ *      second one deflated. The IDENTIFIABILITY rule (US 2007, Rao &
+ *      Edelman): the signal eigenvalue must clear sigma^2 (1 + sqrt(m/n)),
+ *      m = 2 x period samples, n = periods — below that the vector is noise
+ *      and the kernel refuses with the number of periods it would need
+ *      (periods_needed), instead of returning a garbage code.
+ *   2. The contiguous period inside the wide vector (k_max) is the code
+ *      waveform, and its position is the code start.
+ *   3. The carrier offset AFTER the processing gain (the idea of BE 2015, Le
+ *      Nir & Scheers, who estimate it on the eigenvector): the squared (BPSK)
+ *      or fourth-power (QPSK) samples, averaged over the aligned periods,
+ *      are one clean tone at 2 or 4 times the offset — Kay's weighted phase
+ *      estimate on that tone finds alpha where the raw signal could not;
+ *      the data are then derotated and the constellation phase aligned the
+ *      same way. |alpha| < 1 / (2 P sps) cycles per sample (P = 2 or 4): a
+ *      coarser offset comes from the scan's x^2 / x^4 line first.
+ *   4. QPSK chips carry two codes (I and Q; OQPSK's Q chips sit half a
+ *      chip late): the fourth-power phase aligns the constellation, and each
+ *      quadrature's real-valued power iteration gives its code (ATK's form
+ *      of the two-source separation CN 2023 does with Fast-ICA; the two
+ *      wide-window eigenvalues are then nearly equal, which is told from the
+ *      window-boundary degeneracy by their supports). GFSK chips: the caller
+ *      FM-demodulates first (§23's FDIFF path) and passes the real chip
+ *      waveform as the I channel.
+ *   5. The vote (CN 2021, the alternating sign-despread / k-means paper;
+ *      the per-chip margin is ATK's): despread every period with the
+ *      estimate, decide the symbol, accumulate each chip's evidence with
+ *      the decided sign, repeat; the chips are the signs at the chip
+ *      instants, and each chip's MARGIN is its accumulated evidence over the
+ *      noise, a z-score. vote_min says which chips may be trusted.
+ *   6. The generator polynomial, through chip errors: Berlekamp-Massey on
+ *      the chips with its linear-complexity profile (a plateau at r with
+ *      2r << L and the recurrence holding to the end names an LFSR of
+ *      degree r; a jump is the tell that a chip is wrong, and BM is then
+ *      not believed); otherwise parity-check counting over every primitive
+ *      polynomial of the degree L implies (FR 2004, Mitton / Cluzeau; the
+ *      counting statistic Z = sum (-1)^parity over the cyclic positions,
+ *      Z > k sqrt(N) with k from the Pfa and the candidate count; the true
+ *      polynomial of weight w scores N epsilon^w, epsilon = 1 - 2 BER). An
+ *      m-sequence (L = 2^r - 1) is named with its polynomial; a Gold code
+ *      (LC = 2r, BM's polynomial factoring into two primitive polynomials
+ *      of degree r) is named; a Barker code is named from the table;
+ *      anything else is "L chips, generator not confirmed", and the chips
+ *      are returned anyway.
+ *
+ * atkdsp_dsss_acquire — the parallel code-phase search (GNSS-SDR's form, ES;
+ * Borre, DK): per Doppler bin, the FFT of ncoh periods of derotated signal
+ * times the conjugate FFT of the code, back to the lag domain, |.|^2,
+ * summed over nnoncoh dwells with the chosen combiner — NPDI (sum of
+ * powers) or MBAPDI (ES 2018: the best sign pattern over the dwells, which
+ * survives data-bit flips where NPDI pays and the differential form
+ * breaks). The statistic Gamma = 2 K S_max / P_in is chi-square with 2 d
+ * degrees under white noise (d dwells), so the threshold is its quantile at
+ * 1 - (1 - Pfa)^(1/ncells) over every cell searched; the peak-to-second-peak
+ * ratio (outside +-1 chip in the winning bin) is reported beside it, and a
+ * rough C/N0 from the peak over the cell mean. The Doppler step defaults to
+ * 2/(3 T_coh) (DE 2011: narrower bins raise the global false-alarm rate);
+ * the peak is refined by parabolic interpolation in code phase.
+ *
+ * atkdsp_dsss_trk — tracking: one handle per code, a local replica
+ * generated per sample from the fractional code phase and the carrier NCO,
+ * five correlators per period (early / prompt / late at +-spacing chips,
+ * and the quality pair at +-quality_spacing), a non-coherent early-minus-late
+ * DLL and a Costas (arctan) PLL with second-order loop filters, carried
+ * across the caller's blocks (chunk-invariant). Each period yields one
+ * prompt output (the despread symbol); C/N0 by M2M4 (the moments
+ * estimator, unbiased down to low SNR) and NWPR (Van Dierendonck) over
+ * cn0_periods, with VALID_CN0 cleared below 25 dB-Hz where both bias low.
+ *   The QUALITY monitor (US 2017 / 2018, Wesson, Gross, Humphreys, Evans —
+ *   real-data validated): the symmetric difference of the correlation peak
+ *   |xi(-d) - xi(+d)| at d = quality_spacing chips over the correlator noise
+ *   is Rayleigh under a clean, single-path peak; its exceedance is reported
+ *   as distortion_log10_pfa, with the received power tracked over
+ *   power_window_s. The kernel reports the numbers (DISTORTED, POWER_HIGH
+ *   flags at the configured rates); the four-way reading — clean,
+ *   multipath, a second replica, a raised floor — is the caller's
+ *   (ATK gnss_status), as the plan says.
+ *
+ * Codes for callers: atkdsp_gps_ca (IS-GPS-200, PRN 1..32 and the WAAS /
+ * EGNOS 120..138 range by the same G2 tap table), atkdsp_barker (7, 11, 13),
+ * atkdsp_ieee802154_chips (the sixteen 32-chip sequences, symbol 0..15).
+ * Chips are +-1 as int8_t; the twin holds the same tables. */
+
+/* method provenance ------------------------------------------------------- */
+typedef struct {
+    const char *name;         /* "Burel fluctuation detector"               */
+    const char *authors;
+    const char *year;
+    const char *venue;
+    const char *country;      /* "FR", "CN", "ATK", ...                      */
+} atkdsp_method_info;
+#define ATKDSP_METHOD_NONE          0
+#define ATKDSP_METHOD_BUREL_FLUCT    1   /* FR 2000                                   */
+#define ATKDSP_METHOD_CAV            2   /* SG 2008                                   */
+#define ATKDSP_METHOD_CYCLE_MAX      3   /* FI/US 2007: max statistic over a scan    */
+#define ATKDSP_METHOD_EIGEN_WIDE     4   /* FR 2000 / CN 2012                         */
+#define ATKDSP_METHOD_RAO_EDELMAN    5   /* US 2007                                   */
+#define ATKDSP_METHOD_CFO_EIGEN      6   /* BE 2015                                   */
+#define ATKDSP_METHOD_VOTE           7   /* CN 2021 (alternating sign-despread)       */
+#define ATKDSP_METHOD_VOTE_MARGIN    8   /* ATK                                       */
+#define ATKDSP_METHOD_BM             9   /* US 1968/69 Berlekamp, Massey              */
+#define ATKDSP_METHOD_PARITY_COUNT  10   /* FR 2004 Mitton / Cluzeau; CH Meier-Staffelbach */
+#define ATKDSP_METHOD_PCPS          11   /* ES (GNSS-SDR) / DK (Borre)                */
+#define ATKDSP_METHOD_MBAPDI        12   /* ES 2018                                   */
+#define ATKDSP_METHOD_DOPPLER_GRID  13   /* DE 2011                                   */
+#define ATKDSP_METHOD_M2M4          14   /* CA 2000 Pauluzzi & Beaulieu               */
+#define ATKDSP_METHOD_NWPR          15   /* US 1992 Van Dierendonck                   */
+#define ATKDSP_METHOD_PD_MONITOR    16   /* US 2017/2018                              */
+#define ATKDSP_METHOD_FUSION        17   /* ATK                                       */
+#define ATKDSP_METHOD_ACF_CHIP      18   /* ATK (textbook ACF)                        */
+#define ATKDSP_METHOD_QPSK_SPLIT    19   /* ATK (after CN 2023's two-source idea)     */
+#define ATKDSP_METHOD_MSC           20   /* classic: magnitude-squared coherence      */
+#define ATKDSP_METHOD_PHASE_REF     21   /* radio astronomy (VLBI phase referencing)  */
+#define ATKDSP_METHOD_LATTICE       22   /* ATK                                       */
+#define ATKDSP_METHOD_DECHIRP       23   /* Semtech (LoRa) / open descriptions        */
+#define ATKDSP_METHOD_COUNT        24
+/* NULL for an unknown id. */
+ATKDSP_API const atkdsp_method_info *atkdsp_method(int method_id);
+
+/* the detector ------------------------------------------------------------- */
+#define ATKDSP_DSSS_H_FLUCT   1u
+#define ATKDSP_DSSS_H_CAV     2u
+#define ATKDSP_DSSS_H_ACF     4u
+#define ATKDSP_DSSS_FLUCT     1u      /* result flags: FLUCT fired               */
+#define ATKDSP_DSSS_CAV       2u      /* CAV fired                               */
+#define ATKDSP_DSSS_PERIOD    4u      /* equally spaced peaks: a period          */
+#define ATKDSP_DSSS_WARMUP    8u      /* fewer than nwin_min windows             */
+#define ATKDSP_DSSS_ACF       16u     /* the ACF chip estimate is clean          */
+#define ATKDSP_DSSS_DETECT    32u     /* a handle fired                          */
+
+typedef struct {
+    double  fs;
+    int32_t win;              /* window, samples (>= 2 max_lag recommended)   */
+    int32_t max_lag;          /* lags tested, 1..win/2                        */
+    int32_t nwin_min;         /* windows before a verdict (WARMUP below it)   */
+    int32_t handles;          /* ATKDSP_DSSS_H_* bitmask (0 = all)            */
+    double  pfa;              /* for the whole detector                       */
+    int32_t cav_lags;         /* L for CAV, 2..64 (default 8)                 */
+    int32_t min_peaks;        /* equally spaced peaks for PERIOD (default 3)  */
+    int32_t period_min;       /* smallest period in samples (default 4)       */
+    int32_t reserved[4];
+} atkdsp_dsss_det_config;     /* 64 bytes */
+
+typedef struct {
+    double   period;          /* samples (0 = none)                           */
+    double   period_s;
+    double   peak_z;          /* the first peak's z-score over the floor      */
+    double   peak_ratio;      /* rho(T) / floor                               */
+    double   floor_mean, floor_std;
+    double   fluct_log10_pfa; /* of the best lag, Bonferroni over the lags    */
+    double   cav_t, cav_thr, cav_log10_pfa;
+    double   tc_acf;          /* chip length from the ACF, samples (0 = none) */
+    double   ps_acf;          /* signal power from the ACF (linear)           */
+    double   llr;             /* fused: sum of -ln pfa over handles that fired*/
+    int32_t  npeaks;          /* equally spaced peaks counted                 */
+    int32_t  nwin;            /* windows so far                               */
+    int32_t  best_lag;        /* the strongest lag                            */
+    uint32_t flags;           /* ATKDSP_DSSS_*                                */
+    int32_t  method[4];       /* provenance: FLUCT, CAV, ACF, FUSION          */
+} atkdsp_dsss_det_result;     /* 136 bytes */
+
+typedef struct {
+    uint64_t samples, windows, resets, window_fill;
+} atkdsp_dsss_counters;       /* 32 bytes */
+
+typedef struct atkdsp_dsss_det atkdsp_dsss_det;
+ATKDSP_API void             atkdsp_dsss_det_defaults(atkdsp_dsss_det_config *cfg, double fs, int win,
+                                                     int max_lag);
+ATKDSP_API atkdsp_dsss_det *atkdsp_dsss_det_create(const atkdsp_dsss_det_config *cfg);
+ATKDSP_API void             atkdsp_dsss_det_destroy(atkdsp_dsss_det *h);
+ATKDSP_API void             atkdsp_dsss_det_reset(atkdsp_dsss_det *h);
+ATKDSP_API int              atkdsp_dsss_det_process(atkdsp_dsss_det *h, const atkdsp_cf32 *x, size_t n);
+ATKDSP_API int              atkdsp_dsss_det_read(const atkdsp_dsss_det *h, atkdsp_dsss_det_result *out);
+/* rho(tau) for tau = 0..max_lag, for display; returns max_lag + 1 or ATKDSP_E_CAP. */
+ATKDSP_API ptrdiff_t        atkdsp_dsss_det_rho(const atkdsp_dsss_det *h, double *rho, size_t cap);
+ATKDSP_API int              atkdsp_dsss_det_describe(const atkdsp_dsss_det *h, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_dsss_det_stats(const atkdsp_dsss_det *h, atkdsp_dsss_counters *st);
+/* The CAV threshold for L lags over ns samples at Pfa (complex white noise). */
+ATKDSP_API double           atkdsp_cav_threshold(int lags, double ns, double pfa);
+
+/* the scan ----------------------------------------------------------------- */
+#define ATKDSP_SCAN_LINE     1u
+#define ATKDSP_SCAN_HARMONIC 2u       /* 2f is a line too (a clock, not a tone)   */
+#define ATKDSP_SCAN_WARMUP   4u
+
+typedef struct {
+    double   freq_hz;         /* the line, refined                            */
+    double   level, coherence, level_thr, coh_thr, log10_pfa;
+    int32_t  bin;
+    uint32_t flags;
+} atkdsp_scan_line;           /* 56 bytes */
+
+typedef struct atkdsp_cyclic_scan atkdsp_cyclic_scan;
+/* nonlin ATKDSP_NL_*, seg_len 64..65536, nseg 16..4096, 0 <= f_lo < f_hi <= fs/2,
+ * 0 < pfa < 0.5 over the scan. NULL when refused. */
+ATKDSP_API atkdsp_cyclic_scan *atkdsp_cyclic_scan_create(double fs, int nonlin, int hard_limit,
+                                                         int seg_len, int nseg, double f_lo,
+                                                         double f_hi, double pfa);
+ATKDSP_API void             atkdsp_cyclic_scan_destroy(atkdsp_cyclic_scan *s);
+ATKDSP_API void             atkdsp_cyclic_scan_reset(atkdsp_cyclic_scan *s);
+ATKDSP_API int              atkdsp_cyclic_scan_process(atkdsp_cyclic_scan *s, const atkdsp_cf32 *x, size_t n);
+/* Lines above threshold, strongest first, at most cap; returns the count (0 in
+ * warm-up — read the bins with atkdsp_cyclic_scan_level for the picture). */
+ATKDSP_API ptrdiff_t        atkdsp_cyclic_scan_read(const atkdsp_cyclic_scan *s, atkdsp_scan_line *out,
+                                                    size_t cap);
+/* level per scanned bin (nbins floats); returns nbins or ATKDSP_E_CAP. */
+ATKDSP_API ptrdiff_t        atkdsp_cyclic_scan_level(const atkdsp_cyclic_scan *s, float *level, size_t cap);
+ATKDSP_API int              atkdsp_cyclic_scan_nbins(const atkdsp_cyclic_scan *s);
+ATKDSP_API int              atkdsp_cyclic_scan_describe(const atkdsp_cyclic_scan *s, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_cyclic_scan_stats(const atkdsp_cyclic_scan *s, atkdsp_cyclic_counters *st);
+
+/* the code ----------------------------------------------------------------- */
+#define ATKDSP_CHIP_BPSK  0
+#define ATKDSP_CHIP_QPSK  1           /* two codes, I and Q                       */
+#define ATKDSP_CHIP_OQPSK 2           /* two codes, Q half a chip late            */
+#define ATKDSP_CODE_IDENTIFIABLE 1u
+#define ATKDSP_CODE_CFO          2u   /* an offset was estimated and removed      */
+#define ATKDSP_CODE_POLY         4u   /* a generator polynomial was named         */
+#define ATKDSP_CODE_NAMED        8u   /* the code family was named                */
+#define ATKDSP_CODE_Q            16u  /* the Q code is in chips[L..2L)            */
+#define ATKDSP_CODE_REFUSED      32u  /* not identifiable: no chips returned      */
+#define ATKDSP_POLY_NONE   0
+#define ATKDSP_POLY_BM     1
+#define ATKDSP_POLY_PARITY 2
+
+typedef struct {
+    double  fs, rc;           /* chip rate                                     */
+    double  period_s;         /* the code period; period x fs within 2 % of an integer */
+    int32_t chip_mod;         /* ATKDSP_CHIP_*                                 */
+    int32_t vote_passes;      /* decision-directed passes (default 6)          */
+    int32_t poly_max_degree;  /* parity-check search up to this degree, 3..16 (default 14) */
+    int32_t no_cfo;           /* skip the offset estimate                      */
+    double  pfa;              /* for the polynomial decision (default 1e-3)    */
+    int32_t reserved[2];
+} atkdsp_dsss_code_config;    /* 56 bytes */
+
+typedef struct {
+    int32_t  L;               /* chips per period                              */
+    int32_t  nperiods;        /* periods used                                  */
+    int32_t  periods_needed;  /* for identifiability at the measured SNR       */
+    int32_t  start;           /* code start, samples into the capture          */
+    double   cfo_hz;
+    double   lambda1, lambda2, noise_var, ident_margin;   /* lambda1 / (noise (1 + sqrt(m/n))) */
+    double   snr_db;          /* per chip, estimated                           */
+    double   vote_min, vote_mean;  /* chip margins, z-scores                   */
+    int32_t  poly_method;     /* ATKDSP_POLY_*                                 */
+    int32_t  poly_degree;
+    uint64_t poly;            /* siga.bits mask convention (§15)               */
+    double   poly_z;          /* parity statistic Z / sqrt(N) (0 for BM)        */
+    int32_t  lc;              /* linear complexity (BM)                        */
+    int32_t  lc_plateau;      /* chips over which the profile held at lc       */
+    uint32_t flags;           /* ATKDSP_CODE_*                                 */
+    int32_t  method[8];       /* provenance                                    */
+    char     name[48];        /* "m-sequence (31) x^5+x^2+1", "Gold (1023)", "Barker-11", ... */
+} atkdsp_dsss_code_result;    /* 200 bytes */
+
+ATKDSP_API void             atkdsp_dsss_code_defaults(atkdsp_dsss_code_config *cfg, double fs, double rc,
+                                                      double period_s);
+/* chips receives L (or 2L for QPSK) values of +-1; cap in chips. Returns L,
+ * ATKDSP_E_CAP, ATKDSP_E_ARG, or ATKDSP_E_EMPTY when fewer than 3 periods fit;
+ * a refusal for identifiability returns 0 with REFUSED set and the margin. */
+ATKDSP_API ptrdiff_t        atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n,
+                                             const atkdsp_dsss_code_config *cfg, int8_t *chips,
+                                             size_t cap, atkdsp_dsss_code_result *out);
+/* The parity-check decision on its own: Z over the cyclic positions of chips
+ * for the candidate polynomial (bitmask, §15 convention). */
+ATKDSP_API double           atkdsp_parity_z(const int8_t *chips, int L, uint64_t poly, int degree);
+/* Primitive polynomials of a degree, in a fixed order; returns the count,
+ * fills up to cap masks. Degree 2..16. */
+ATKDSP_API ptrdiff_t        atkdsp_primitive_polys(int degree, uint64_t *out, size_t cap);
+
+/* known codes --------------------------------------------------------------- */
+/* 1023 chips of +-1 for PRN 1..32 (and 120..138 WAAS/EGNOS). Returns 1023 or E_ARG. */
+ATKDSP_API ptrdiff_t        atkdsp_gps_ca(int prn, int8_t *chips, size_t cap);
+/* Barker 7, 11 or 13. */
+ATKDSP_API ptrdiff_t        atkdsp_barker(int length, int8_t *chips, size_t cap);
+/* IEEE 802.15.4 (2.4 GHz O-QPSK): the 32-chip sequence of symbol 0..15. */
+ATKDSP_API ptrdiff_t        atkdsp_ieee802154_chips(int symbol, int8_t *chips, size_t cap);
+
+/* acquisition --------------------------------------------------------------- */
+#define ATKDSP_ACQ_NPDI   0
+#define ATKDSP_ACQ_MBAPDI 1
+#define ATKDSP_ACQ_DETECT 1u
+
+typedef struct {
+    double  fs, rc;
+    int32_t L;                /* chips per period                              */
+    int32_t ncoh;             /* periods per coherent sum (1..64)              */
+    int32_t nnoncoh;          /* dwells (1..64; MBAPDI <= 10)                  */
+    int32_t combiner;         /* ATKDSP_ACQ_*                                  */
+    double  dop_lo, dop_hi;   /* Doppler span, Hz                              */
+    double  dop_step;         /* 0 = 2 / (3 T_coh)                             */
+    double  pfa;
+    int32_t reserved[2];
+} atkdsp_dsss_acq_config;     /* 72 bytes */
+
+typedef struct {
+    double   code_phase;      /* chips, refined                                 */
+    double   doppler_hz;
+    double   gamma, gamma_thr, log10_pfa;
+    double   peak_ratio;      /* peak over the best cell outside +-1 chip       */
+    double   cn0_dbhz;        /* rough, from the peak over the cell mean        */
+    int32_t  ncells;
+    int32_t  ndop;
+    uint32_t flags;
+    int32_t  method[4];
+} atkdsp_dsss_acq;            /* 88 bytes */
+
+ATKDSP_API void             atkdsp_dsss_acq_defaults(atkdsp_dsss_acq_config *cfg, double fs, double rc,
+                                                     int L);
+/* Needs n >= ncoh x nnoncoh periods of samples. Returns 0 or an error. */
+ATKDSP_API int              atkdsp_dsss_acquire(const atkdsp_cf32 *iq, size_t n, const int8_t *code,
+                                                const atkdsp_dsss_acq_config *cfg, atkdsp_dsss_acq *out);
+/* The chi-square(2 d) threshold on Gamma for ncells cells at Pfa. */
+ATKDSP_API double           atkdsp_acq_threshold(int dwells, double ncells, double pfa);
+
+/* tracking ------------------------------------------------------------------ */
+#define ATKDSP_TRK_LOCK      1u
+#define ATKDSP_TRK_VALID_CN0 2u
+#define ATKDSP_TRK_DISTORTED 4u
+#define ATKDSP_TRK_POWER_HIGH 8u
+
+typedef struct {
+    double  fs, rc;
+    int32_t L;
+    int32_t reserved0;
+    double  code_phase;       /* chips, at the first sample                    */
+    double  doppler_hz;
+    double  dll_bw_hz;        /* default 2                                     */
+    double  pll_bw_hz;        /* default 15                                    */
+    double  spacing;          /* early-late half spacing, chips (default 0.5)  */
+    double  quality_spacing;  /* the monitor's taps, chips (default 0.15)      */
+    int32_t cn0_periods;      /* C/N0 window, periods (default 20)             */
+    int32_t reserved1;
+    double  power_window_s;   /* received-power window (default 0.2)           */
+    double  distortion_pfa;   /* DISTORTED at this rate (default 1e-3)         */
+    double  power_high_db;    /* POWER_HIGH when power rises this much over its start (default 3) */
+    int32_t reserved[2];
+} atkdsp_dsss_trk_config;     /* 112 bytes */
+
+typedef struct {
+    double   code_phase;      /* chips, fractional, mod L                       */
+    double   doppler_hz;
+    double   cn0_m2m4, cn0_nwpr;   /* dB-Hz                                     */
+    double   distortion;      /* |xi(-d) - xi(+d)| / sigma                       */
+    double   distortion_log10_pfa;
+    double   power_db;        /* received power, dBFS-ish (10 log10 mean |x|^2)  */
+    double   power_start_db;
+    double   lock;            /* |mean I| / mean |P| over the C/N0 window         */
+    uint64_t periods;
+    uint32_t flags;
+    int32_t  method[4];
+} atkdsp_dsss_trk_state;      /* 104 bytes */
+
+typedef struct atkdsp_dsss_trk atkdsp_dsss_trk;
+ATKDSP_API void             atkdsp_dsss_trk_defaults(atkdsp_dsss_trk_config *cfg, double fs, double rc,
+                                                     int L, double code_phase, double doppler_hz);
+ATKDSP_API atkdsp_dsss_trk *atkdsp_dsss_trk_create(const int8_t *code, const atkdsp_dsss_trk_config *cfg);
+ATKDSP_API void             atkdsp_dsss_trk_destroy(atkdsp_dsss_trk *h);
+/* One prompt output per completed period; returns the count (<= cap, the rest
+ * are dropped and counted). */
+ATKDSP_API ptrdiff_t        atkdsp_dsss_trk_process(atkdsp_dsss_trk *h, const atkdsp_cf32 *x, size_t n,
+                                                    atkdsp_cf32 *prompt, size_t cap);
+ATKDSP_API int              atkdsp_dsss_trk_read(const atkdsp_dsss_trk *h, atkdsp_dsss_trk_state *st);
+ATKDSP_API int              atkdsp_dsss_trk_describe(const atkdsp_dsss_trk *h, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_dsss_trk_stats(const atkdsp_dsss_trk *h, atkdsp_dsss_counters *st);
+
+/* ---- 26. Chirp spread spectrum: the LoRa probe (§B6b, v0.18.0) --------------
+ * A LoRa symbol is one linear chirp over bw, cyclically shifted by the
+ * symbol value, 2^sf values, T_sym = 2^sf / bw; a frame starts with 8
+ * unshifted up-chirps. Multiplying a window of one symbol by the conjugate
+ * base up-chirp and taking its FFT collapses a LoRa symbol to one bin;
+ * noise collapses to nothing (Semtech's waveform; the open descriptions,
+ * gr-lora / LoRa-SDR, for the demodulation — read before any protocol
+ * decode, which this is not).
+ * atkdsp_css_probe — per candidate (sf, bw): sliding windows of one symbol
+ * at hop T_sym / 4 on the global index; per window the dechirped FFT's
+ * peak bin and its level (peak power over the mean bin power: Exp(1) for
+ * white noise, so the per-window threshold is -ln of the Pfa divided by
+ * the bins and the candidates); DETECT when a window passes; PREAMBLE when
+ * preamble_min consecutive passing windows (default 6 of 8) agree on the bin
+ * within +-1 — the coherence test again, and what a chirp-shaped noise
+ * burst does not pass. offset_hz is the bin's frequency as a carrier
+ * offset (the down-chirps that resolve the time / frequency ambiguity are
+ * the demodulator's business).
+ * atkdsp_css_demod — raw symbol values from t_sym0 at (sf, bw, offset):
+ * the peak bin per symbol window, scaled to 0..2^sf - 1. Gray mapping,
+ * interleaving, Hamming and whitening are per-protocol and ATK-side. */
+#define ATKDSP_CSS_DETECT   1u
+#define ATKDSP_CSS_PREAMBLE 2u
+#define ATKDSP_CSS_WARMUP   4u
+
+typedef struct {
+    int32_t sf;               /* 5..12                                         */
+    int32_t reserved;
+    double  bw_hz;            /* <= fs                                         */
+} atkdsp_css_cand;            /* 16 bytes */
+
+typedef struct {
+    double   level, level_thr, offset_hz;
+    int32_t  bin;             /* the last passing window's peak bin            */
+    int32_t  run;             /* consecutive agreeing windows                  */
+    int32_t  nwin;
+    uint32_t flags;
+} atkdsp_css_result;          /* 40 bytes */
+
+typedef struct atkdsp_css_probe atkdsp_css_probe;
+ATKDSP_API atkdsp_css_probe *atkdsp_css_probe_create(double fs, const atkdsp_css_cand *cands, int ncand,
+                                                     int preamble_min, double pfa);
+ATKDSP_API void             atkdsp_css_probe_destroy(atkdsp_css_probe *p);
+ATKDSP_API void             atkdsp_css_probe_reset(atkdsp_css_probe *p);
+ATKDSP_API int              atkdsp_css_probe_process(atkdsp_css_probe *p, const atkdsp_cf32 *x, size_t n);
+ATKDSP_API int              atkdsp_css_probe_read(const atkdsp_css_probe *p, atkdsp_css_result *out);
+ATKDSP_API int              atkdsp_css_probe_describe(const atkdsp_css_probe *p, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_css_probe_stats(const atkdsp_css_probe *p, atkdsp_cyclic_counters *st);
+/* symbols from sample t0 (fractional), one per T_sym; returns the count. */
+ATKDSP_API ptrdiff_t        atkdsp_css_demod(const atkdsp_cf32 *iq, size_t n, double fs, int sf,
+                                             double bw_hz, double offset_hz, double t0,
+                                             uint16_t *symbols, size_t cap);
+
+/* ---- 27. The receiver pair and the consistency lattice (§B6c, v0.18.0) -------
+ * The second-order centre of Undertow (docs/ATKDSP_PLAN.md §B6c). Two
+ * receivers whose noise is independent: the averaged cross-spectrum of
+ * their streams keeps a common signal and loses the noise as 1/sqrt(nseg)
+ * — a floor that falls instead of a fixed floor with ripple, and no
+ * noise-power input. The survey over scales waits for A4; this is one cell.
+ *
+ * atkdsp_xspec — pair accumulator on one time axis: segments of nfft on the
+ * global index, Hann, Sxx, Syy and Sxy averaged over the last navg segments;
+ * per bin the magnitude-squared coherence C = |Sxy|^2 / (Sxx Syy), which for
+ * independent inputs over navg averages has P(C > c) = (1 - c)^(navg - 1)
+ * (classic), so the per-bin threshold at the scan's Pfa is
+ * 1 - (Pfa / nbins)^(1 / (navg - 1)) — the max statistic over the bins. A
+ * learned noise-only cross-spectrum (atkdsp_xspec_baseline) is subtracted
+ * first, which is how common-mode spurs (LO leakage, DC, a shared supply)
+ * and coupled noise are kept out. The read reports the detected band
+ * (bins above threshold, merged), its TDOA from the cross-spectrum phase
+ * slope across the band (a coherence-weighted linear fit; the intercept is
+ * the LO phase offset, which the slope does not care about), the slope
+ * fit's residual, and the LO offset as the band's centre shift between
+ * Sxx and Syy peaks is NOT attempted here — atkdsp_align does that.
+ *
+ * atkdsp_align — the alignment of two free-running streams from a common
+ * signal they both hear (the reference emitter, or the target itself when
+ * strong enough): the cross-correlation peak gives the time offset
+ * (sub-sample by parabola), its change between the two halves of the
+ * capture gives the sample-rate offset (ppm), the product x1 conj x2 at the
+ * found lag has a tone at the LO offset (its FFT peak), and the phase of
+ * that tone over time, per block, is the LO wander: atkdsp_align_apply
+ * shifts, resamples (linear, small ppm) and derotates the second stream and
+ * subtracts the tracked phase — VLBI's phase referencing on a calibrator —
+ * so the pair integrates coherently as long as the reference is heard.
+ *
+ * atkdsp_lattice — the consistency test (ATK): the independent estimates of
+ * the chip rate (ACF, scan line), the period, the carrier and the chip-clock
+ * offsets must agree: L = period x rc is an integer, preferably of a known
+ * family (2^n - 1, Barker, 32, 1023, 511, 4092, 2^15, 38400 — a boost, not
+ * a requirement), and the common-oscillator test: a transmitter derives
+ * carrier and chip clock from one reference, so (cfo / fc) and (drc / rc)
+ * agree to within the receiver's own reference error. */
+#define ATKDSP_XS_DETECT  1u
+#define ATKDSP_XS_WARMUP  2u
+#define ATKDSP_XS_TDOA    4u          /* the slope fit had >= 4 bins              */
+
+typedef struct {
+    double   max_coh, coh_thr, log10_pfa;
+    int32_t  max_bin;
+    int32_t  band_lo, band_hi;  /* bins (inclusive) of the band around the max */
+    int32_t  band_bins;
+    double   band_coh_mean;
+    double   tdoa_s, tdoa_err_s;  /* from the phase slope across the band      */
+    double   phase0;          /* the fit's intercept: LO phase offset, rad     */
+    double   slope_resid;     /* rms residual of the fit, rad                  */
+    int32_t  navg;
+    uint32_t flags;
+    int32_t  method[2];
+} atkdsp_xspec_result;        /* 96 bytes */
+
+typedef struct atkdsp_xspec atkdsp_xspec;
+/* nfft 16..65536, navg 2..65536, 0 < pfa < 0.5. */
+ATKDSP_API atkdsp_xspec    *atkdsp_xspec_create(double fs, int nfft, int navg, double pfa);
+ATKDSP_API void             atkdsp_xspec_destroy(atkdsp_xspec *h);
+ATKDSP_API void             atkdsp_xspec_reset(atkdsp_xspec *h);
+ATKDSP_API int              atkdsp_xspec_process(atkdsp_xspec *h, const atkdsp_cf32 *x1,
+                                                 const atkdsp_cf32 *x2, size_t n);
+/* Learn (accumulate) the noise-only cross-spectrum from these samples; the
+ * learned mean is subtracted from Sxy in every later read. */
+ATKDSP_API int              atkdsp_xspec_baseline(atkdsp_xspec *h, const atkdsp_cf32 *x1,
+                                                  const atkdsp_cf32 *x2, size_t n);
+ATKDSP_API int              atkdsp_xspec_read(const atkdsp_xspec *h, atkdsp_xspec_result *out);
+/* coherence and cross phase per bin (nfft each, fftshifted); NULL to skip. */
+ATKDSP_API int              atkdsp_xspec_bins(const atkdsp_xspec *h, float *coh, float *phase);
+ATKDSP_API int              atkdsp_xspec_describe(const atkdsp_xspec *h, char *buf, size_t cap);
+ATKDSP_API int              atkdsp_xspec_stats(const atkdsp_xspec *h, atkdsp_cyclic_counters *st);
+/* The per-bin coherence threshold for navg averages, nbins scanned, Pfa over the scan. */
+ATKDSP_API double           atkdsp_msc_threshold(int navg, double nbins, double pfa);
+
+#define ATKDSP_ALIGN_FOUND 1u
+typedef struct {
+    double   lag;             /* samples: x2 lags x1 by this (sub-sample)        */
+    double   lag_err;         /* from the peak width, samples                    */
+    double   rate_ppm;        /* x2's clock runs fast by this                    */
+    double   lo_offset_hz;    /* x2's LO sits above x1's by this                 */
+    double   peak_ratio;      /* correlation peak over the floor                 */
+    double   snr_db;          /* of the common signal in the correlation         */
+    int32_t  nblocks;         /* phase-track blocks                              */
+    uint32_t flags;
+    int32_t  method[2];
+} atkdsp_align;               /* 64 bytes */
+
+/* max_lag samples each way; block samples for the LO phase track (phase
+ * receives n / block values, cap in values, may be NULL). */
+ATKDSP_API int              atkdsp_align_estimate(const atkdsp_cf32 *x1, const atkdsp_cf32 *x2, size_t n,
+                                                  double fs, int max_lag, int block, atkdsp_align *out,
+                                                  float *phase, size_t cap);
+/* out[i] = x2 shifted, resampled and derotated onto x1's axis, the tracked
+ * phase (from estimate, same block) subtracted when given. out has n values;
+ * samples that would come from outside x2 are zero. */
+ATKDSP_API int              atkdsp_align_apply(const atkdsp_cf32 *x2, size_t n, double fs,
+                                               const atkdsp_align *a, const float *phase, int block,
+                                               atkdsp_cf32 *out);
+
+#define ATKDSP_LAT_AGREE_RC   1u      /* the chip-rate estimates agree            */
+#define ATKDSP_LAT_INTEGER_L  2u      /* period x rc is an integer                */
+#define ATKDSP_LAT_FAMILY     4u      /* L is of a known family                   */
+#define ATKDSP_LAT_ONE_CLOCK  8u      /* the ppm pair agrees                      */
+#define ATKDSP_LAT_CONSISTENT 16u     /* the verdict                              */
+typedef struct {
+    double  rc_acf_hz, rc_line_hz, rc_nominal_hz;  /* 0 = not available          */
+    double  period_s;         /* 0 = none                                         */
+    double  fc_hz, cfo_hz;    /* the carrier and its measured offset              */
+    double  rc_tol;           /* fractional agreement tolerance (default 0.02)    */
+    double  ppm_tol;          /* common-oscillator tolerance, ppm (default 2)     */
+    double  rx_ppm;           /* the receiver's own reference error, ppm          */
+} atkdsp_lattice_in;          /* 72 bytes */
+typedef struct {
+    double   rc_hz;           /* the agreed chip rate                             */
+    double   rc_spread;       /* fractional spread of the estimates               */
+    double   L;               /* period x rc                                      */
+    double   L_frac;          /* distance from the nearest integer                */
+    double   ppm_carrier, ppm_chip, ppm_diff;
+    int32_t  L_int;
+    int32_t  family;          /* 0 none, 1 m-sequence/Gold 2^n-1, 2 Barker, 3 802.15.4, 4 GPS/GLONASS/Galileo, 5 CDMA/UMTS */
+    uint32_t flags;
+    int32_t  method;
+} atkdsp_lattice_out;         /* 72 bytes */
+ATKDSP_API int              atkdsp_lattice(const atkdsp_lattice_in *in, atkdsp_lattice_out *out);
 
 #ifdef __cplusplus
 }

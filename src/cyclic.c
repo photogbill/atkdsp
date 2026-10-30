@@ -242,9 +242,9 @@ static double arg_prod(const atkdsp_cf32 *a, const atkdsp_cf32 *b) {   /* arg(a 
     const double im = (double)a->im * b->re - (double)a->re * b->im;
     return atan2(im, re);
 }
-static void cyc_nonlin(const atkdsp_cyclic *c, const atkdsp_cyc_cand *cd, double *vre, double *vim) {
-    const int L = c->L;
-    const atkdsp_cf32 *x = c->seg + 2;              /* seg[0..1] are the two previous samples */
+static void nonlin_segment(const atkdsp_cf32 *seg, int L, int have_prev, const atkdsp_cyc_cand *cd,
+                           double *vre, double *vim) {
+    const atkdsp_cf32 *x = seg + 2;                 /* seg[0..1] are the two previous samples */
     for (int n = 0; n < L; ++n) {
         double re = x[n].re, im = x[n].im;
         if (cd->hard_limit && cd->nonlin != ATKDSP_NL_ENV2) {
@@ -263,8 +263,8 @@ static void cyc_nonlin(const atkdsp_cyclic *c, const atkdsp_cyc_cand *cd, double
             const double br = ar * ar - ai * ai, bi = 2.0 * ar * ai;
             yr = br * br - bi * bi; yi = 2.0 * br * bi; break; }
         case ATKDSP_NL_DM: {                         /* |x[n] - x[n-1]|^2 */
-            double pr = c->seg[n + 1].re, pi = c->seg[n + 1].im;
-            if (n == 0 && c->have_prev < 1) { pr = re; pi = im; }
+            double pr = seg[n + 1].re, pi = seg[n + 1].im;
+            if (n == 0 && have_prev < 1) { pr = re; pi = im; }
             if (cd->hard_limit) {
                 const double m = sqrt(pr * pr + pi * pi);
                 if (m > 0.0) { pr /= m; pi /= m; } else { pr = pi = 0.0; }
@@ -272,10 +272,10 @@ static void cyc_nonlin(const atkdsp_cyclic *c, const atkdsp_cyc_cand *cd, double
             const double dr = re - pr, di = im - pi;
             yr = dr * dr + di * di; yi = 0.0; break; }
         default: {                                   /* FDIFF: (f[n] - f[n-1])^2, f = arg(x[n] conj x[n-1]) */
-            const int h = c->have_prev;              /* x[n] = seg[n+2], x[n-1] = seg[n+1], x[n-2] = seg[n] */
+            const int h = have_prev;                 /* x[n] = seg[n+2], x[n-1] = seg[n+1], x[n-2] = seg[n] */
             double f1 = 0.0, f0 = 0.0;
-            if (n + h >= 1) f1 = arg_prod(&c->seg[n + 2], &c->seg[n + 1]);
-            if (n + h >= 2) f0 = arg_prod(&c->seg[n + 1], &c->seg[n]);
+            if (n + h >= 1) f1 = arg_prod(&seg[n + 2], &seg[n + 1]);
+            if (n + h >= 2) f0 = arg_prod(&seg[n + 1], &seg[n]);
             const double d = f1 - f0;
             yr = d * d; yi = 0.0; break; }
         }
@@ -289,7 +289,7 @@ static void cyc_nonlin(const atkdsp_cyclic *c, const atkdsp_cyc_cand *cd, double
 
 static void cyc_finish_segment(atkdsp_cyclic *c) {
     for (int i = 0; i < c->ncand; ++i) {
-        cyc_nonlin(c, &c->cand[i], c->vre, c->vim);
+        nonlin_segment(c->seg, c->L, c->have_prev, &c->cand[i], c->vre, c->vim);
         line_segment(&c->acc[i], c->vre, c->vim, c->w, c->L);
     }
     c->seg[0] = c->seg[c->L];                        /* the last two samples become the history */
@@ -553,5 +553,205 @@ int atkdsp_cp_probe_stats(const atkdsp_cp_probe *p, atkdsp_cyclic_counters *st) 
     if (!p || !st) return ATKDSP_E_ARG;
     st->samples = p->samples; st->segments = p->segments; st->resets = p->resets;
     st->segment_fill = (uint64_t)p->pos;
+    return ATKDSP_OK;
+}
+
+/* ---- 25b. atkdsp_cyclic_scan: every line in a band (§B6 step 2) ---------------
+ * The same segmentation, nonlinearity, mean removal and periodic Hann as
+ * atkdsp_cyclic, but one FFT per segment instead of one Goertzel per
+ * candidate, and the last nseg phasors kept for every bin of [f_lo, f_hi).
+ * Per bin the §23 statistics hold exactly (the FFT bin IS the Goertzel at
+ * that frequency): level is Exp(1) for white input, coherence the line-
+ * versus-hump test, delta the bin-to-line offset from the segment-to-segment
+ * phase. The Pfa is the scan's: each bin at pfa / nbins (the max statistic
+ * over independent bins — Lunden et al.'s form; the bins of one FFT of a
+ * mean-removed, Hann-windowed segment are close to independent beyond the
+ * window's main lobe, and the measured rate in tests/test_phase6.py is what
+ * the threshold is judged by). A line is a bin passing both thresholds that
+ * is a local maximum of level; lines come out strongest first; HARMONIC when
+ * the bin at twice the line's frequency passes the level threshold too. */
+struct atkdsp_cyclic_scan {
+    double fs, pfa, pfa_each, level_thr, coh_thr, wsum2, f_lo, f_hi;
+    int L, K, nonlin, hard_limit, k_lo, k_hi, nbins;
+    double *w;
+    atkdsp_cf32 *seg, *X, *Y;
+    int pos, have_prev;
+    double *vre, *vim;
+    double *p_re, *p_im;       /* nbins x K ring                                 */
+    double *e;                 /* K ring of segment energies                     */
+    int head, count;
+    atkdsp_fft *fft;
+    uint64_t samples, segments, resets;
+};
+
+atkdsp_cyclic_scan *atkdsp_cyclic_scan_create(double fs, int nonlin, int hard_limit, int seg_len,
+                                              int nseg, double f_lo, double f_hi, double pfa) {
+    if (!(fs > 0.0) || !isfinite(fs) || nonlin < 0 || nonlin > 5) return NULL;
+    if (seg_len < 64 || seg_len > CYC_SEG_MAX || nseg < 16 || nseg > CYC_NSEG_MAX) return NULL;
+    if (!(f_lo >= 0.0) || !(f_hi > f_lo) || !(f_hi <= 0.5 * fs)) return NULL;
+    if (!(pfa > 0.0 && pfa < 0.5)) return NULL;
+    const int k_lo = (int)ceil(f_lo * seg_len / fs), k_hi = (int)floor(f_hi * seg_len / fs);
+    if (k_hi <= k_lo) return NULL;
+    const int nbins = k_hi - k_lo;
+    double lt, ct;
+    atkdsp_cyclic_thresholds(nseg, pfa / (double)nbins, &lt, &ct);
+    if (ct > 1.0) return NULL;
+    atkdsp_cyclic_scan *s = (atkdsp_cyclic_scan *)calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->fs = fs; s->pfa = pfa; s->pfa_each = pfa / (double)nbins; s->level_thr = lt; s->coh_thr = ct;
+    s->f_lo = f_lo; s->f_hi = f_hi; s->L = seg_len; s->K = nseg; s->nonlin = nonlin; s->hard_limit = hard_limit;
+    s->k_lo = k_lo; s->k_hi = k_hi; s->nbins = nbins;
+    s->w = hann_periodic(seg_len, &s->wsum2);
+    s->seg = (atkdsp_cf32 *)malloc(((size_t)seg_len + 2) * sizeof *s->seg);
+    s->X = (atkdsp_cf32 *)malloc((size_t)seg_len * sizeof *s->X);
+    s->Y = (atkdsp_cf32 *)malloc((size_t)seg_len * sizeof *s->Y);
+    s->vre = (double *)malloc((size_t)seg_len * sizeof(double));
+    s->vim = (double *)malloc((size_t)seg_len * sizeof(double));
+    s->p_re = (double *)calloc((size_t)nbins * (size_t)nseg, sizeof(double));
+    s->p_im = (double *)calloc((size_t)nbins * (size_t)nseg, sizeof(double));
+    s->e = (double *)calloc((size_t)nseg, sizeof(double));
+    s->fft = atkdsp_fft_create((size_t)seg_len);
+    if (!s->w || !s->seg || !s->X || !s->Y || !s->vre || !s->vim || !s->p_re || !s->p_im || !s->e || !s->fft) {
+        atkdsp_cyclic_scan_destroy(s); return NULL;
+    }
+    return s;
+}
+
+void atkdsp_cyclic_scan_destroy(atkdsp_cyclic_scan *s) {
+    if (!s) return;
+    atkdsp_fft_destroy(s->fft);
+    free(s->w); free(s->seg); free(s->X); free(s->Y); free(s->vre); free(s->vim);
+    free(s->p_re); free(s->p_im); free(s->e);
+    free(s);
+}
+
+void atkdsp_cyclic_scan_reset(atkdsp_cyclic_scan *s) {
+    if (!s) return;
+    s->pos = 0; s->have_prev = 0; s->head = 0; s->count = 0; s->resets++;
+}
+
+static void scan_finish_segment(atkdsp_cyclic_scan *s) {
+    atkdsp_cyc_cand cd; cd.rate_hz = 1.0; cd.nonlin = s->nonlin; cd.hard_limit = s->hard_limit;
+    nonlin_segment(s->seg, s->L, s->have_prev, &cd, s->vre, s->vim);
+    double e = 0.0;
+    for (int n = 0; n < s->L; ++n) {
+        e += s->vre[n] * s->vre[n] + s->vim[n] * s->vim[n];
+        s->X[n].re = (float)(s->w[n] * s->vre[n]); s->X[n].im = (float)(s->w[n] * s->vim[n]);
+    }
+    atkdsp_fft_exec(s->fft, s->X, s->Y, 0);
+    double *pr = s->p_re + (size_t)s->head * (size_t)s->nbins;
+    double *pi = s->p_im + (size_t)s->head * (size_t)s->nbins;
+    for (int b = 0; b < s->nbins; ++b) { pr[b] = s->Y[s->k_lo + b].re; pi[b] = s->Y[s->k_lo + b].im; }
+    s->e[s->head] = e;
+    s->head = (s->head + 1) % s->K;
+    if (s->count < s->K) s->count++;
+    s->seg[0] = s->seg[s->L]; s->seg[1] = s->seg[s->L + 1];
+    s->have_prev = s->have_prev + 2 > 2 ? 2 : s->have_prev + 2;
+    s->pos = 0;
+    s->segments++;
+}
+
+int atkdsp_cyclic_scan_process(atkdsp_cyclic_scan *s, const atkdsp_cf32 *x, size_t n) {
+    if (!s || (!x && n)) return ATKDSP_E_ARG;
+    size_t i = 0;
+    while (i < n) {
+        size_t take = (size_t)(s->L - s->pos);
+        if (take > n - i) take = n - i;
+        memcpy(s->seg + 2 + s->pos, x + i, take * sizeof *x);
+        s->pos += (int)take; i += take;
+        if (s->pos == s->L) scan_finish_segment(s);
+    }
+    s->samples += n;
+    return ATKDSP_OK;
+}
+
+/* per-bin statistics over the segments held (the §23 reading, FFT bins) */
+static void scan_bin(const atkdsp_cyclic_scan *s, int b, double *level, double *coh, double *delta_hz) {
+    const int K = s->count;
+    const int first = (s->head - K + s->K) % s->K;
+    double sr = 0.0, si = 0.0, sa = 0.0, se = 0.0, dr = 0.0, di = 0.0, lpr = 0.0, lpi = 0.0;
+    for (int k = 0; k < K; ++k) {
+        const int j = (first + k) % s->K;
+        const double pr = s->p_re[(size_t)j * s->nbins + b], pi = s->p_im[(size_t)j * s->nbins + b];
+        sr += pr; si += pi; sa += sqrt(pr * pr + pi * pi); se += s->e[j];
+        if (k) { dr += pr * lpr + pi * lpi; di += pi * lpr - pr * lpi; }
+        lpr = pr; lpi = pi;
+    }
+    const double den = se * (s->wsum2 / (double)s->L);
+    *level = den > 0.0 ? (sr * sr + si * si) / den : 0.0;
+    *coh = sa > 0.0 ? sqrt(sr * sr + si * si) / sa : 0.0;
+    *delta_hz = (K >= 2 && (dr != 0.0 || di != 0.0)) ? atan2(di, dr) / (2.0 * ATK_PI * (double)s->L / s->fs) : 0.0;
+}
+
+int atkdsp_cyclic_scan_nbins(const atkdsp_cyclic_scan *s) { return s ? s->nbins : ATKDSP_E_ARG; }
+
+ptrdiff_t atkdsp_cyclic_scan_level(const atkdsp_cyclic_scan *s, float *level, size_t cap) {
+    if (!s || !level) return ATKDSP_E_ARG;
+    if (cap < (size_t)s->nbins) return ATKDSP_E_CAP;
+    for (int b = 0; b < s->nbins; ++b) {
+        double lv = 0.0, co, dh;
+        if (s->count) scan_bin(s, b, &lv, &co, &dh);
+        level[b] = (float)lv;
+    }
+    return s->nbins;
+}
+
+static int cmp_line_desc(const void *a, const void *b) {
+    const double x = ((const atkdsp_scan_line *)a)->level, y = ((const atkdsp_scan_line *)b)->level;
+    return (x < y) - (x > y);
+}
+
+ptrdiff_t atkdsp_cyclic_scan_read(const atkdsp_cyclic_scan *s, atkdsp_scan_line *out, size_t cap) {
+    if (!s || (!out && cap)) return ATKDSP_E_ARG;
+    if (s->count < s->K) return 0;
+    const int nb = s->nbins;
+    double *lv = (double *)malloc((size_t)nb * 3 * sizeof(double));
+    if (!lv) return ATKDSP_E_NOMEM;
+    double *co = lv + nb, *dh = lv + 2 * nb;
+    for (int b = 0; b < nb; ++b) scan_bin(s, b, &lv[b], &co[b], &dh[b]);
+    size_t n = 0;
+    for (int b = 0; b < nb; ++b) {
+        if (lv[b] < s->level_thr || co[b] < s->coh_thr) continue;
+        if (b > 0 && lv[b - 1] > lv[b]) continue;
+        if (b + 1 < nb && lv[b + 1] > lv[b]) continue;
+        if (n < cap) {
+            atkdsp_scan_line *l = &out[n];
+            memset(l, 0, sizeof *l);
+            l->bin = s->k_lo + b;
+            l->freq_hz = (double)(s->k_lo + b) * s->fs / (double)s->L + dh[b];
+            l->level = lv[b]; l->coherence = co[b]; l->level_thr = s->level_thr; l->coh_thr = s->coh_thr;
+            {
+                double l10 = -lv[b] / log(10.0) + log10((double)nb);
+                if (l10 > 0.0) l10 = 0.0;
+                l->log10_pfa = l10;
+            }
+            l->flags = ATKDSP_SCAN_LINE;
+            const int b2 = (int)floor(2.0 * l->freq_hz * s->L / s->fs + 0.5) - s->k_lo;
+            if (b2 >= 0 && b2 < nb && lv[b2] >= s->level_thr) l->flags |= ATKDSP_SCAN_HARMONIC;
+        }
+        n++;
+    }
+    free(lv);
+    const size_t m = n < cap ? n : cap;
+    if (m > 1) qsort(out, m, sizeof *out, cmp_line_desc);
+    return (ptrdiff_t)m;
+}
+
+int atkdsp_cyclic_scan_describe(const atkdsp_cyclic_scan *s, char *buf, size_t cap) {
+    if (!s || !buf || !cap) return ATKDSP_E_ARG;
+    static const char *nl[6] = {"|x|^2", "x^2", "x^4", "x^8", "|x - x[-1]|^2", "(f - f[-1])^2"};
+    int n = snprintf(buf, cap, "cyclic_scan: fs %.6g Hz, %s%s over %.6g..%.6g Hz (%d bins of %.4g Hz), "
+                     "segments of %d samples (%.4g s) x %d, Pfa %.3g over the scan (%.3g per bin) -> "
+                     "level >= %.2f and coherence >= %.3f; %llu segments in",
+                     s->fs, nl[s->nonlin], s->hard_limit && s->nonlin ? " (limited)" : "", s->f_lo, s->f_hi,
+                     s->nbins, s->fs / (double)s->L, s->L, (double)s->L / s->fs, s->K, s->pfa, s->pfa_each,
+                     s->level_thr, s->coh_thr, (unsigned long long)s->segments);
+    return n < 0 ? ATKDSP_E_ARG : (n >= (int)cap ? ATKDSP_E_CAP : n);
+}
+
+int atkdsp_cyclic_scan_stats(const atkdsp_cyclic_scan *s, atkdsp_cyclic_counters *st) {
+    if (!s || !st) return ATKDSP_E_ARG;
+    st->samples = s->samples; st->segments = s->segments; st->resets = s->resets;
+    st->segment_fill = (uint64_t)s->pos;
     return ATKDSP_OK;
 }

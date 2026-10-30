@@ -9714,3 +9714,1546 @@ def selcall_match(freqs, tol: float = 0.015, durations=None) -> tuple:
         if misses < best[2] or (misses == best[2] and dur_err < best[3]):
             best = (name, "".join(digits), misses, dur_err)
     return best[:3]
+
+
+# ============================================================================
+# §25-27 spread spectrum (twins of src/dsss_det.c, dsss_code.c, dsss_acq.c,
+# css.c, xspec.c; the known codes of dsss_codes.c). docs/ATKDSP_PLAN.md §B6,
+# §B6b, §B6c and docs/DSSS_LITERATURE.md are the specification.
+# ============================================================================
+from math import erfc as _erfc, sqrt as _sqrt
+
+
+def _norm_isf(p: float) -> float:
+    """z with P(N(0,1) > z) = p (Acklam's inverse-normal, good to ~1e-9)."""
+    if not 0.0 < p < 1.0:
+        return 0.0
+    q = 1.0 - p                                            # the lower tail
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if q < plow:
+        t = _sqrt(-2 * _m.log(q))
+        z = (((((c[0] * t + c[1]) * t + c[2]) * t + c[3]) * t + c[4]) * t + c[5]) / \
+            ((((d[0] * t + d[1]) * t + d[2]) * t + d[3]) * t + 1)
+    elif q <= phigh:
+        t = q - 0.5
+        r = t * t
+        z = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * t / \
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+    else:
+        t = _sqrt(-2 * _m.log(1 - q))
+        z = -(((((c[0] * t + c[1]) * t + c[2]) * t + c[3]) * t + c[4]) * t + c[5]) / \
+            ((((d[0] * t + d[1]) * t + d[2]) * t + d[3]) * t + 1)
+    return z
+
+
+def _log10_q(z: float) -> float:
+    """log10 P(N(0,1) > z)."""
+    if z <= 0.0:
+        return _m.log10(0.5 * _erfc(-z / _m.sqrt(2.0)))
+    # tail-safe: Q(z) = 0.5 erfc(z/sqrt2); for large z use the asymptotic log
+    from math import lgamma
+    x = z * z * 0.5
+    # ln Q(1/2, x) via a continued fraction is overkill here; erfc underflows
+    # past ~37, so fall back to the asymptotic ln Q(z) = -z^2/2 - ln(z sqrt(2 pi))
+    val = 0.5 * _erfc(z / _m.sqrt(2.0))
+    if val > 0.0:
+        return _m.log10(val)
+    lnq = -0.5 * z * z - _m.log(z * _m.sqrt(2.0 * _m.pi))
+    return lnq / _m.log(10.0)
+
+
+# ---- the method provenance table (indices match atkdsp.h) -------------------
+METHOD_NONE = 0
+(METHOD_BUREL_FLUCT, METHOD_CAV, METHOD_CYCLE_MAX, METHOD_EIGEN_WIDE, METHOD_RAO_EDELMAN,
+ METHOD_CFO_EIGEN, METHOD_VOTE, METHOD_VOTE_MARGIN, METHOD_BM, METHOD_PARITY_COUNT,
+ METHOD_PCPS, METHOD_MBAPDI, METHOD_DOPPLER_GRID, METHOD_M2M4, METHOD_NWPR, METHOD_PD_MONITOR,
+ METHOD_FUSION, METHOD_ACF_CHIP, METHOD_QPSK_SPLIT, METHOD_MSC, METHOD_PHASE_REF,
+ METHOD_LATTICE, METHOD_DECHIRP) = range(1, 24)
+METHOD_COUNT = 24
+
+_METHODS = {
+    METHOD_BUREL_FLUCT: ("fluctuation-of-correlation detector", "G. Burel", "2000", "FR"),
+    METHOD_CAV: ("covariance absolute-value test (CAV)", "Y. Zeng, Y.-C. Liang", "2008", "SG"),
+    METHOD_CYCLE_MAX: ("cyclostationarity test, max over a scan", "Lunden et al.", "2007", "FI/US"),
+    METHOD_EIGEN_WIDE: ("wide-window eigenvector", "Burel, Bouder; Tongxin Xuebao", "2000/2012", "FR / CN"),
+    METHOD_RAO_EDELMAN: ("eigenvalue identifiability rule", "Rao, Edelman", "2007", "US"),
+    METHOD_CFO_EIGEN: ("carrier offset on the eigenvector", "Le Nir, Scheers", "2015", "BE"),
+    METHOD_VOTE: ("alternating sign-despread / k-means", "Ye et al.", "2021", "CN"),
+    METHOD_VOTE_MARGIN: ("per-chip vote margin", "ATK", "2026", "ATK"),
+    METHOD_BM: ("Berlekamp-Massey with the LC profile", "Berlekamp, Massey", "1968/69", "US"),
+    METHOD_PARITY_COUNT: ("parity-check counting", "Mitton; Cluzeau; Meier-Staffelbach", "2004/07/89", "FR / CH"),
+    METHOD_PCPS: ("parallel code-phase search", "GNSS-SDR; Borre et al.", "2007/2015", "ES / DK"),
+    METHOD_MBAPDI: ("best-bit-pattern post-detection integration", "Gomez-Casco et al.", "2018", "ES"),
+    METHOD_DOPPLER_GRID: ("Doppler bin width rule", "Geiger, Vogel", "2011/2014", "DE"),
+    METHOD_M2M4: ("M2M4 moments C/N0", "Pauluzzi, Beaulieu", "2000", "CA"),
+    METHOD_NWPR: ("narrowband-wideband power ratio C/N0", "Van Dierendonck", "1992/96", "US"),
+    METHOD_PD_MONITOR: ("power-distortion correlation-peak monitor", "Wesson, Gross, Humphreys, Evans", "2017/18", "US"),
+    METHOD_FUSION: ("three-handle fusion", "ATK", "2026", "ATK"),
+    METHOD_ACF_CHIP: ("chip length from the ACF triangle", "ATK (textbook)", "2026", "ATK"),
+    METHOD_QPSK_SPLIT: ("quadrature split of QPSK chips", "ATK (after MDPI Information 2023)", "2026", "ATK"),
+    METHOD_MSC: ("magnitude-squared coherence test", "classic (Carter 1987)", "1987", "US"),
+    METHOD_PHASE_REF: ("phase referencing on a calibrator", "radio astronomy (VLBI)", "—", "—"),
+    METHOD_LATTICE: ("consistency lattice and common-oscillator test", "ATK", "2026", "ATK"),
+    METHOD_DECHIRP: ("dechirp detection of chirp spread spectrum", "Semtech; open descriptions", "2013/2017", "US/CH"),
+}
+
+
+def method(method_id: int):
+    """(name, authors, year, country) for a method id, or None — the twin of
+    atkdsp_method(); the country is what Bill groups the UI menu by."""
+    return _METHODS.get(int(method_id))
+
+
+# ---- 25a. the blind detector (twin of src/dsss_det.c) -----------------------
+DSSS_H_FLUCT, DSSS_H_CAV, DSSS_H_ACF = 1, 2, 4
+DSSS_FLUCT, DSSS_CAV, DSSS_PERIOD, DSSS_WARMUP, DSSS_ACF, DSSS_DETECT = 1, 2, 4, 8, 16, 32
+
+
+def dsss_det_defaults(fs: float, win: int, max_lag: int) -> dict:
+    return dict(fs=float(fs), win=int(win), max_lag=int(max_lag), nwin_min=16, handles=0,
+                pfa=1e-3, cav_lags=8, min_peaks=3, period_min=4)
+
+
+def cav_threshold(lags: int, ns: float, pfa: float) -> float:
+    """The CAV threshold for L lags over ns samples (complex white noise)."""
+    if lags < 2 or not ns > 1.0 or not 0.0 < pfa < 0.5:
+        return 0.0
+    z = _norm_isf(pfa)
+    s = _sqrt(ns)
+    den = 1.0 - z / s
+    if den <= 0.0:
+        return float("inf")
+    return (1.0 + (lags - 1) * 0.886226925452758 / s) / den
+
+
+class DsssDet:
+    """Twin of atkdsp_dsss_det (atkdsp.h §25): Burel's fluctuation detector,
+    the CAV covariance test and the ACF chip estimate, fused. cfg: a dict from
+    dsss_det_defaults()."""
+
+    def __init__(self, cfg: dict):
+        c = dict(cfg)
+        self.fs = float(c["fs"]); self.win = int(c["win"]); self.max_lag = int(c["max_lag"])
+        self.nwin_min = int(c.get("nwin_min", 16)); self.pfa = float(c.get("pfa", 1e-3))
+        self.cav_lags = int(c.get("cav_lags", 8)); self.min_peaks = int(c.get("min_peaks", 3))
+        self.period_min = int(c.get("period_min", 4))
+        self.handles = int(c.get("handles", 0)) or (DSSS_H_FLUCT | DSSS_H_CAV | DSSS_H_ACF)
+        if not self.fs > 0 or not 16 <= self.win <= (1 << 22):
+            raise ValueError("dsss_det: fs > 0 and win 16..4M")
+        if not 2 <= self.max_lag <= self.win // 2:
+            raise ValueError("dsss_det: max_lag 2..win/2")
+        if not 0.0 < self.pfa < 0.5 or not 2 <= self.cav_lags <= min(64, self.max_lag):
+            raise ValueError("dsss_det: pfa and cav_lags")
+        if not 1 <= self.period_min <= self.max_lag:
+            raise ValueError("dsss_det: period_min")
+        self.reset()
+
+    def reset(self):
+        self._buf = np.zeros(self.win, np.complex128)
+        self._fill = 0
+        self._nw = 0
+        self._rho = np.zeros(self.max_lag + 1)
+        self._r = np.zeros(self.max_lag + 1, np.complex128)
+        self.samples = 0
+
+    def _window(self):
+        T, ML = self.win, self.max_lag
+        y = self._buf
+        X = np.fft.fft(y, n=self._nfft())
+        ac = np.fft.ifft(np.abs(X) ** 2)                   # sum_t y(t) conj y(t-tau): ac[tau]
+        self._nw += 1
+        taus = np.arange(ML + 1)
+        norm = 1.0 / (T - taus)
+        # ac[tau] = sum y(t) conj y(t-tau); conj to match sum y(t) conj y(t+tau)
+        # rho_m = |r_m|^2 / (T - tau) (norm^1, a flat floor for white noise — the
+        # header); r (for CAV and the ACF) is the autocorrelation estimate (norm^1).
+        r = np.conj(ac[: ML + 1]) * norm
+        rm = (np.abs(ac[: ML + 1]) ** 2) * norm
+        self._rho += (rm - self._rho) / self._nw
+        self._r += (r - self._r) / self._nw
+
+    def _nfft(self):
+        n = 1
+        while n < self.win + self.max_lag:
+            n <<= 1
+        return n
+
+    def process(self, x):
+        x = np.asarray(x, np.complex128).ravel()
+        i = 0
+        while i < x.size:
+            take = min(self.win - self._fill, x.size - i)
+            self._buf[self._fill:self._fill + take] = x[i:i + take]
+            self._fill += take; i += take
+            if self._fill == self.win:
+                self._window(); self._fill = 0
+        self.samples += x.size
+
+    def rho(self):
+        return self._rho.copy()
+
+    def read(self) -> dict:
+        ML, PM = self.max_lag, self.period_min
+        out = dict(period=0.0, period_s=0.0, peak_z=0.0, peak_ratio=0.0, floor_mean=0.0, floor_std=0.0,
+                   fluct_log10_pfa=0.0, cav_t=0.0, cav_thr=0.0, cav_log10_pfa=0.0, tc_acf=0.0, ps_acf=0.0,
+                   llr=0.0, npeaks=0, nwin=self._nw, best_lag=0, flags=0,
+                   method=[METHOD_BUREL_FLUCT, METHOD_CAV, METHOD_ACF_CHIP, METHOD_FUSION])
+        if self._nw < self.nwin_min or self._nw < 2:
+            out["flags"] |= DSSS_WARMUP
+            return out
+        llr = 0.0
+        if self.handles & DSSS_H_FLUCT:
+            # rho ~ Gamma(nwin); 2 nwin rho/E ~ chi^2(2 nwin). The threshold is
+            # that chi-square tail, not a Gaussian (at nwin ~ 16 the Gamma tail
+            # is far heavier). E is the mean over lags (sparse peaks shift it a
+            # few percent, slightly conservative); median/MAD are display only.
+            seg = self._rho[PM:ML + 1]
+            nl = ML - PM + 1
+            nw = float(self._nw)
+            mean = float(np.mean(seg)) or 1e-300
+            med = float(np.median(seg))
+            mad = float(np.median(np.abs(seg - med)))
+            out["floor_mean"], out["floor_std"] = med, 1.4826 * mad
+            thr_ratio = self._chi2_ratio(nw, self.pfa / nl)
+            best = PM + int(np.argmax(seg))
+            out["best_lag"] = best
+            out["peak_ratio"] = float(self._rho[best] / mean)
+            out["peak_z"] = float((self._rho[best] - med) / out["floor_std"]) if out["floor_std"] > 0 else 0.0
+            out["fluct_log10_pfa"] = min(0.0, _logq_chi2(nw, nw * self._rho[best] / mean) / _m.log(10.0) + _m.log10(nl))
+            if self._rho[best] / mean > thr_ratio:
+                out["flags"] |= DSSS_FLUCT | DSSS_DETECT
+                llr += -out["fluct_log10_pfa"] * _m.log(10.0)
+                self._period(out, mean, thr_ratio * mean)
+        if self.handles & DSSS_H_CAV:
+            L = self.cav_lags
+            ns = self._nw * self.win
+            r0 = abs(self._r[0])
+            t1 = r0 + sum(2.0 * (L - l) / L * abs(self._r[l]) for l in range(1, L))
+            stat = t1 / r0 if r0 > 0 else 0.0
+            out["cav_t"] = stat
+            out["cav_thr"] = cav_threshold(L, ns, self.pfa)
+            zc = (stat - 1.0 - (L - 1) * 0.886226925452758 / _sqrt(ns)) * _sqrt(ns)
+            out["cav_log10_pfa"] = min(0.0, _log10_q(zc))
+            if stat > out["cav_thr"]:
+                out["flags"] |= DSSS_CAV | DSSS_DETECT
+                llr += -out["cav_log10_pfa"] * _m.log(10.0)
+        if self.handles & DSSS_H_ACF:
+            self._acf(out)
+        out["llr"] = llr
+        return out
+
+    @staticmethod
+    def _chi2_ratio(nw, pfa):
+        """r with P(chi^2(2 nw) > 2 nw r) = pfa, i.e. Q(nw, nw r) = pfa."""
+        target = _m.log(pfa)
+        lo, hi = 1.0, 50.0
+        while _logq_chi2(nw, nw * hi) > target and hi < 1e6:
+            hi *= 2.0
+        for _ in range(80):
+            m = 0.5 * (lo + hi)
+            if _logq_chi2(nw, nw * m) > target:
+                lo = m
+            else:
+                hi = m
+        return 0.5 * (lo + hi)
+
+    def _period(self, out, mean, strong):
+        ML, PM = self.max_lag, self.period_min
+        rho = self._rho
+        # interior local maxima only (a strict peak on both sides): this skips
+        # the central chip-autocorrelation lobe, which only descends. The
+        # fundamental is gauged against the strongest such peak, not the lobe.
+        lo = PM if PM >= 1 else 1
+        rref = 0.0
+        for tau in range(lo, ML):
+            if rho[tau] > rho[tau - 1] and rho[tau] > rho[tau + 1] and rho[tau] > rref:
+                rref = rho[tau]
+        if rref <= strong:
+            return
+        rfund = 0.5 * rref
+        tried = 0
+        for tau in range(lo, ML):
+            if tried >= 8:
+                break
+            if rho[tau] < strong or rho[tau] < rfund:
+                continue
+            if not (rho[tau] > rho[tau - 1] and rho[tau] > rho[tau + 1]):
+                continue
+            tried += 1
+            t1 = _parab(rho, tau) if 0 < tau < ML else float(tau)
+            K = ML // tau
+            npk, sk2, skt = 1, 1.0, t1
+            for k in range(2, K + 1):
+                centre = int(_m.floor(t1 * k + 0.5))
+                tol = int(_m.floor(0.005 * t1 * k)) + 1
+                cand = [u for u in range(centre - tol, centre + tol + 1)
+                        if PM <= u <= ML and rho[u] > strong]
+                if not cand:
+                    continue
+                found = max(cand, key=lambda u: rho[u])
+                tk = _parab(rho, found) if 0 < found < ML else float(found)
+                npk += 1; sk2 += k * k; skt += k * tk
+            need = min(self.min_peaks, K)
+            if npk >= need and npk >= 1:
+                out["period"] = skt / sk2
+                out["period_s"] = out["period"] / self.fs
+                out["npeaks"] = npk
+                if npk >= 2 or need == 1:
+                    out["flags"] |= DSSS_PERIOD
+                break
+
+    def _acf(self, out):
+        ML = self.max_lag
+        kmax = min(ML, 64)
+        a = np.abs(self._r[1:kmax + 1])
+        k = 0
+        for tau in range(1, kmax + 1):
+            if tau >= 2 and a[tau - 1] >= a[tau - 2]:
+                break
+            k = tau
+            if a[tau - 1] < 0.1 * a[0]:
+                break
+        if k >= 3:
+            x = np.arange(1, k + 1, dtype=float)
+            yv = a[:k]
+            n = float(k)
+            slope = (n * np.sum(x * yv) - x.sum() * yv.sum()) / (n * np.sum(x * x) - x.sum() ** 2)
+            icpt = (yv.sum() - slope * x.sum()) / n
+            ssr = float(np.sum(yv ** 2) - yv.sum() ** 2 / n)
+            sse = float(np.sum((yv - (icpt + slope * x)) ** 2))
+            r2 = 1.0 - sse / ssr if ssr > 0 else 0.0
+            if slope < 0 and icpt > 0 and r2 >= 0.95:
+                out["tc_acf"] = -icpt / slope
+                out["ps_acf"] = icpt
+                out["flags"] |= DSSS_ACF
+
+    def describe(self) -> str:
+        return ("dsss_det: fs %.0f Hz, windows of %d samples (%.4g s), lags %d..%d, verdict after %d "
+                "windows, Pfa %g per handle; %d windows in" %
+                (self.fs, self.win, self.win / self.fs, self.period_min, self.max_lag, self.nwin_min,
+                 self.pfa, self._nw))
+
+    def stats(self) -> dict:
+        return dict(samples=self.samples, windows=self._nw, resets=0, window_fill=self._fill)
+
+
+def _parab(v, i) -> float:
+    a, b, c = v[i - 1], v[i], v[i + 1]
+    d = a - 2 * b + c
+    if not d < 0:
+        return float(i)
+    off = 0.5 * (a - c) / d
+    return float(i) + max(-0.5, min(0.5, off))
+
+
+# ---- 25b. the chip-rate scan (twin of atkdsp_cyclic_scan) --------------------
+SCAN_LINE, SCAN_HARMONIC, SCAN_WARMUP = 1, 2, 4
+
+
+class CyclicScan:
+    """Twin of atkdsp_cyclic_scan (atkdsp.h §25): every line in [f_lo, f_hi)
+    after a nonlinearity, with a Pfa stated over the whole scan."""
+
+    def __init__(self, fs: float, nonlin: int, hard_limit: int, seg_len: int, nseg: int,
+                 f_lo: float, f_hi: float, pfa: float):
+        fs = float(fs)
+        if not fs > 0 or not 0 <= nonlin <= 5:
+            raise ValueError("cyclic_scan: fs and nonlin")
+        if not 64 <= seg_len <= CYC_SEG_MAX or not 16 <= nseg <= CYC_NSEG_MAX:
+            raise ValueError("cyclic_scan: seg_len 64..65536, nseg 16..4096")
+        if not 0 <= f_lo < f_hi <= 0.5 * fs or not 0 < pfa < 0.5:
+            raise ValueError("cyclic_scan: band and pfa")
+        self.fs, self.nonlin, self.hard_limit = fs, int(nonlin), int(hard_limit)
+        self.L, self.K, self.pfa = int(seg_len), int(nseg), float(pfa)
+        self.f_lo, self.f_hi = float(f_lo), float(f_hi)
+        self.k_lo = int(_m.ceil(f_lo * seg_len / fs))
+        self.k_hi = int(_m.floor(f_hi * seg_len / fs))
+        if self.k_hi <= self.k_lo:
+            raise ValueError("cyclic_scan: empty band")
+        self.nbins = self.k_hi - self.k_lo
+        self.pfa_each = pfa / self.nbins
+        self.level_thr, self.coh_thr = cyclic_thresholds(nseg, self.pfa_each)
+        if self.coh_thr > 1.0:
+            raise ValueError("cyclic_scan: coherence test cannot be met; raise nseg")
+        self.w = hann_periodic(seg_len)
+        self.wsum2 = float(np.sum(self.w ** 2))
+        self.reset()
+
+    def reset(self):
+        self._seg = np.zeros(self.L + 2, np.complex128)
+        self._pos = 0; self._have = 0
+        self._p = []            # list of per-segment phasor arrays (nbins)
+        self._e = []
+        self.samples = 0; self.segments = 0
+
+    def _finish(self):
+        cand = (1.0, self.nonlin, self.hard_limit)
+        prev = [self._seg[0], self._seg[1]][2 - self._have:] if self._have else []
+        v = _nonlin(self._seg[2:2 + self.L], list(prev), self.nonlin, self.hard_limit)
+        v = v - v.mean()
+        e = float(np.sum(np.abs(v) ** 2))
+        X = np.fft.fft(self.w * v)
+        self._p.append(X[self.k_lo:self.k_hi].copy())
+        self._e.append(e)
+        if len(self._p) > self.K:
+            del self._p[0]; del self._e[0]
+        self._seg[0] = self._seg[self.L]; self._seg[1] = self._seg[self.L + 1]
+        self._have = min(2, self._have + 2)
+        self._pos = 0; self.segments += 1
+
+    def process(self, x):
+        x = np.asarray(x, np.complex128).ravel()
+        i = 0
+        while i < x.size:
+            take = min(self.L - self._pos, x.size - i)
+            self._seg[2 + self._pos:2 + self._pos + take] = x[i:i + take]
+            self._pos += take; i += take
+            if self._pos == self.L:
+                self._finish()
+        self.samples += x.size
+
+    def _bins(self):
+        K = len(self._p)
+        p = np.array(self._p)                # K x nbins
+        s = p.sum(0)
+        sa = np.abs(p).sum(0)
+        se = float(np.sum(self._e))
+        den = se * (self.wsum2 / self.L)
+        level = (np.abs(s) ** 2 / den) if den > 0 else np.zeros(self.nbins)
+        coh = np.where(sa > 0, np.abs(s) / np.where(sa > 0, sa, 1.0), 0.0)
+        if K >= 2:
+            d = np.sum(p[1:] * np.conj(p[:-1]), 0)
+            dphi = np.arctan2(d.imag, d.real)
+            delta = dphi / (2.0 * np.pi * self.L / self.fs)
+        else:
+            delta = np.zeros(self.nbins)
+        return level, coh, delta
+
+    def nbins(self):
+        return self.nbins
+
+    def level(self):
+        if not self._p:
+            return np.zeros(self.nbins)
+        return self._bins()[0]
+
+    def read(self, cap: int = 64) -> list:
+        if len(self._p) < self.K:
+            return []
+        level, coh, delta = self._bins()
+        lines = []
+        for b in range(self.nbins):
+            if level[b] < self.level_thr or coh[b] < self.coh_thr:
+                continue
+            if b > 0 and level[b - 1] > level[b]:
+                continue
+            if b + 1 < self.nbins and level[b + 1] > level[b]:
+                continue
+            freq = (self.k_lo + b) * self.fs / self.L + delta[b]
+            flags = SCAN_LINE
+            b2 = int(_m.floor(2.0 * freq * self.L / self.fs + 0.5)) - self.k_lo
+            if 0 <= b2 < self.nbins and level[b2] >= self.level_thr:
+                flags |= SCAN_HARMONIC
+            lines.append(dict(freq_hz=freq, level=float(level[b]), coherence=float(coh[b]),
+                              level_thr=self.level_thr, coh_thr=self.coh_thr,
+                              log10_pfa=min(0.0, -float(level[b]) / _m.log(10.0) + _m.log10(self.nbins)),
+                              bin=self.k_lo + b, flags=flags))
+        lines.sort(key=lambda d: -d["level"])
+        return lines[:cap]
+
+    def describe(self) -> str:
+        return ("cyclic_scan: fs %.6g Hz, %s over %.6g..%.6g Hz (%d bins), segments of %d x %d, "
+                "Pfa %.3g over the scan -> level >= %.2f and coherence >= %.3f; %d segments in" %
+                (self.fs, NL_NAMES[self.nonlin], self.f_lo, self.f_hi, self.nbins, self.L, self.K,
+                 self.pfa, self.level_thr, self.coh_thr, self.segments))
+
+    def stats(self) -> dict:
+        return dict(samples=self.samples, segments=self.segments, resets=0, segment_fill=self._pos)
+
+
+# ---- 25c. known codes, primitive polynomials, the parity statistic ----------
+_G2_TAPS = [(2, 6), (3, 7), (4, 8), (5, 9), (1, 9), (2, 10), (1, 8), (2, 9), (3, 10), (2, 3),
+            (3, 4), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10), (1, 4), (2, 5), (3, 6), (4, 7),
+            (5, 8), (6, 9), (1, 3), (4, 6), (5, 7), (6, 8), (7, 9), (8, 10), (1, 6), (2, 7),
+            (3, 8), (4, 9), (5, 10), (4, 10), (1, 7), (2, 8), (4, 10)]
+_SBAS_DELAY = [145, 175, 52, 21, 237, 235, 886, 657, 634, 762, 355, 1012, 176, 603, 130, 359, 595, 68, 386]
+
+
+def gps_ca(prn: int) -> np.ndarray:
+    """1023 chips of +-1 for a GPS L1 C/A PRN (1..32, or WAAS/EGNOS 120..138).
+    Twin of atkdsp_gps_ca; chip = 1 - 2 bit (bit 0 -> +1)."""
+    g1 = [1] * 10
+    g2 = [1] * 10
+    delay = -1
+    if 1 <= prn <= 37:
+        t1, t2 = _G2_TAPS[prn - 1]
+    elif 120 <= prn <= 138:
+        t1 = t2 = 0; delay = _SBAS_DELAY[prn - 120]
+    else:
+        raise ValueError("gps_ca: PRN 1..37 or 120..138")
+    g2seq = None
+    if delay >= 0:
+        r = [1] * 10; g2seq = []
+        for _ in range(1023):
+            g2seq.append(r[9])
+            fb = r[1] ^ r[2] ^ r[5] ^ r[7] ^ r[8] ^ r[9]
+            r = [fb] + r[:9]
+    out = np.empty(1023, np.int8)
+    for n in range(1023):
+        g1o = g1[9]
+        g2o = g2seq[(n - delay) % 1023] if delay >= 0 else g2[t1 - 1] ^ g2[t2 - 1]
+        out[n] = -1 if (g1o ^ g2o) else 1
+        f1 = g1[2] ^ g1[9]
+        f2 = g2[1] ^ g2[2] ^ g2[5] ^ g2[7] ^ g2[8] ^ g2[9]
+        g1 = [f1] + g1[:9]; g2 = [f2] + g2[:9]
+    return out
+
+
+_BARKER = {7: [1, 1, 1, -1, -1, 1, -1], 11: [1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1],
+           13: [1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1]}
+
+
+def barker(length: int) -> np.ndarray:
+    if length not in _BARKER:
+        raise ValueError("barker: 7, 11 or 13")
+    return np.array(_BARKER[length], np.int8)
+
+
+_IEEE = [0x744AC39B, 0x44AC39B7, 0x4AC39B74, 0xAC39B744, 0xC39B744A, 0x39B744AC, 0x9B744AC3, 0xB744AC39,
+         0xDEE06931, 0xEE06931D, 0xE06931DE, 0x06931DEE, 0x6931DEE0, 0x931DEE06, 0x31DEE069, 0x1DEE0693]
+
+
+def ieee802154_chips(symbol: int) -> np.ndarray:
+    if not 0 <= symbol <= 15:
+        raise ValueError("ieee802154_chips: symbol 0..15")
+    v = _IEEE[symbol]
+    return np.array([1 if (v >> i) & 1 else -1 for i in range(32)], np.int8)
+
+
+def _pmulmod(a, b, f, r):
+    res = 0
+    for i in range(r):
+        if (b >> i) & 1:
+            res ^= a
+        a <<= 1
+        if (a >> r) & 1:
+            a ^= f
+    return res
+
+
+def _ppowmod(base, e, f, r):
+    res = 1
+    while e:
+        if e & 1:
+            res = _pmulmod(res, base, f, r)
+        base = _pmulmod(base, base, f, r)
+        e >>= 1
+    return res
+
+
+def _is_primitive(f, r):
+    order = (1 << r) - 1
+    if _ppowmod(2, order, f, r) != 1:
+        return False
+    m = order
+    q = 2
+    while q * q <= m:
+        if m % q == 0:
+            while m % q == 0:
+                m //= q
+            if _ppowmod(2, order // q, f, r) == 1:
+                return False
+        q += 1
+    if m > 1 and _ppowmod(2, order // m, f, r) == 1:
+        return False
+    return True
+
+
+def primitive_polys(degree: int) -> list:
+    """Every primitive polynomial of a degree (2..16), as masks, in ascending
+    order — twin of atkdsp_primitive_polys."""
+    if not 2 <= degree <= 16:
+        raise ValueError("primitive_polys: degree 2..16")
+    hi = 1 << degree
+    return [f for f in range(hi | 1, hi << 1, 2) if bin(f).count("1") & 1 and _is_primitive(f, degree)]
+
+
+def parity_z(chips, poly: int, degree: int) -> float:
+    """Z = sum (-1)^parity over the cyclic positions — twin of atkdsp_parity_z."""
+    chips = np.asarray(chips, np.int8)
+    L = chips.size
+    taps = [i for i in range(degree + 1) if (poly >> i) & 1]
+    bits = (chips < 0).astype(int)
+    z = 0.0
+    for n in range(L):
+        par = 0
+        for t in taps:
+            par ^= bits[(n + t) % L]
+        z += -1.0 if par else 1.0
+    return z
+
+
+# ---- 25d. the spreading code (twin of src/dsss_code.c) ----------------------
+CHIP_BPSK, CHIP_QPSK, CHIP_OQPSK = 0, 1, 2
+CODE_IDENTIFIABLE, CODE_CFO, CODE_POLY, CODE_NAMED, CODE_Q, CODE_REFUSED = 1, 2, 4, 8, 16, 32
+POLY_NONE, POLY_BM, POLY_PARITY = 0, 1, 2
+
+
+def dsss_code_defaults(fs: float, rc: float, period_s: float) -> dict:
+    return dict(fs=float(fs), rc=float(rc), period_s=float(period_s), chip_mod=CHIP_BPSK,
+                vote_passes=6, poly_max_degree=14, no_cfo=0, pfa=1e-3)
+
+
+def _power_iter(windows, v0, deflate=None, iters=60):
+    """Principal eigenvector by iteration on the data windows (M x W complex)."""
+    v = v0 / (np.linalg.norm(v0) or 1.0)
+    lam = 0.0
+    for _ in range(iters):
+        # u = (1/M) sum_m y_m (y_m^H v)
+        u = (windows.T @ (windows.conj() @ v)) / len(windows)
+        if deflate is not None:
+            u = u - deflate * (deflate.conj() @ u)
+        nrm = np.linalg.norm(u)
+        if nrm <= 0:
+            return v, 0.0
+        newlam = nrm
+        v = u / nrm
+        if abs(newlam - lam) <= 1e-7 * newlam:
+            lam = newlam
+            break
+        lam = newlam
+    return v, lam
+
+
+def _support_start(v, N):
+    p = np.abs(v) ** 2
+    cs = np.concatenate([[0.0], np.cumsum(p)])
+    best, kb = -1.0, 0
+    for k in range(len(v) - N + 1):
+        e = cs[k + N] - cs[k]
+        if e > best:
+            best, kb = e, k
+    return kb
+
+
+def _kay_freq(q):
+    N = q.size
+    if N < 3:
+        return 0.0
+    i = np.arange(N - 1)
+    prod = q[1:] * np.conj(q[:-1])
+    t = i - (N / 2.0 - 1.0)
+    w = 1.5 * N / (N * N - 1.0) * (1.0 - (t / (N / 2.0)) ** 2)
+    return float(np.sum(w * np.arctan2(prod.imag, prod.real))) / (2.0 * np.pi)
+
+
+def dsss_code(iq, cfg: dict) -> tuple:
+    """(chips, result) — twin of atkdsp_dsss_code. chips is int8 L (or 2L for
+    QPSK); result a dict. Empty chips with CODE_REFUSED when not identifiable."""
+    c = dict(cfg)
+    iq = np.asarray(iq, np.complex128).ravel()
+    fs, rc, ps = float(c["fs"]), float(c["rc"]), float(c["period_s"])
+    chip_mod = int(c.get("chip_mod", CHIP_BPSK))
+    vote_passes = int(c.get("vote_passes", 6))
+    poly_max = int(c.get("poly_max_degree", 14))
+    pfa = float(c.get("pfa", 1e-3))
+    res = dict(L=0, nperiods=0, periods_needed=0, start=0, cfo_hz=0.0, lambda1=0.0, lambda2=0.0,
+               noise_var=0.0, ident_margin=0.0, snr_db=0.0, vote_min=0.0, vote_mean=0.0,
+               poly_method=POLY_NONE, poly_degree=0, poly=0, poly_z=0.0, lc=0, lc_plateau=0,
+               flags=0, method=[], name="")
+    Nd = ps * fs
+    N = int(_m.floor(Nd + 0.5))
+    if N < 2 or abs(Nd - N) > 0.02:
+        raise ValueError("dsss_code: period x fs not an integer")
+    sps = fs / rc
+    L = int(_m.floor(N / sps + 0.5))
+    two = chip_mod != CHIP_BPSK
+    res["L"] = L
+    res["method"] = [METHOD_EIGEN_WIDE, METHOD_RAO_EDELMAN]
+    if iq.size < 4 * N:
+        raise ValueError("dsss_code: need >= 4 periods")
+
+    W = 2 * N
+    off, t0 = 0, 0
+    lam1 = lam2 = trace = 0.0
+    M = 0
+    for attempt in range(2):
+        M = (iq.size - off) // N - 1
+        if M < 3:
+            raise ValueError("dsss_code: need >= 3 windows")
+        wins = np.lib.stride_tricks.sliding_window_view(iq[off:off + (M + 1) * N], W)[::N][:M]
+        v1, lam1 = _power_iter(wins, iq[off:off + W].copy())
+        d2 = iq[off + N:off + N + W].copy()
+        d2 = d2 - v1 * (v1.conj() @ d2)
+        v2, lam2 = _power_iter(wins, d2, deflate=v1)
+        trace = float(np.mean(np.sum(np.abs(wins) ** 2, 1)))
+        t0 = _support_start(v1, N)
+        if attempt == 0 and lam2 > 0.7 * lam1:
+            t1 = _support_start(v2, N)
+            if abs(t1 - t0) > 0.5 * N:
+                off = N // 2
+                continue
+        break
+    sig2 = max((trace - lam1 - lam2) / (W - 2.0), 1e-30)
+    edge = sig2 * (1.0 + _sqrt(W / M)) ** 2
+    res.update(lambda1=lam1, lambda2=lam2, noise_var=sig2, ident_margin=lam1 / edge,
+               nperiods=M, start=off + t0)
+    ps_n = lam1 - edge
+    res["periods_needed"] = int(_m.ceil(W * (sig2 / ps_n) ** 2 * 1.5)) if ps_n > 0 else -1
+    res["snr_db"] = 10.0 * _m.log10(max(lam1 - sig2, 1e-30) / N * sps / sig2)
+    if res["ident_margin"] < 1.15:
+        res["flags"] |= CODE_REFUSED
+        res["name"] = "not identifiable (margin %.2f)" % res["ident_margin"]
+        return np.zeros(0, np.int8), res
+    res["flags"] |= CODE_IDENTIFIABLE
+
+    a0 = off + t0
+    Mp = (iq.size - a0) // N
+    if Mp < 3:
+        raise ValueError("dsss_code: too few aligned periods")
+    xd = iq[a0:a0 + Mp * N].reshape(Mp, N).copy()
+    P = 4 if two else 2
+    inst = np.minimum((np.arange(L) * sps + 0.5 * sps).astype(int), N - 1)
+    qpos = (np.arange(L) + 0.5) * sps + (0.5 * sps if chip_mod == CHIP_OQPSK else 0.0)
+    instq = np.mod(qpos.astype(int), N)
+    alpha = 0.0
+    nm = res["method"]
+    for pass_ in range(2):
+        q = np.sum(xd ** P, 0)
+        if pass_ == 0 and not c.get("no_cfo", 0):
+            alpha = _kay_freq(q) / P
+            if abs(alpha) > 1e-12:
+                idx = np.arange(Mp * N).reshape(Mp, N)
+                xd = xd * np.exp(-2j * np.pi * alpha * idx)
+                res["flags"] |= CODE_CFO
+                res["cfo_hz"] = alpha * fs
+                nm.append(METHOD_CFO_EIGEN)
+            continue
+        sr = np.sum(q[inst])
+        theta = _m.atan2(sr.imag, sr.real)
+        if two:
+            theta -= np.pi
+        theta /= P
+        xd = xd * np.exp(-1j * theta)
+        break
+
+    nm += [METHOD_VOTE, METHOD_VOTE_MARGIN]
+    if two:
+        nm.append(METHOD_QPSK_SPLIT)
+    chips = np.zeros(L * (2 if two else 1), np.int8)
+    vmin, vsum = float("inf"), 0.0
+    for branch in range(2 if two else 1):
+        yr = xd.imag if branch else xd.real
+        cc = yr[0].copy()
+        cc /= np.linalg.norm(cc) or 1.0
+        for _ in range(30):
+            u = (yr.T @ (yr @ cc))
+            nrm = np.linalg.norm(u)
+            if nrm <= 0:
+                break
+            cc = u / nrm
+        a = np.zeros(Mp, np.int8)
+        for _ in range(max(vote_passes, 1)):
+            s = yr @ cc
+            a = np.where(s >= 0, 1, -1).astype(np.int8)
+            cc = (a[:, None] * yr).sum(0) / Mp
+        resid = float(np.mean((yr - a[:, None] * cc) ** 2))
+        sd = _sqrt(resid / Mp)
+        pts = instq if branch else inst
+        for k in range(L):
+            ck = cc[pts[k]]
+            chips[branch * L + k] = 1 if ck >= 0 else -1
+            z = abs(ck) / sd if sd > 0 else float("inf")
+            vmin = min(vmin, z); vsum += z
+    res["vote_min"], res["vote_mean"] = vmin, vsum / (L * (2 if two else 1))
+    if two:
+        res["flags"] |= CODE_Q
+
+    # ---- 5. the generator and the name ----
+    res["name"] = "%d chips, generator not confirmed" % L
+    if L in (7, 11, 13) and _barker_match(chips[:L], L):
+        res["name"] = "Barker-%d" % L
+        res["flags"] |= CODE_NAMED
+    bits = (chips[:L] < 0).astype(np.uint8)
+    lc, poly = bm(bits)
+    prof = bm_profile(bits)
+    res["lc"] = int(lc)
+    plateau = 0
+    i = L - 1
+    while i >= 0 and prof[i] == lc:
+        plateau += 1; i -= 1
+    res["lc_plateau"] = plateau
+    nm.append(METHOD_BM)
+    r = _pow2m1(L)
+    # The code is recovered up to a global sign; (chips < 0) on -code is the
+    # m-sequence's complement, whose linear complexity is r + 1 and whose parity
+    # checks fail. So the naming tries BOTH sign conventions and keeps the clean
+    # one. bits0 = (chips<0); bits1 its complement.
+    bits1 = (1 - bits).astype(np.uint8)
+    lc1, poly1 = bm(bits1)
+    # 1. Berlekamp-Massey names a CLEAN m-sequence or Gold on either sign.
+    for (clc, cpoly) in ((lc, poly), (lc1, poly1)):
+        cprof = bm_profile(bits if clc == lc else bits1)
+        cplat = 0
+        i = L - 1
+        while i >= 0 and cprof[i] == clc:
+            cplat += 1; i -= 1
+        if not (clc >= 2 and 4 * clc <= L and 2 * cplat >= L):
+            continue
+        mask = bm_mask(cpoly)
+        if r and r == clc and mask in primitive_polys(r):
+            res.update(poly=mask, poly_degree=int(clc), poly_method=POLY_BM, lc=int(clc), lc_plateau=cplat)
+            res["name"] = "m-sequence (%d) %s" % (L, _poly_str(mask, int(clc)))
+            res["flags"] |= CODE_POLY | CODE_NAMED
+            break
+        if r and clc == 2 * r:
+            fac = _gold_factor(mask, r)
+            if fac:
+                res.update(poly=mask, poly_degree=int(clc), poly_method=POLY_BM, lc=int(clc), lc_plateau=cplat)
+                res["name"] = "Gold (%d) %s x %s" % (L, _poly_str(fac[0], r), _poly_str(fac[1], r))
+                res["flags"] |= CODE_POLY | CODE_NAMED
+                break
+    # 2. Not cleanly named: parity-check counting over the degree-r primitives,
+    #    on whichever sign gives the stronger statistic.
+    if not (res["flags"] & CODE_NAMED) and r and r <= poly_max:
+        polys = primitive_polys(r)
+        best = (0.0, 0)
+        for cc in (chips[:L], -chips[:L]):
+            zs = [(parity_z(cc, p, r), p) for p in polys]
+            z = max(zs) if zs else (0.0, 0)
+            if z[0] > best[0]:
+                best = z
+        zbest, pbest = best
+        k = _norm_isf(pfa / max(len(polys), 1))
+        res["poly_z"] = zbest / _sqrt(L)
+        nm.append(METHOD_PARITY_COUNT)
+        if zbest > k * _sqrt(L):
+            res.update(poly=pbest, poly_degree=r, poly_method=POLY_PARITY)
+            res["flags"] |= CODE_POLY | CODE_NAMED
+            res["name"] = "m-sequence (%d) %s, by parity (%d checks failed)" % (
+                L, _poly_str(pbest, r), int((L - zbest) / 2.0 + 0.5))
+    # 3. Still unnamed: report the linear complexity and the chips.
+    if not (res["flags"] & CODE_NAMED) and lc >= 2 and 4 * lc <= L and 2 * plateau >= L:
+        mask = bm_mask(poly)
+        res.update(poly=mask, poly_degree=int(lc), poly_method=POLY_BM)
+        res["flags"] |= CODE_POLY
+        res["name"] = "LFSR degree %d (%d) %s" % (lc, L, _poly_str(mask, int(lc)))
+    return chips, res
+
+
+def _barker_match(chips, L):
+    b = _BARKER[L]
+    for sgn in (1, -1):
+        for sh in range(L):
+            if all(chips[(i + sh) % L] == sgn * b[i] for i in range(L)):
+                return True
+    return False
+
+
+def _pow2m1(L):
+    for k in range(2, 17):
+        if L == (1 << k) - 1:
+            return k
+    return 0
+
+
+def _poly_str(mask, r):
+    terms = []
+    for i in range(r, -1, -1):
+        if (mask >> i) & 1:
+            terms.append("1" if i == 0 else ("x" if i == 1 else "x^%d" % i))
+    return "+".join(terms)
+
+
+def _gold_factor(f, r):
+    for d in primitive_polys(r):
+        rem, q = f, 0
+        for k in range(2 * r, r - 1, -1):
+            if (rem >> k) & 1:
+                rem ^= d << (k - r); q |= 1 << (k - r)
+        if rem == 0 and q in primitive_polys(r):
+            return d, q
+    return None
+
+
+# ---- 25e. acquisition and tracking (twin of src/dsss_acq.c) -----------------
+from math import gamma as _gamma
+
+ACQ_NPDI, ACQ_MBAPDI = 0, 1
+ACQ_DETECT = 1
+TRK_LOCK, TRK_VALID_CN0, TRK_DISTORTED, TRK_POWER_HIGH = 1, 2, 4, 8
+
+
+def _chi2_isf_nolib(dof, p):
+    """x with P(chi2(2 dof) > x) = p, upper incomplete gamma Q(dof, x/2) by
+    series/continued fraction — no scipy."""
+    a = float(dof)
+    def Q(a, x):
+        if x <= 0:
+            return 1.0
+        if x < a + 1.0:                                   # series for P
+            term = 1.0 / a; s = term; n = a
+            for _ in range(500):
+                n += 1.0; term *= x / n; s += term
+                if abs(term) < abs(s) * 1e-15:
+                    break
+            return 1.0 - s * _m.exp(-x + a * _m.log(x) - _lgamma(a))
+        b = x + 1.0 - a; cc = 1e300; d = 1.0 / b; h = d   # continued fraction for Q
+        for i in range(1, 500):
+            an = -i * (i - a); b += 2.0
+            d = an * d + b; d = d if abs(d) > 1e-300 else 1e-300
+            cc = b + an / cc; cc = cc if abs(cc) > 1e-300 else 1e-300
+            d = 1.0 / d; delta = d * cc; h *= delta
+            if abs(delta - 1.0) < 1e-15:
+                break
+        return h * _m.exp(-x + a * _m.log(x) - _lgamma(a))
+    lo, hi = 0.0, 2.0 * a + 40.0 * _sqrt(2.0 * a) + 40.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if Q(a, mid / 2.0) > p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+from math import lgamma as _lgamma
+
+
+def acq_threshold(dwells, ncells, pfa):
+    if dwells < 1 or not ncells >= 1.0 or not 0.0 < pfa < 1.0:
+        return 0.0
+    per_cell = 1.0 - (1.0 - pfa) ** (1.0 / ncells)
+    return _chi2_isf_nolib(dwells, per_cell)
+
+
+def dsss_acq_defaults(fs, rc, L):
+    return dict(fs=float(fs), rc=float(rc), L=int(L), ncoh=1, nnoncoh=1, combiner=ACQ_NPDI,
+                dop_lo=-5000.0, dop_hi=5000.0, dop_step=0.0, pfa=1e-3)
+
+
+def _sample_code(code, L, sps, Np):
+    idx = np.minimum((np.arange(Np) / sps).astype(int), L - 1)
+    return np.asarray(code, np.float64)[idx]
+
+
+def dsss_acquire(iq, code, cfg):
+    """(result) — twin of atkdsp_dsss_acquire."""
+    c = dict(cfg)
+    iq = np.asarray(iq, np.complex128).ravel()
+    code = np.asarray(code, np.int8)
+    fs, rc, L = float(c["fs"]), float(c["rc"]), int(c["L"])
+    ncoh, nnon = int(c["ncoh"]), int(c["nnoncoh"])
+    comb = int(c.get("combiner", ACQ_NPDI))
+    dop_lo, dop_hi = float(c["dop_lo"]), float(c["dop_hi"])
+    pfa = float(c.get("pfa", 1e-3))
+    sps = fs / rc
+    Np = int(_m.floor(L * sps + 0.5))
+    if iq.size < Np * ncoh * nnon:
+        raise ValueError("dsss_acquire: need ncoh*nnoncoh periods")
+    tcoh = Np * ncoh / fs
+    dstep = float(c["dop_step"]) if c.get("dop_step", 0.0) > 0 else 2.0 / (3.0 * tcoh)
+    ndop = int(_m.floor((dop_hi - dop_lo) / dstep)) + 1
+    rep = _sample_code(code, L, sps, Np)
+    Rf = np.conj(np.fft.fft(rep))
+    pin = float(np.mean(np.abs(iq) ** 2))
+    best = (-1.0, 0, 0)
+    accs = []
+    for di in range(ndop):
+        f = dop_lo + di * dstep
+        acc = np.zeros(Np)
+        zk = []
+        for d in range(nnon):
+            coh = np.zeros(Np, np.complex128)
+            for cq in range(ncoh):
+                base = (d * ncoh + cq) * Np
+                seg = iq[base:base + Np]
+                b = seg * np.exp(-2j * np.pi * f * (np.arange(Np) + base) / fs)
+                coh += np.fft.ifft(np.fft.fft(b) * Rf)
+            if comb == ACQ_NPDI:
+                acc += np.abs(coh) ** 2
+            else:
+                zk.append(coh)
+        if comb == ACQ_MBAPDI:
+            zk = np.array(zk)                              # nnon x Np
+            acc = np.zeros(Np)
+            for mask in range(1 << (nnon - 1)):
+                signs = np.array([1.0] + [(-1.0 if (mask >> b) & 1 else 1.0) for b in range(nnon - 1)])
+                sm = (signs[:, None] * zk).sum(0)
+                acc = np.maximum(acc, np.abs(sm) ** 2)
+        accs.append(acc)
+        pk = acc.argmax()
+        if acc[pk] > best[0]:
+            best = (acc[pk], di, pk)
+    gbest, dbest, pbest = best
+    acc = accs[dbest]
+    guard = int(_m.ceil(sps))
+    mask = np.ones(Np, bool)
+    for dd in range(-guard, guard + 1):
+        mask[(pbest + dd) % Np] = False
+    s2 = acc[mask].max() if mask.any() else 0.0
+    cellmean = float(acc.mean())
+    out = dict(code_phase=0.0, doppler_hz=dop_lo + dbest * dstep, gamma=0.0, gamma_thr=0.0,
+               log10_pfa=0.0, peak_ratio=(acc[pbest] / s2 if s2 > 0 else float("inf")),
+               cn0_dbhz=0.0, ncells=Np * ndop, ndop=ndop, flags=0,
+               method=[METHOD_PCPS, METHOD_MBAPDI if comb == ACQ_MBAPDI else METHOD_PCPS, METHOD_DOPPLER_GRID])
+    out["cn0_dbhz"] = 10.0 * _m.log10(max(acc[pbest] / cellmean - 1.0, 1e-9) / tcoh) if cellmean > 0 else 0.0
+    im1, ip1 = (pbest - 1) % Np, (pbest + 1) % Np
+    den = acc[im1] - 2 * acc[pbest] + acc[ip1]
+    offs = 0.5 * (acc[im1] - acc[ip1]) / den if den < 0 else 0.0
+    out["code_phase"] = ((pbest + offs) / sps) % L
+    out["gamma"] = 2.0 * Np * gbest / pin if pin > 0 else 0.0
+    out["gamma_thr"] = acq_threshold(nnon, out["ncells"], pfa)
+    out["log10_pfa"] = min(0.0, _logq_chi2(nnon, out["gamma"] / 2.0) / _m.log(10.0) + _m.log10(out["ncells"]))
+    if out["gamma"] > out["gamma_thr"]:
+        out["flags"] |= ACQ_DETECT
+    return out
+
+
+def _logq_chi2(dof, x):
+    """ln Q(dof, x) (upper incomplete gamma), finite into the tail."""
+    a = float(dof)
+    if x <= 0:
+        return 0.0
+    if x < a + 1.0:
+        term = 1.0 / a; s = term; nn = a
+        for _ in range(1000):
+            nn += 1.0; term *= x / nn; s += term
+            if abs(term) < abs(s) * 1e-16:
+                break
+        p = s * _m.exp(-x + a * _m.log(x) - _lgamma(a))
+        return _m.log(max(1.0 - p, 1e-300))
+    b = x + 1.0 - a; cc = 1e300; d = 1.0 / b; h = d
+    for i in range(1, 1000):
+        an = -i * (i - a); b += 2.0
+        d = an * d + b; d = d if abs(d) > 1e-300 else 1e-300
+        cc = b + an / cc; cc = cc if abs(cc) > 1e-300 else 1e-300
+        d = 1.0 / d; delta = d * cc; h *= delta
+        if abs(delta - 1.0) < 1e-16:
+            break
+    return -x + a * _m.log(x) - _lgamma(a) + _m.log(h)
+
+
+def dsss_trk_defaults(fs, rc, L, code_phase, doppler_hz):
+    return dict(fs=float(fs), rc=float(rc), L=int(L), code_phase=float(code_phase),
+                doppler_hz=float(doppler_hz), dll_bw_hz=2.0, pll_bw_hz=15.0, spacing=0.5,
+                quality_spacing=0.15, cn0_periods=20, power_window_s=0.2, distortion_pfa=1e-3,
+                power_high_db=3.0)
+
+
+class DsssTrk:
+    """Twin of atkdsp_dsss_trk: a DLL/PLL tracking loop with C/N0 and the
+    distortion monitor."""
+
+    def __init__(self, code, cfg):
+        c = dict(cfg)
+        self.code = np.asarray(code, np.int8)
+        self.fs, self.rc, self.L = float(c["fs"]), float(c["rc"]), int(c["L"])
+        self.sp, self.qs = float(c["spacing"]), float(c["quality_spacing"])
+        self.cn0_n = int(c["cn0_periods"])
+        self.code_phase = float(c["code_phase"])
+        self.code_rate = self.rc / self.fs
+        self.carrier_phase = 0.0
+        self.carrier_rate = 2.0 * np.pi * float(c["doppler_hz"]) / self.fs
+        self.pll_integ = 2.0 * np.pi * float(c["doppler_hz"])   # rad/s
+        self.code_hz = 0.0
+        self.Tupd = self.L / self.rc
+        self.wn_pll = 2.0 * np.pi * float(c["pll_bw_hz"]) / 0.53
+        self.dll_c1 = 4.0 * float(c["dll_bw_hz"])
+        self._reset_corr()
+        self.chip_in = 0.0
+        self.pr_hist = []; self.p_hist = []
+        self.power = 0.0; self.periods = 0; self.samples = 0; self.dropped = 0
+
+    def _reset_corr(self):
+        self.E = self.Pp = self.Lx = self.Qe = self.Ql = 0j
+
+    def _code_at(self, chip):
+        return float(self.code[int(_m.floor(chip)) % self.L])
+
+    def process(self, x):
+        x = np.asarray(x, np.complex128).ravel()
+        out = []
+        for xi in x:
+            cr = np.exp(-1j * self.carrier_phase)
+            xr = xi * cr
+            cp = self.code_phase
+            self.E += xr * self._code_at(cp - self.sp)
+            self.Pp += xr * self._code_at(cp)
+            self.Lx += xr * self._code_at(cp + self.sp)
+            self.Qe += xr * self._code_at(cp - self.qs)
+            self.Ql += xr * self._code_at(cp + self.qs)
+            self.power += abs(xi) ** 2
+            self.carrier_phase += self.carrier_rate
+            self.code_phase += self.code_rate
+            self.chip_in += self.code_rate
+            if self.chip_in >= self.L:
+                e, l = abs(self.E), abs(self.Lx)
+                dll = 0.5 * (e - l) / (e + l) if (e + l) > 0 else 0.0
+                self.code_hz += self.dll_c1 * dll * self.Tupd
+                self.code_rate = (self.rc + self.code_hz) / self.fs
+                pll = _m.atan(self.Pp.imag / self.Pp.real) if self.Pp.real != 0 else 0.0  # Costas 2-quadrant
+                self.pll_integ += self.wn_pll * self.wn_pll * pll * self.Tupd
+                freq = 1.414213562373095 * self.wn_pll * pll + self.pll_integ
+                self.carrier_rate = freq / self.fs
+                out.append(self.Pp)
+                self.pr_hist.append(abs(self.Pp) ** 2); self.p_hist.append(self.Pp)
+                if len(self.pr_hist) > self.cn0_n:
+                    self.pr_hist.pop(0); self.p_hist.pop(0)
+                self.periods += 1
+                self._reset_corr(); self.chip_in -= self.L; self.power = 0.0
+        self.samples += x.size
+        return np.array(out, np.complex128)
+
+    def read(self):
+        st = dict(code_phase=self.code_phase % self.L,
+                  doppler_hz=self.carrier_rate * self.fs / (2.0 * np.pi),
+                  cn0_m2m4=0.0, cn0_nwpr=0.0, distortion=0.0, distortion_log10_pfa=0.0,
+                  power_db=0.0, power_start_db=0.0, lock=0.0, periods=self.periods, flags=0,
+                  method=[METHOD_M2M4, METHOD_NWPR, METHOD_PD_MONITOR])
+        if len(self.pr_hist) >= 2:
+            T = self.L / self.rc
+            pr = np.array(self.pr_hist); p = np.array(self.p_hist)
+            m2, m4 = pr.mean(), (pr ** 2).mean()
+            disc = 2 * m2 * m2 - m4
+            pd = _sqrt(disc) if disc > 0 else 0.0
+            pn = m2 - pd
+            snr = pd / pn if pn > 0 else 1e9
+            st["cn0_m2m4"] = 10.0 * _m.log10(max(snr, 1e-9) / T)
+            mu = abs(p.sum()) ** 2 / pr.sum() if pr.sum() > 0 else 0.0
+            nf = len(pr)
+            ratio = (mu - 1.0) / (nf - mu) if (nf - mu) > 0 else 0.0
+            st["cn0_nwpr"] = 10.0 * _m.log10(max(ratio, 1e-9) / T)
+            if st["cn0_m2m4"] >= 25.0:
+                st["flags"] |= TRK_VALID_CN0
+            st["lock"] = abs(p.real.sum()) / np.sqrt(pr).sum() if pr.sum() > 0 else 0.0
+            if st["lock"] > 0.5:
+                st["flags"] |= TRK_LOCK
+        return st
+
+    def describe(self):
+        return "dsss_trk: fs %.0f Hz, %d chips at %.6g chip/s; %d periods" % (
+            self.fs, self.L, self.rc, self.periods)
+
+    def stats(self):
+        return dict(samples=self.samples, windows=self.periods, resets=0, window_fill=self.dropped)
+
+
+# ---- 26. the LoRa chirp probe (twin of src/css.c) ---------------------------
+CSS_DETECT, CSS_PREAMBLE, CSS_WARMUP = 1, 2, 4
+
+
+class CssProbe:
+    """Twin of atkdsp_css_probe: de-chirp + FFT per candidate (sf, bw)."""
+
+    def __init__(self, fs, cands, preamble_min, pfa):
+        self.fs = float(fs)
+        self.cands = [(int(s), float(b)) for (s, b) in cands]
+        self.preamble_min = int(preamble_min)
+        self.pfa = float(pfa)
+        if not self.fs > 0 or not 1 <= len(self.cands) <= 32:
+            raise ValueError("css_probe: fs and 1..32 candidates")
+        if not 1 <= self.preamble_min <= 64 or not 0 < self.pfa < 0.5:
+            raise ValueError("css_probe: preamble_min and pfa")
+        self.c = []
+        for sf, bw in self.cands:
+            if not 5 <= sf <= 12 or not 0 < bw <= fs:
+                raise ValueError("css_probe: sf 5..12, bw <= fs")
+            os = fs / bw
+            Nsym = int(_m.floor((1 << sf) * os + 0.5))
+            Tsym = (1 << sf) / bw
+            t = np.arange(Nsym) / fs
+            ph = 2 * np.pi * (-0.5 * bw * t + 0.5 * bw / Tsym * t * t)
+            dechirp = np.exp(-1j * ph)
+            bins = 1 << sf
+            self.c.append(dict(sf=sf, bw=bw, Nsym=Nsym, dechirp=dechirp, bins=bins,
+                               level_thr=-_m.log(self.pfa / bins / len(self.cands)),
+                               last_bin=-1, run=0, nwin=0, last_level=0.0, flags=0,
+                               ring=[-1] * 256, rhead=0))
+        self.maxN = max(cc["Nsym"] for cc in self.c)
+        self.reset()
+
+    def reset(self):
+        self.hist = np.zeros(self.maxN, np.complex128)
+        self.fill = 0; self.pos = 0; self.samples = 0; self.segments = 0
+        for cc in self.c:
+            cc.update(last_bin=-1, run=0, nwin=0, flags=0, last_level=0.0, ring=[-1] * 256, rhead=0)
+
+    def _eval(self, cc):
+        N = cc["Nsym"]
+        base = self.fill - N
+        if base < 0:
+            return
+        win = self.hist[base:base + N] * cc["dechirp"]
+        X = np.fft.fft(win)
+        bins = cc["bins"]
+        k = (np.arange(bins) * N // bins)
+        m = np.abs(X[k]) ** 2
+        peak = int(m.argmax()); pmax = float(m[peak]); mean = float(m.mean())
+        level = pmax / mean if mean > 0 else 0.0
+        cc["last_level"] = level; cc["nwin"] += 1
+        det = level >= cc["level_thr"]
+        RING = 256
+        cc["ring"][cc["rhead"]] = peak if det else -1
+        cc["rhead"] = (cc["rhead"] + 1) % RING
+        if det:
+            cc["flags"] = CSS_DETECT
+            cc["last_bin"] = peak
+            # the same bin (+-1) recurs over the recent windows: at a hop of
+            # Nsym/4 the symbol-aligned windows of the 8 identical up-chirps
+            # share a bin while the straddling ones scatter, so count rather
+            # than require a consecutive run.
+            span = min(4 * self.preamble_min, RING)
+            cnt = sum(1 for j in range(span)
+                      if (b := cc["ring"][(cc["rhead"] - 1 - j) % RING]) >= 0 and abs(b - peak) <= 1)
+            cc["run"] = cnt
+            if cnt >= self.preamble_min:
+                cc["flags"] |= CSS_PREAMBLE
+        else:
+            cc["flags"] = 0; cc["run"] = 0; cc["last_bin"] = -1
+
+    def process(self, x):
+        x = np.asarray(x, np.complex128).ravel()
+        for xi in x:
+            if self.fill == self.maxN:
+                half = self.maxN // 2
+                self.hist[:self.maxN - half] = self.hist[half:]
+                self.fill -= half
+            self.hist[self.fill] = xi; self.fill += 1; self.pos += 1
+            for cc in self.c:
+                hop = max(cc["Nsym"] // 4, 1)
+                if self.pos % hop == 0 and self.fill >= cc["Nsym"]:
+                    self._eval(cc); self.segments += 1
+        self.samples += x.size
+
+    def read(self):
+        out = []
+        for cc in self.c:
+            r = dict(level=cc["last_level"], level_thr=cc["level_thr"], offset_hz=0.0,
+                     bin=cc["last_bin"], run=cc["run"], nwin=cc["nwin"], flags=cc["flags"])
+            if cc["nwin"] == 0:
+                r["flags"] |= CSS_WARMUP
+            out.append(r)
+        return out
+
+    def describe(self):
+        return "css_probe: fs %.0f Hz, %d candidate(s), preamble %d, Pfa %.3g" % (
+            self.fs, len(self.c), self.preamble_min, self.pfa)
+
+    def stats(self):
+        return dict(samples=self.samples, segments=self.segments, resets=0, segment_fill=self.fill)
+
+
+def css_demod(iq, fs, sf, bw_hz, offset_hz, t0, cap=1 << 30):
+    """Raw symbol values — twin of atkdsp_css_demod."""
+    iq = np.asarray(iq, np.complex128).ravel()
+    os = fs / bw_hz
+    N = int(_m.floor((1 << sf) * os + 0.5))
+    bins = 1 << sf
+    Tsym = (1 << sf) / bw_hz
+    t = np.arange(N) / fs
+    ph = 2 * np.pi * (-0.5 * bw_hz * t + 0.5 * bw_hz / Tsym * t * t + offset_hz * t)
+    dc = np.exp(-1j * ph)
+    syms = []
+    start = t0
+    k = (np.arange(bins) * N // bins)
+    while True:
+        s0 = int(_m.floor(start + 0.5))
+        if s0 < 0 or s0 + N > iq.size:
+            break
+        X = np.fft.fft(iq[s0:s0 + N] * dc)
+        syms.append(int(np.argmax(np.abs(X[k]) ** 2)))
+        if len(syms) >= cap:
+            break
+        start += N
+    return np.array(syms, np.uint16)
+
+
+# ---- 27. the receiver pair and the lattice (twin of src/xspec.c) ------------
+XS_DETECT, XS_WARMUP, XS_TDOA = 1, 2, 4
+ALIGN_FOUND = 1
+(LAT_AGREE_RC, LAT_INTEGER_L, LAT_FAMILY, LAT_ONE_CLOCK, LAT_CONSISTENT) = 1, 2, 4, 8, 16
+
+
+def msc_threshold(navg, nbins, pfa):
+    if navg < 2 or not nbins >= 1.0 or not 0.0 < pfa < 1.0:
+        return 0.0
+    c = 1.0 - (pfa / nbins) ** (1.0 / (navg - 1))
+    return min(1.0, max(0.0, c))
+
+
+class Xspec:
+    """Twin of atkdsp_xspec: the averaged cross-spectrum of two streams, the
+    coherence test and the TDOA from its phase slope."""
+
+    def __init__(self, fs, nfft, navg, pfa):
+        self.fs, self.nfft, self.navg, self.pfa = float(fs), int(nfft), int(navg), float(pfa)
+        if not self.fs > 0 or not 16 <= self.nfft <= (1 << 16) or not 2 <= self.navg <= (1 << 16):
+            raise ValueError("xspec: fs, nfft, navg")
+        if not 0 < self.pfa < 0.5:
+            raise ValueError("xspec: pfa")
+        self.w = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(self.nfft) / self.nfft))
+        self.wsum2 = float(np.sum(self.w ** 2))
+        self.base_re = np.zeros(self.nfft); self.base_im = np.zeros(self.nfft); self.base_n = 0
+        self.reset()
+
+    def reset(self):
+        self.sxx = np.zeros(self.nfft); self.syy = np.zeros(self.nfft)
+        self.sxy = np.zeros(self.nfft, np.complex128)
+        self.b1 = np.zeros(self.nfft, np.complex128); self.b2 = np.zeros(self.nfft, np.complex128)
+        self.pos = 0; self.segments = 0; self.samples = 0
+
+    def _seg(self, learn):
+        X1 = np.fft.fft(self.w * self.b1); X2 = np.fft.fft(self.w * self.b2)
+        if learn:
+            nw = self.base_n + 1
+            cx = X1 * np.conj(X2)
+            self.base_re += (cx.real - self.base_re) / nw
+            self.base_im += (cx.imag - self.base_im) / nw
+            self.base_n += 1
+            return
+        nw = min(self.segments + 1, self.navg)
+        self.sxx += (np.abs(X1) ** 2 - self.sxx) / nw
+        self.syy += (np.abs(X2) ** 2 - self.syy) / nw
+        cx = X1 * np.conj(X2)
+        self.sxy += (cx - self.sxy) / nw
+        self.segments += 1
+
+    def _feed(self, x1, x2, learn):
+        x1 = np.asarray(x1, np.complex128).ravel(); x2 = np.asarray(x2, np.complex128).ravel()
+        i = 0
+        while i < x1.size:
+            take = min(self.nfft - self.pos, x1.size - i)
+            self.b1[self.pos:self.pos + take] = x1[i:i + take]
+            self.b2[self.pos:self.pos + take] = x2[i:i + take]
+            self.pos += take; i += take
+            if self.pos == self.nfft:
+                self._seg(learn); self.pos = 0
+        if not learn:
+            self.samples += x1.size
+
+    def process(self, x1, x2):
+        self._feed(x1, x2, False)
+
+    def baseline(self, x1, x2):
+        self._feed(x1, x2, True)
+
+    def _coh(self):
+        cr = self.sxy.real - self.base_re; ci = self.sxy.imag - self.base_im
+        num = cr ** 2 + ci ** 2
+        den = self.sxx * self.syy
+        coh = np.where(den > 0, num / np.where(den > 0, den, 1.0), 0.0)
+        return np.minimum(coh, 1.0), np.arctan2(ci, cr)
+
+    def read(self):
+        navg = min(self.segments, self.navg)
+        out = dict(max_coh=0.0, coh_thr=0.0, log10_pfa=0.0, max_bin=0, band_lo=0, band_hi=0,
+                   band_bins=0, band_coh_mean=0.0, tdoa_s=0.0, tdoa_err_s=0.0, phase0=0.0,
+                   slope_resid=0.0, navg=navg, flags=0, method=[METHOD_MSC, METHOD_PHASE_REF])
+        if self.segments < 2:
+            out["flags"] |= XS_WARMUP
+            return out
+        coh, ph = self._coh()
+        out["coh_thr"] = msc_threshold(navg, self.nfft, self.pfa)
+        mb = int(coh.argmax()); mc = float(coh[mb])
+        out["max_coh"] = mc
+        out["max_bin"] = (mb + self.nfft // 2) % self.nfft - self.nfft // 2
+        out["log10_pfa"] = min(0.0, (navg - 1) * _m.log10(1.0 - min(mc, 1 - 1e-12)) + _m.log10(self.nfft))
+        if mc >= out["coh_thr"]:
+            out["flags"] |= XS_DETECT
+            lo = hi = mb
+            while lo > 0 and coh[lo - 1] >= out["coh_thr"]:
+                lo -= 1
+            while hi < self.nfft - 1 and coh[hi + 1] >= out["coh_thr"]:
+                hi += 1
+            out["band_lo"] = (lo + self.nfft // 2) % self.nfft - self.nfft // 2
+            out["band_hi"] = (hi + self.nfft // 2) % self.nfft - self.nfft // 2
+            out["band_bins"] = hi - lo + 1
+            idx = np.arange(lo, hi + 1)
+            w = coh[idx]
+            p = np.unwrap(ph[idx])
+            out["band_coh_mean"] = float(w.mean())
+            if out["band_bins"] >= 4:
+                sw = w.sum(); sx = (w * idx).sum(); sy = (w * p).sum()
+                sxx = (w * idx * idx).sum(); sxy = (w * idx * p).sum()
+                dd = sw * sxx - sx * sx
+                if dd != 0:
+                    slope = (sw * sxy - sx * sy) / dd
+                    icpt = (sy - slope * sx) / sw
+                    df = self.fs / self.nfft
+                    out["tdoa_s"] = -slope / (2.0 * np.pi * df)
+                    out["phase0"] = icpt
+                    resid = float(np.sqrt(np.mean((p - (icpt + slope * idx)) ** 2)))
+                    out["slope_resid"] = resid
+                    out["tdoa_err_s"] = resid / (2.0 * np.pi * df * _sqrt(out["band_bins"]))
+                    out["flags"] |= XS_TDOA
+        return out
+
+    def bins(self):
+        coh, ph = self._coh()
+        roll = self.nfft // 2
+        return np.roll(coh, roll), np.roll(ph, roll)
+
+    def describe(self):
+        return "xspec: fs %.0f Hz, nfft %d, navg %d, Pfa %.3g; %d segments in, baseline from %d" % (
+            self.fs, self.nfft, self.navg, self.pfa, self.segments, self.base_n)
+
+    def stats(self):
+        return dict(samples=self.samples, segments=self.segments, resets=0, segment_fill=self.pos)
+
+
+def align_estimate(x1, x2, fs, max_lag, block=0):
+    """(result, phase) — twin of atkdsp_align_estimate."""
+    x1 = np.asarray(x1, np.complex128).ravel(); x2 = np.asarray(x2, np.complex128).ravel()
+    n = x1.size
+    out = dict(lag=0.0, lag_err=0.0, rate_ppm=0.0, lo_offset_hz=0.0, peak_ratio=0.0,
+               snr_db=0.0, nblocks=0, flags=0, method=[METHOD_PHASE_REF, METHOD_MSC])
+    # non-coherent over blocks of ALIGN_BLK, so a large LO offset (a phase ramp
+    # on x1 conj x2) does not decorrelate the lag peak; the offset is read from
+    # the product at the found lag afterwards.
+    ALIGN_BLK = 256
+
+    def ncxcorr(a, b, nn):
+        out_m = []
+        for lag in range(-max_lag, max_lag + 1):
+            lo = -lag if lag < 0 else 0
+            hi = nn if lag < 0 else nn - lag
+            m = 0.0
+            for i in range(lo, hi, ALIGN_BLK):
+                e = min(i + ALIGN_BLK, hi)
+                m += abs(np.vdot(a[i:e], b[i + lag:e + lag]))
+            out_m.append(m)
+        return np.array(out_m)
+
+    mags = ncxcorr(x1, x2, n)
+    bl = int(mags.argmax()) - max_lag
+    best = mags.max()
+    noise = (mags.sum() - best) / (2 * max_lag)
+    out["peak_ratio"] = best / noise if noise > 0 else float("inf")
+    out["snr_db"] = 10.0 * _m.log10(max(best / noise - 1.0, 1e-9)) if noise > 0 else 0.0
+    i = bl + max_lag
+    offs = 0.0
+    if 0 < i < 2 * max_lag:
+        d = mags[i - 1] - 2 * mags[i] + mags[i + 1]
+        if d < 0:
+            offs = 0.5 * (mags[i - 1] - mags[i + 1]) / d
+    out["lag"] = bl + offs
+    out["lag_err"] = 1.0 / _sqrt(max(out["peak_ratio"], 1.0))
+    # rate from the two halves (same non-coherent sum)
+    h2 = n // 2
+    lags = []
+    for half in range(2):
+        a1 = x1[h2:] if half else x1[:h2]; a2 = x2[h2:] if half else x2[:h2]
+        mm = ncxcorr(a1, a2, a1.size)
+        lags.append(int(np.argmax(mm)) - max_lag)
+    out["rate_ppm"] = (lags[1] - lags[0]) / h2 * 1e6
+    # LO offset: block-sum the product first (a low-pass + decimate that kills
+    # the band carrier the signal x noise cross terms sit at, and the white
+    # noise), leaving the baseband LO tone; its lag-1 phase gives the offset.
+    lag = bl
+    if lag < 0:
+        prod = x1[-lag:] * np.conj(x2[:n + lag])
+    else:
+        prod = x1[:n - lag] * np.conj(x2[lag:])
+    nb = prod.size // ALIGN_BLK
+    if nb >= 2:
+        blk = prod[:nb * ALIGN_BLK].reshape(nb, ALIGN_BLK).sum(1)
+        d = np.sum(blk[1:] * np.conj(blk[:-1]))
+    else:
+        d = np.sum(prod[1:] * np.conj(prod[:-1]))
+    dphi = _m.atan2(d.imag, d.real)
+    out["lo_offset_hz"] = -dphi * fs / (2.0 * np.pi * (ALIGN_BLK if nb >= 2 else 1))  # +: x2 LO above x1
+    phase = None
+    if block and block > 0:
+        nb = (n + block - 1) // block
+        phase = np.zeros(nb, np.float32)
+        for b in range(nb):
+            i0, i1 = b * block, min((b + 1) * block, n)
+            acc = 0j
+            for idx in range(i0, i1):
+                j = idx + lag
+                if 0 <= j < n:
+                    pr = x1[idx] * np.conj(x2[j])
+                    acc += pr * np.exp(-2j * np.pi * out["lo_offset_hz"] * idx / fs)
+            phase[b] = _m.atan2(acc.imag, acc.real)
+        out["nblocks"] = int(nb)
+    out["flags"] |= ALIGN_FOUND
+    return out, phase
+
+
+def align_apply(x2, fs, a, phase=None, block=0):
+    """x2 resampled, shifted and derotated onto x1's axis — twin of atkdsp_align_apply."""
+    x2 = np.asarray(x2, np.complex128).ravel()
+    n = x2.size
+    rate = 1.0 + a["rate_ppm"] * 1e-6
+    i = np.arange(n)
+    sp = i * rate + a["lag"]
+    k = np.floor(sp).astype(int)
+    f = sp - k
+    v = np.zeros(n, np.complex128)
+    ok = (k >= 0) & (k + 1 < n)
+    v[ok] = (1 - f[ok]) * x2[k[ok]] + f[ok] * x2[k[ok] + 1]
+    ph = -2.0 * np.pi * a["lo_offset_hz"] * i / fs
+    if phase is not None and block and block > 0:
+        ph = ph - np.asarray(phase)[np.minimum(i // block, len(phase) - 1)]
+    return v * np.exp(1j * ph)
+
+
+def _known_family(L):
+    for r in range(2, 21):
+        if L == (1 << r) - 1:
+            return 1
+    if L in (7, 11, 13):
+        return 2
+    if L == 32:
+        return 3
+    if L in (1023, 511, 4092, 4096, 10230):
+        return 4
+    if L in (32768, 38400):
+        return 5
+    return 0
+
+
+def lattice(in_: dict) -> dict:
+    """The consistency test — twin of atkdsp_lattice."""
+    tol = in_.get("rc_tol", 0.0) or 0.02
+    ppm_tol = in_.get("ppm_tol", 0.0) or 2.0
+    est = [in_.get("rc_acf_hz", 0.0), in_.get("rc_line_hz", 0.0), in_.get("rc_nominal_hz", 0.0)]
+    est = [e for e in est if e > 0]
+    out = dict(rc_hz=0.0, rc_spread=0.0, L=0.0, L_frac=0.0, ppm_carrier=0.0, ppm_chip=0.0,
+               ppm_diff=0.0, L_int=0, family=0, flags=0, method=METHOD_LATTICE)
+    if not est:
+        raise ValueError("lattice: no chip-rate estimate")
+    out["rc_hz"] = float(np.mean(est))
+    out["rc_spread"] = (max(est) - min(est)) / out["rc_hz"] if out["rc_hz"] > 0 else 0.0
+    if len(est) < 2 or out["rc_spread"] <= tol:
+        out["flags"] |= LAT_AGREE_RC
+    ps = in_.get("period_s", 0.0)
+    if ps > 0 and out["rc_hz"] > 0:
+        out["L"] = ps * out["rc_hz"]
+        out["L_int"] = int(_m.floor(out["L"] + 0.5))
+        out["L_frac"] = abs(out["L"] - out["L_int"])
+        if out["L_frac"] <= 0.02 and out["L_int"] >= 2:
+            out["flags"] |= LAT_INTEGER_L
+            fam = _known_family(out["L_int"])
+            if fam:
+                out["family"] = fam; out["flags"] |= LAT_FAMILY
+    fc = in_.get("fc_hz", 0.0); cfo = in_.get("cfo_hz", 0.0); rx_ppm = in_.get("rx_ppm", 0.0)
+    nominal = in_.get("rc_nominal_hz", 0.0)
+    if fc > 0 and out["rc_hz"] > 0:
+        out["ppm_carrier"] = cfo / fc * 1e6
+        if nominal > 0:
+            out["ppm_chip"] = (out["rc_hz"] - nominal) / nominal * 1e6
+        out["ppm_diff"] = abs(out["ppm_carrier"] - out["ppm_chip"])
+        if out["ppm_diff"] <= ppm_tol + rx_ppm:
+            out["flags"] |= LAT_ONE_CLOCK
+    if (out["flags"] & LAT_AGREE_RC) and (out["flags"] & LAT_INTEGER_L):
+        out["flags"] |= LAT_CONSISTENT
+    return out

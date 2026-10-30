@@ -92,9 +92,10 @@ atkdsp_pfb *atkdsp_pfb_create(double fs, unsigned nchan, unsigned oversample,
     p->twiddle = (atkdsp_cf32 *)malloc(nchan * sizeof(atkdsp_cf32));
     p->hist = (atkdsp_cf32 *)calloc((size_t)max_nel * p->ov, sizeof(atkdsp_cf32));
     p->leftover = (atkdsp_cf32 *)calloc((size_t)max_nel * p->hop, sizeof(atkdsp_cf32));
-    p->win = (atkdsp_cf32 *)atk_aligned_malloc(p->L * sizeof(atkdsp_cf32));
-    p->folded = (atkdsp_cf32 *)atk_aligned_malloc(nchan * sizeof(atkdsp_cf32));
-    p->X = (atkdsp_cf32 *)atk_aligned_malloc(nchan * sizeof(atkdsp_cf32));
+    /* scratch per element: process_n runs the elements in parallel */
+    p->win = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * p->L * sizeof(atkdsp_cf32));
+    p->folded = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * nchan * sizeof(atkdsp_cf32));
+    p->X = (atkdsp_cf32 *)atk_aligned_malloc((size_t)max_nel * nchan * sizeof(atkdsp_cf32));
     if (!p->h || !p->fft || !p->twiddle || !p->hist || !p->leftover || !p->win ||
         !p->folded || !p->X) { atkdsp_pfb_destroy(p); return NULL; }
     pfb_build_prototype(p);
@@ -165,46 +166,67 @@ ptrdiff_t atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins, uns
     const size_t consumed = m * hop;
     const size_t rem = avail - consumed;
     const int64_t b0 = p->b;
-    /* per element: build its (leftover ++ in) stream contiguously in `win`? no —
-     * we need random access across hops, so index src via a small helper that
-     * reads leftover then in. To keep one contiguous src, copy into a scratch
-     * stream per element is O(n) extra memory; instead index on the fly. */
-    for (unsigned e = 0; e < nel; ++e) {
-        atkdsp_cf32 *hist = p->hist + (size_t)e * p->ov;
+    /* Element e's stream is s = hist(ov) ++ leftover(lc) ++ in(n), and hop i's
+     * window is s[i*hop, i*hop + L). Every window that starts at or past ov+lc
+     * lies wholly inside `in` and is folded IN PLACE — no copy. Only the first
+     * few windows (those that reach back into hist/leftover) are assembled into
+     * `win`, and the history is saved once per call, not slid per hop: v0.19's
+     * per-hop memcpy+memmove of the ov-sample history moved ~2*ov/hop (≈46)
+     * samples of memory per input sample. Same window values, same fold order:
+     * the output is bit-identical. */
+    const size_t ov = p->ov, L = p->L;
+    /* elements are independent (own history, scratch and output; the FFT plan
+     * is thread-safe), so they run in parallel — same result at any thread count */
+    int ei;
+#pragma omp parallel for num_threads(atkdsp_get_threads()) schedule(static, 1)
+    for (ei = 0; ei < (int)nel; ++ei) {
+        const unsigned e = (unsigned)ei;
+        atkdsp_cf32 *win = p->win + (size_t)e * L;
+        atkdsp_cf32 *folded = p->folded + (size_t)e * N;
+        atkdsp_cf32 *X = p->X + (size_t)e * N;
+        atkdsp_cf32 *hist = p->hist + (size_t)e * ov;
         const atkdsp_cf32 *cal = (p->cal && e < p->cal_nel) ? p->cal + (size_t)e * N : NULL;
         atkdsp_cf32 *dstbase = out + (size_t)e * N * m;
         const atkdsp_cf32 *lo = p->leftover + (size_t)e * hop;
         const unsigned lc = p->lc;
         const atkdsp_cf32 *xin = ins[e];
+        const size_t head = ov + lc;                    /* s index where `in` begins */
         for (size_t i = 0; i < m; ++i) {
-            const size_t off = i * hop;                 /* start in (leftover ++ in) */
-            /* assemble this hop's hop samples into win[ov..ov+hop) directly here,
-             * reading across the leftover/in boundary, then let pfb_hop reuse
-             * win's head for hist. We inline the assembly to handle the split. */
-            memcpy(p->win, hist, p->ov * sizeof(atkdsp_cf32));
-            for (unsigned s = 0; s < hop; ++s) {
-                const size_t j = off + s;
-                p->win[p->ov + s] = (j < lc) ? lo[j] : xin[j - lc];
+            const size_t st = i * hop;                  /* window start in s */
+            const atkdsp_cf32 *wp;
+            if (st >= head) {
+                wp = xin + (st - head);                 /* wholly inside `in` */
+            } else {
+                for (size_t q = 0; q < L; ++q) {
+                    const size_t pq = st + q;
+                    win[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
+                }
+                wp = win;
             }
             /* fold + fft + rotate + cal, write stride m */
             const unsigned Nn = N;
-            for (unsigned j = 0; j < Nn; ++j) { p->folded[j].re = 0.0f; p->folded[j].im = 0.0f; }
+            for (unsigned j = 0; j < Nn; ++j) { folded[j].re = 0.0f; folded[j].im = 0.0f; }
             for (size_t k = 0; k < p->K; ++k) {
                 const size_t base = k * Nn;
                 for (unsigned j = 0; j < Nn; ++j) {
                     const double hc = p->h[base + j];
-                    p->folded[j].re += (float)(hc * p->win[base + j].re);
-                    p->folded[j].im += (float)(hc * p->win[base + j].im);
+                    folded[j].re += (float)(hc * wp[base + j].re);
+                    folded[j].im += (float)(hc * wp[base + j].im);
                 }
             }
-            atkdsp_fft_exec(p->fft, p->folded, p->X, 0);
+            atkdsp_fft_exec(p->fft, folded, X, 0);
+            /* reference the bins to input sample 0: the block starts at
+             * (b+1)*hop - L and L = K*N, so remove exp(+2 pi i k ((b+1) hop mod N)/N)
+             * — multiply by exp(-2 pi i k shift/N), twiddle index (N - k*shift) mod N.
+             * Correct at every oversampling (v0.19-0.20 used +b*hop: right only at 2x,
+             * up to a constant (-1)^k per bin). */
             const int64_t b = b0 + (int64_t)i;
-            const unsigned shift = (unsigned)(((b * (int64_t)hop) % (int64_t)Nn + Nn) % Nn);
+            const unsigned shift = (unsigned)((((b + 1) * (int64_t)hop) % (int64_t)Nn + Nn) % Nn);
             for (unsigned k = 0; k < Nn; ++k) {
-                const unsigned idx = (unsigned)(((size_t)k * shift) % Nn);
+                const unsigned idx = (unsigned)((Nn - ((size_t)k * shift) % Nn) % Nn);
                 const float wr = p->twiddle[idx].re, wi = p->twiddle[idx].im;
-                float yr = p->X[k].re * wr - p->X[k].im * wi;
-                float yi = p->X[k].re * wi + p->X[k].im * wr;
+                float yr = X[k].re * wr - X[k].im * wi;
+                float yi = X[k].re * wi + X[k].im * wr;
                 if (cal) {
                     const float cr = cal[k].re, ci = cal[k].im;
                     const float zr = yr * cr - yi * ci, zi = yr * ci + yi * cr;
@@ -213,14 +235,19 @@ ptrdiff_t atkdsp_pfb_process_n(atkdsp_pfb *p, const atkdsp_cf32 *const *ins, uns
                 dstbase[(size_t)k * m + i].re = yr;
                 dstbase[(size_t)k * m + i].im = yi;
             }
-            /* slide hist by hop */
-            memmove(hist, p->win + hop, p->ov * sizeof(atkdsp_cf32));
         }
-        /* new leftover = last `rem` samples of (leftover ++ in) */
-        for (size_t s = 0; s < rem; ++s) {
-            const size_t j = consumed + s;
-            p->leftover[(size_t)e * hop + s] = (j < lc) ? lo[j] : xin[j - lc];
+        /* save the state once: new hist = s[m*hop, m*hop + ov) — assembled into
+         * `win` first, since it can read the old hist and leftover — then the
+         * new leftover = s[m*hop + ov, head + n), which (m >= 1, lc < hop)
+         * always lies inside `in`. */
+        const size_t ns0 = consumed;                    /* = m*hop */
+        for (size_t q = 0; q < ov; ++q) {
+            const size_t pq = ns0 + q;
+            win[q] = (pq < ov) ? hist[pq] : (pq < head) ? lo[pq - ov] : xin[pq - head];
         }
+        for (size_t s = 0; s < rem; ++s)
+            p->leftover[(size_t)e * hop + s] = xin[ns0 + ov + s - head];
+        memcpy(hist, win, ov * sizeof(atkdsp_cf32));
     }
     p->lc = (unsigned)rem;
     p->b = b0 + (int64_t)m;
@@ -310,7 +337,8 @@ double atk_kaiser_beta(double atten_db);                      /* src/design.c */
 typedef struct {
     int          active;
     double       offset, bw, out_rate, chan_rate;
-    unsigned     decim, shift;        /* shift = round(offset/fs*nfft) mod nfft */
+    unsigned     decim, shift;        /* shift = s mod nfft, s = floor(offset/fs*nfft + 0.5) */
+    double       delta;               /* offset - s*fs/nfft: removed after the fold (Hz) */
     size_t       M, ntaps, ovd;       /* M = nfft/decim; ovd = ov/decim         */
     atkdsp_cf32 *H;                   /* nfft, channel filter freq response      */
     atkdsp_fft  *ifft;                /* M-point inverse plan                    */
@@ -321,6 +349,7 @@ struct atkdsp_osx {
     double       fs, atten;
     size_t       nfft, ov, hop;
     unsigned     max_nel;
+    int64_t      blk;                 /* blocks so far (block i starts at i*hop - ov) */
     atkdsp_fft  *fft;                 /* nfft forward plan                       */
     atkdsp_cf32 *hist;                /* max_nel * ov                            */
     atkdsp_cf32 *leftover;            /* max_nel * hop                           */
@@ -351,7 +380,7 @@ atkdsp_osx *atkdsp_osx_create(double fs, size_t nfft, double atten_db, unsigned 
     if (!x->fft || !x->hist || !x->leftover || !x->Xall || !x->Yf || !x->ys || !x->valid) {
         atkdsp_osx_destroy(x); return NULL;
     }
-    x->lc = 0; x->nslots = 0; x->cap_slots = 0; x->chans = NULL;
+    x->lc = 0; x->blk = 0; x->nslots = 0; x->cap_slots = 0; x->chans = NULL;
     return x;
 }
 
@@ -375,7 +404,7 @@ void atkdsp_osx_reset(atkdsp_osx *x) {
     if (!x) return;
     memset(x->hist, 0, (size_t)x->max_nel * x->ov * sizeof(atkdsp_cf32));
     memset(x->leftover, 0, (size_t)x->max_nel * x->hop * sizeof(atkdsp_cf32));
-    x->lc = 0;
+    x->lc = 0; x->blk = 0;
     for (int i = 0; i < x->nslots; ++i)
         if (x->chans[i].active && x->chans[i].rs)
             for (unsigned e = 0; e < x->max_nel; ++e)
@@ -392,6 +421,15 @@ static unsigned osx_pick_decim(const atkdsp_osx *x, double bw, double out_rate) 
         decim = nd;
     }
     return decim;
+}
+
+/* the integer bin the roll moves by, and what is left over (Hz) */
+static void osx_tune(const atkdsp_osx *x, osx_chan *c, double offset_hz) {
+    const long s = (long)floor(offset_hz / x->fs * (double)x->nfft + 0.5);
+    long sh = s % (long)x->nfft; if (sh < 0) sh += (long)x->nfft;
+    c->offset = offset_hz;
+    c->shift = (unsigned)sh;
+    c->delta = offset_hz - (double)s * x->fs / (double)x->nfft;
 }
 
 int atkdsp_osx_add(atkdsp_osx *x, double offset_hz, double bw_hz, double out_rate) {
@@ -434,9 +472,7 @@ int atkdsp_osx_add(atkdsp_osx *x, double offset_hz, double bw_hz, double out_rat
     c->offset = offset_hz; c->bw = bw_hz; c->out_rate = out_rate;
     c->decim = decim; c->chan_rate = chan_rate; c->ntaps = ntaps;
     c->M = x->nfft / decim; c->ovd = x->ov / decim;
-    long sh = (long)llround(offset_hz / x->fs * (double)x->nfft);
-    sh %= (long)x->nfft; if (sh < 0) sh += (long)x->nfft;
-    c->shift = (unsigned)sh;
+    osx_tune(x, c, offset_hz);
     /* H = FFT(taps zero-padded to nfft) */
     c->H = (atkdsp_cf32 *)atk_aligned_malloc(x->nfft * sizeof(atkdsp_cf32));
     atkdsp_cf32 *hin = (atkdsp_cf32 *)calloc(x->nfft, sizeof(atkdsp_cf32));
@@ -459,9 +495,7 @@ int atkdsp_osx_add(atkdsp_osx *x, double offset_hz, double bw_hz, double out_rat
 
 int atkdsp_osx_retune(atkdsp_osx *x, int ch, double offset_hz) {
     if (!x || ch < 0 || ch >= x->nslots || !x->chans[ch].active) return ATKDSP_E_ARG;
-    long sh = (long)llround(offset_hz / x->fs * (double)x->nfft);
-    sh %= (long)x->nfft; if (sh < 0) sh += (long)x->nfft;
-    x->chans[ch].offset = offset_hz; x->chans[ch].shift = (unsigned)sh;
+    osx_tune(x, &x->chans[ch], offset_hz);
     return ATKDSP_OK;
 }
 
@@ -539,9 +573,25 @@ ptrdiff_t atkdsp_osx_process_n(atkdsp_osx *x, const atkdsp_cf32 *const *ins, uns
                     x->Yf[k].re = ar; x->Yf[k].im = ai;
                 }
                 atkdsp_fft_exec(c->ifft, x->Yf, x->ys, 1);    /* inverse, 1/M applied */
+                /* The roll mixed by s bins relative to THIS block's start; take
+                 * it to absolute time, exp(-2 pi i (s*start mod nfft)/nfft), and
+                 * remove the residual delta at each sample's absolute input
+                 * index n = blk*hop + k*decim: one phase per sample in absolute
+                 * time, continuous across blocks, calls and chunkings. (v0.20.0
+                 * had neither: an odd s flipped the sign every block and the
+                 * channel sat up to half a bin off its centre.) */
+                const int64_t bi = x->blk + (int64_t)i;
+                const int64_t start = bi * (int64_t)hop - (int64_t)ov;
+                int64_t smod = ((int64_t)sh * start) % (int64_t)nfft;
+                if (smod < 0) smod += (int64_t)nfft;
+                const double a0 = (double)smod / (double)nfft;
                 for (size_t k = 0; k < nvalid; ++k) {
-                    x->valid[k].re = (float)(x->ys[ovd + k].re * invd);
-                    x->valid[k].im = (float)(x->ys[ovd + k].im * invd);
+                    const int64_t nabs = bi * (int64_t)hop + (int64_t)k * (int64_t)decim;
+                    const double ph = -2.0 * ATK_PI * (a0 + c->delta * (double)nabs / x->fs);
+                    const double cr = cos(ph), si = sin(ph);
+                    const double yr = x->ys[ovd + k].re * invd, yi = x->ys[ovd + k].im * invd;
+                    x->valid[k].re = (float)(yr * cr - yi * si);
+                    x->valid[k].im = (float)(yr * si + yi * cr);
                 }
                 atkdsp_cf32 *dst = outs ? outs[(size_t)e * ns + ci] : NULL;
                 const size_t wpos = out_counts[ci];
@@ -572,6 +622,7 @@ ptrdiff_t atkdsp_osx_process_n(atkdsp_osx *x, const atkdsp_cf32 *const *ins, uns
             x->leftover[(size_t)e * hop + s] = ins[e][consumed + s - lc];
     }
     x->lc = (unsigned)rem;
+    x->blk += (int64_t)m;
     return (ptrdiff_t)ns;
 }
 

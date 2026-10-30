@@ -269,6 +269,41 @@ def test_code_refuses_when_not_identifiable():
         assert res["periods_needed"] != 0
 
 
+# Carrier offsets across the band where the period-summed P-th power used to
+# cancel itself: tiny (half a turn over the capture), the bootstrap's residual
+# (~15 turns), and up to the in-period limit 1/(2 P sps). 0 dB, 4000 periods.
+CFO_CASES = [0.0, 1e-6, 3e-5, -3e-5, 3e-4, 2e-3, -2e-3, 1e-2, -1e-2]
+
+
+@pytest.mark.parametrize("cfo", CFO_CASES)
+def test_code_recovered_through_a_carrier_offset(cfo):
+    rng = np.random.default_rng(700 + int(abs(cfo) * 1e7) % 97)
+    code = mseq(ref.primitive_polys(5)[0], 5)
+    sps, nper = 4, 4000
+    N = code.size * sps
+    x = dsss_signal(code, sps, nper, 0.0, rng, cfo_cyc=cfo)
+    chips, res = ref.dsss_code(x, ref.dsss_code_defaults(1.0, 1.0 / sps, float(N)))
+    assert _match_code(chips, code), (cfo, res["name"], res["cfo_hz"])
+    assert res["name"].startswith("m-sequence (31)")
+    # the offset itself, to a fraction of the capture's resolution
+    assert abs(res["cfo_hz"] - cfo) < 2.0 / (N * nper), (cfo, res["cfo_hz"])
+
+
+@needs_lib
+@pytest.mark.parametrize("cfo", [3e-5, -2e-3])
+def test_code_cfo_c_equals_twin(cfo):
+    rng = np.random.default_rng(42)
+    code = mseq(ref.primitive_polys(5)[0], 5)
+    N = code.size * 4
+    x = dsss_signal(code, 4, 3000, -2.0, rng, cfo_cyc=cfo).astype(np.complex64)
+    cfg = ref.dsss_code_defaults(1.0, 0.25, float(N))
+    ct, rt = ref.dsss_code(x, cfg)
+    cc, rc = atkdsp.dsss_code(x, cfg)
+    assert np.array_equal(np.asarray(cc), np.asarray(ct))
+    assert abs(rc["cfo_hz"] - rt["cfo_hz"]) < 1e-9
+    assert rc["name"] == rt["name"]
+
+
 def test_code_gold_named():
     rng = np.random.default_rng(21)
     r = 5

@@ -60,8 +60,8 @@
 extern "C" {
 #endif
 
-#define ATKDSP_ABI_VERSION 21
-#define ATKDSP_VERSION_STRING "0.20.0"
+#define ATKDSP_ABI_VERSION 23
+#define ATKDSP_VERSION_STRING "0.22.0"
 /* 9 -> 10: atkdsp_spectrum_stats (per-bin max/avg/min + spectral kurtosis in
  * one pass) and atkdsp_window_stats (coherent gain + ENBW, so a level can be
  * read in true dBFS and a bin width in Hz). The FFT plan also became genuinely
@@ -137,6 +137,32 @@ extern "C" {
  * between blocks without disturbing the others; the N-element form
  * (atkdsp_osx_process_n) keeps them phase-coherent for DF (R1-R3, W4). The two
  * channelizer tools (PFB grid §28b, extractor §28a) are now both present. */
+/* 21 -> 22: Undertow, piece 1 (§29; docs/ATKDSP_PLAN.md §B6c) — the
+ * scale-space survey atkdsp_undertow: unknown DSSS searched as cells (dyadic
+ * PFB scale x channel), each with Burel's fluctuation (the wall-free handle,
+ * period_min past the channelized noise's correlation length), the chip-shape
+ * ACF and the scale-constrained cyclic line against the neighbouring cells
+ * (predictive Student-t, atkdsp_t_log10_sf2), a survey-wide Pfa, and hits
+ * merged across scales. Three ATK methods join the provenance table
+ * (ATKDSP_METHOD_SCALE_SURVEY / _ACF_CFAR / _SCALE_CYC; COUNT 24 -> 27).
+ * Two corrections ride along (no signature changes): the PFB's per-hop bin
+ * rotation (every bin a true baseband at any oversampling; at 2x the output
+ * changes by exactly (-1)^k per bin), and the overlap-save extractor's mixing
+ * (absolute time: odd bin shifts and fractional offsets now land on centre and
+ * stay phase-continuous). The PFB also folds in place (no per-hop history
+ * copy) and runs process_n's elements in parallel — both bit-identical. */
+/* 22 -> 23: Undertow, pieces 2, 4 and 6 (§30) — the survey's candidate
+ * periods below its own threshold (atkdsp_dsss_det_lags,
+ * atkdsp_undertow_candidates); the period-synchronous watch atkdsp_psync
+ * (the wide-window eigenvector at a searched period and period rate, scored
+ * against mistuned periods — second order where the fluctuation statistic is
+ * fourth order); the bootstrap atkdsp_bootstrap (psync -> carrier, chip count
+ * -> atkdsp_dsss_code); and the versioned hit blob
+ * (atkdsp_undertow_hit_export / _import). Three ATK methods (PSYNC, LAG_RATE,
+ * BOOTSTRAP; COUNT 27 -> 30). A correction rides along (no signature change):
+ * atkdsp_dsss_code's carrier offset is now read on its eigenvector in two
+ * steps; the period-summed estimate it replaces cancelled itself once the
+ * carrier turned across the capture and returned confident wrong chips. */
 
 /* ---- errors ------------------------------------------------------------ */
 #define ATKDSP_OK            0
@@ -2516,13 +2542,16 @@ ATKDSP_API int             atkdsp_dcs_decode(uint32_t word, int max_errors, int 
  *   2. The contiguous period inside the wide vector (k_max) is the code
  *      waveform, and its position is the code start.
  *   3. The carrier offset AFTER the processing gain (the idea of BE 2015, Le
- *      Nir & Scheers, who estimate it on the eigenvector): the squared (BPSK)
- *      or fourth-power (QPSK) samples, averaged over the aligned periods,
- *      are one clean tone at 2 or 4 times the offset — Kay's weighted phase
- *      estimate on that tone finds alpha where the raw signal could not;
- *      the data are then derotated and the constellation phase aligned the
- *      same way. |alpha| < 1 / (2 P sps) cycles per sample (P = 2 or 4): a
- *      coarser offset comes from the scan's x^2 / x^4 line first.
+ *      Nir & Scheers, who estimate it on the eigenvector), in two steps
+ *      (v0.22): coarse from the eigenvector's full-period support raised to
+ *      the P-th power (a tone at P alpha), fine from the periods despread
+ *      with it (a tone at P delta N per period, resolution 1/capture); the
+ *      data are then derotated and the constellation phase aligned. Before
+ *      v0.22 the period-averaged P-th power was used, which cancels itself
+ *      once the carrier turns across the capture — offsets between about
+ *      1/(capture) and the in-period limit returned confident wrong chips.
+ *      |alpha| < 1 / (2 P sps) cycles per sample (P = 2 or 4): a coarser
+ *      offset comes from the scan's x^2 / x^4 line first.
  *   4. QPSK chips carry two codes (I and Q; OQPSK's Q chips sit half a
  *      chip late): the fourth-power phase aligns the constellation, and each
  *      quadrature's real-valued power iteration gives its code (ATK's form
@@ -2622,7 +2651,13 @@ typedef struct {
 #define ATKDSP_METHOD_PHASE_REF     21   /* radio astronomy (VLBI phase referencing)  */
 #define ATKDSP_METHOD_LATTICE       22   /* ATK                                       */
 #define ATKDSP_METHOD_DECHIRP       23   /* Semtech (LoRa) / open descriptions        */
-#define ATKDSP_METHOD_COUNT        24
+#define ATKDSP_METHOD_SCALE_SURVEY  24   /* ATK (Undertow §29: the scale-space extremum) */
+#define ATKDSP_METHOD_ACF_CFAR      25   /* ATK (chip-shape ACF vs neighbouring cells) */
+#define ATKDSP_METHOD_SCALE_CYC     26   /* ATK (scale-constrained cyclic chip line)  */
+#define ATKDSP_METHOD_PSYNC         27   /* ATK (period-synchronous eigen watch)       */
+#define ATKDSP_METHOD_LAG_RATE      28   /* ATK (lag-rate period refinement)           */
+#define ATKDSP_METHOD_BOOTSTRAP     29   /* ATK (bootstrap code recovery)              */
+#define ATKDSP_METHOD_COUNT        30
 /* NULL for an unknown id. */
 ATKDSP_API const atkdsp_method_info *atkdsp_method(int method_id);
 
@@ -3096,7 +3131,13 @@ ATKDSP_API double      atkdsp_pfb_out_rate(const atkdsp_pfb *p);
  * current state — the m in the [..][m] layouts below. */
 ATKDSP_API size_t      atkdsp_pfb_out_hops(const atkdsp_pfb *p, size_t n);
 /* single element: out is [nchan][m], channel-major (channel k hop i at k*m+i).
- * Returns m (>=0), or ATKDSP_E_CAP if cap < nchan*m. */
+ * Returns m (>=0), or ATKDSP_E_CAP if cap < nchan*m.
+ * Every bin is the TRUE baseband of its channel, referenced to input sample 0,
+ * at any oversampling: a tone df above channel k's centre comes out of bin k at
+ * +df. (v0.19-0.20 referenced each hop to its own start with the wrong sign:
+ * right at 2x up to a constant (-1)^k per bin, wrong at every other ratio. From
+ * v0.21.0 the 2x output differs from v0.20 by exactly (-1)^k — even bins
+ * bit-identical, odd bins negated — so a per-channel covariance is unchanged.) */
 ATKDSP_API ptrdiff_t   atkdsp_pfb_process(atkdsp_pfb *p, const atkdsp_cf32 *in, size_t n,
                                           atkdsp_cf32 *out, size_t cap);
 /* N elements, ONE block clock: ins[el] each n samples, sample-aligned; out is
@@ -3158,7 +3199,12 @@ ATKDSP_API double      atkdsp_osx_chan_rate(const atkdsp_osx *x, int ch);  /* ou
 ATKDSP_API size_t      atkdsp_osx_out_max(const atkdsp_osx *x, int ch, size_t n);
 /* single element: outs[ch] (one pointer per channel slot, NULL for a slot you
  * don't want) each receive out_counts[ch] samples, cap_each each. A free slot
- * writes out_counts[ch]=0. Returns the slot count, or ATKDSP_E_*. */
+ * writes out_counts[ch]=0. Returns the slot count, or ATKDSP_E_*.
+ * Each channel is mixed down by exactly offset_hz in ABSOLUTE time (the integer
+ * bin by the roll, taken to absolute time per block; the residual up to half a
+ * bin removed per sample), so it lands on its centre and is phase-continuous
+ * across blocks and calls, like a DDC. (v0.20.0 mixed relative to each block:
+ * an odd bin shift flipped the sign every block, and the residual was left.) */
 ATKDSP_API ptrdiff_t   atkdsp_osx_process(atkdsp_osx *x, const atkdsp_cf32 *in, size_t n,
                                           atkdsp_cf32 *const *outs, size_t *out_counts,
                                           size_t cap_each);
@@ -3169,6 +3215,257 @@ ATKDSP_API ptrdiff_t   atkdsp_osx_process_n(atkdsp_osx *x, const atkdsp_cf32 *co
                                             atkdsp_cf32 *const *outs, size_t *out_counts,
                                             size_t cap_each);
 ATKDSP_API int         atkdsp_osx_describe(const atkdsp_osx *x, char *buf, size_t cap);
+
+/* ==== UNDERTOW: THE SCALE-SPACE SURVEY (v0.21.0, ABI 22) =================
+ * docs/ATKDSP_PLAN.md §B6c piece 1. Unknown DSSS — unknown carrier, chip rate
+ * and bandwidth — searched as a grid of cells (scale, channel): one PFB (§28b)
+ * per dyadic scale (nchan0 << s channels, B = fs/nchan, cell rate 2B). Three
+ * handles per cell:
+ *   FLUCT  Burel's fluctuation of the window autocorrelation (§25, that handle
+ *          only) — fourth order, no SNR wall, gains with the watch. period_min
+ *          must sit past the channelized noise's correlation length (16 for the
+ *          2x-oversampled grid): below it the noise's own autocorrelation reads
+ *          as a period. At the matched scale a code's period is L*2B/Rc cell
+ *          samples, in [2L, 4L] at every scale, so one lag range serves all.
+ *   ACF    the chip-shape |R(tau)|/R(0) against the neighbouring cells at the
+ *          same scale (predictive Student-t): where and how wide, in seconds,
+ *          above ~-10 dB. Its floor is how alike neighbouring cells' noise is
+ *          — a coloured front end makes it an SNR wall (measured, not hidden).
+ *   CYC    the chip-rate line of |y|^2 inside the scale window [B/2, B]
+ *          against the neighbours per bin: the Rc estimate, above the floor.
+ * Every handle's Pfa is corrected for the cells and the handles: cfg.pfa is
+ * survey-wide. One emitter lights several cells and scales; read() merges them
+ * strongest first — fc, bw and the period from the strongest cell (the
+ * scale-space extremum: the cell about as wide as the signal), each handle's
+ * best evidence kept. rc_hz is 0 (unknown) unless the cyclic line confirmed
+ * it; then L = period * rc and CONSISTENT says L is an integer.
+ * The twin is reference.py §29 (class Undertow). */
+#define ATKDSP_UT_FLUCT       1u
+#define ATKDSP_UT_ACF         2u
+#define ATKDSP_UT_CYC         4u
+#define ATKDSP_UT_PERIOD      8u
+#define ATKDSP_UT_CONSISTENT 16u
+#define ATKDSP_UT_WARMUP     32u
+typedef struct {
+    double  fs;
+    int32_t nscales;          /* dyadic scales, 1..12                              */
+    int32_t nchan0;           /* coarsest scale's channels (power of two >= 4)     */
+    int32_t win;              /* fluctuation window, cell samples (power of two)   */
+    int32_t max_lag;          /* fluctuation lag search; 4 * the longest code      */
+    int32_t period_min;       /* past the cell noise's correlation length (16)     */
+    int32_t acf_lags;         /* chip-shape lags (4)                               */
+    int32_t seg_len;          /* cyclic alpha-spectrum segment (256, power of two) */
+    int32_t taps_per_poly;    /* PFB prototype (12)                                */
+    double  atten_db;         /* PFB stopband (80)                                 */
+    double  pfa;              /* survey-wide false-alarm rate                      */
+    int32_t max_block;        /* internal chunk; process() takes any n             */
+    int32_t reserved[3];
+} atkdsp_undertow_cfg;        /* 72 bytes */
+typedef struct {
+    double   fc_hz, bw_hz;                /* the cell (or a hit's strongest cell)   */
+    double   fluct_log10_pfa, period_s;
+    double   acf_log10_pfa, acf_z;
+    double   cyc_log10_pfa, cyc_alpha_hz, cyc_z;
+    double   rc_hz, L;                    /* 0 = unknown                            */
+    double   log10_pfa;                   /* the best handle, survey-corrected      */
+    int32_t  scale, chan, nwin, nseen;    /* nseen: cells merged into a hit         */
+    uint32_t flags;                       /* ATKDSP_UT_*                            */
+    int32_t  method[4];                   /* survey, FLUCT, ACF, CYC provenance     */
+    int32_t  reserved;
+} atkdsp_undertow_cell;       /* 136 bytes; also the hit record */
+typedef struct atkdsp_undertow atkdsp_undertow;
+/* lmax: the longest code (chips) the fluctuation handle should see. */
+ATKDSP_API void              atkdsp_undertow_defaults(atkdsp_undertow_cfg *cfg, double fs, int nscales, int lmax);
+ATKDSP_API atkdsp_undertow  *atkdsp_undertow_create(const atkdsp_undertow_cfg *cfg);
+ATKDSP_API void              atkdsp_undertow_destroy(atkdsp_undertow *u);
+ATKDSP_API void              atkdsp_undertow_reset(atkdsp_undertow *u);
+ATKDSP_API int               atkdsp_undertow_process(atkdsp_undertow *u, const atkdsp_cf32 *x, size_t n);
+ATKDSP_API int               atkdsp_undertow_ncells(const atkdsp_undertow *u);
+/* every cell's statistics, scale-major (ncells records). */
+ATKDSP_API ptrdiff_t         atkdsp_undertow_cells(const atkdsp_undertow *u, atkdsp_undertow_cell *out, size_t cap);
+/* the hits, strongest first, merged across scales; ATKDSP_E_CAP if cap is short
+ * (out then holds the strongest cap). */
+ATKDSP_API ptrdiff_t         atkdsp_undertow_read(const atkdsp_undertow *u, atkdsp_undertow_cell *hits, size_t cap);
+ATKDSP_API int               atkdsp_undertow_describe(const atkdsp_undertow *u, char *buf, size_t cap);
+/* log10 P(|T| > t) for Student's t with nu degrees of freedom (the survey's
+ * neighbour test; exported for the cross-check). */
+ATKDSP_API double            atkdsp_t_log10_sf2(double t, double nu);
+
+/* ---- 30. Undertow, pieces 2, 4 and 6: candidates, the period-synchronous
+ * watch, the bootstrap and the hit blob ------------------------------------
+ * docs/ATKDSP_PLAN.md §B6c (piece 2's measured note); the twin is reference.py
+ * §30. Measured on the survey's own cells (31-chip code, one bit a period):
+ * the fluctuation handle is fourth order (about -10 dB in 2 s, ~2.5 dB per 10x
+ * of watch, and blind to drift); the period-synchronous eigenvector is second
+ * order — at a known period, -18 dB in 2 s at z ~ 44 — but needs the period
+ * to about chip / (periods watched), held over the watch. So the survey
+ * supplies CANDIDATE periods (even below its own threshold) and psync makes
+ * the depth; the bootstrap turns a detection into the code.
+ *
+ * CANDIDATES. atkdsp_dsss_det_lags: the k strongest interior local maxima of
+ * the fluctuation statistic over period_min..max_lag-1, each with its
+ * parabolic period and the handle's own Bonferroni Gamma tail.
+ * atkdsp_undertow_candidates: those of every survey cell whose CELL-level
+ * tail is at or below max_log10, sorted (tail, finer scale, cell, lag); the
+ * caller re-extracts the cell (scale nchan0 << scale, channel chan, rate
+ * fs_cell) from its recording and hands it to psync.
+ *
+ * PSYNC (one narrowband stream, one candidate). Wide windows of 2 round(T0)
+ * samples cut at nearest-sample starts s_i = round(off + i T + r T^2 i^2 /
+ * (2 fs)) — T the period in samples, r = (dT/dt)/T per second; lambda1 of their
+ * covariance by fixed-count power iteration on the data. The H0 model:
+ * lambda1 at nref mistuned periods T (1 +- (0.010 + 0.003 j)), fitted as a
+ * LINE in the period — the noise eigenvalue trends with how much the windows
+ * overlap, and a one-sided reference set reads that trend as signal
+ * (measured). A lambda1 is scored as a one-sided predictive Student t
+ * (nref - 2 dof, reported as z) against the line, times the hypotheses
+ * searched. Level 0 sweeps T0 +- tol at step 0.5/n over n periods (scored
+ * against the line), in warm-started chains of 64 grid points (the result
+ * does not depend on the thread count), escalating n (x2) until the winner's
+ * tail times the grid size is at most esc_pfa, or n reaches n0_max (BUDGET:
+ * no refinement, no detection). Then the span doubles to all the data (less
+ * the longest reference's stretch), 13 periods (+-6 steps of 0.5/n) a level and,
+ * when rate_max > 0 and the period's drift could slip a quarter sample, a
+ * grid of +-6 rates at step 0.5 fs / (T^2 n^2) (RATE; the lag-rate search —
+ * radar's keystone idea, on the statistic that needs it; measured on a
+ * 20 ppm/s ramp: lambda1 +9 %, the rate to about +-30 % — nearest-sample
+ * window starts make lambda1 bumpy at the 1-2 % level, which bounds the
+ * rate's precision; a ramp slipping under a chip is not identifiable and
+ * not needed). The final tail
+ * counts 4 tol n hypotheses per rate (conservative). lambda2 (deflated): when
+ * it stands above 0.7 of lambda1's excess the windows are re-cut half a
+ * period later (RECUT — a code whose start meets the window start ties); if
+ * it still does, MULTI: several comparable components — symbol-clocked data,
+ * not one repeating code. The wave is the principal eigenvector (window
+ * samples), the code waveform and its pieces.
+ *
+ * BOOTSTRAP. psync. The survey's candidates are often MULTIPLES of the
+ * period (the fluctuation statistic peaks at 2T and 3T about as strongly as
+ * at T), and at kT a wide window holds ~2k periods with independent data —
+ * psync rightly says MULTI (measured: dominance 0.9 at 2T). So on MULTI the
+ * bootstrap tries T/2, T/3, T/4 (>= 8 samples, tol 0.5 — the refined period
+ * is exact) and keeps the first that detects clean (HARMONIC, harmonic = k).
+ * Refused (no code attempted) unless a clean detection is found — symbol-
+ * clocked data has no clean sub-multiple either.
+ * The eigenvector's full-period support gives the carrier offset (its P-th
+ * power's tone, P = 2 BPSK / 4 QPSK); the stream is derotated and resampled
+ * (atkdsp_arb_resampler, ratio m0 / T(t) set block by block) so a period is
+ * exactly m0 = round(T) samples; the chip count, over Rc in [0.4, 1.25] x
+ * bw_hz (the survey cell's scale window, widened) unless rc_hz is given, from
+ * two scores of the eigenvector's support: the chip-centre envelope (sampled
+ * at L chip centres, best of 16 chip phases, mean |.| over rms — a band-
+ * limited code dips at its transitions, so only the true L lands every
+ * sample on a plateau) and the transition line (|d[t+1] - d[t]| at harmonic
+ * L — strong on sharp chips, where the envelope is flat). Each works where
+ * the other fails (measured), so the three best of each are decoded on a
+ * 1024-period slice, interleaved, and one that names a code (m-sequence,
+ * Gold, Barker, a believed LFSR) wins, else the best envelope; line_ratio is its envelope over
+ * the best other L's — near 1.0 the chip count is weakly determined, and only
+ * a named code confirms it. Then atkdsp_dsss_code on everything.
+ * Measured (twin, 1 s at 600 kS/s cells, +40 kHz offset): the exact code,
+ * named, at -10, -16 and -18 dB in-band; the chip-count margin there is thin
+ * (envelope ratio ~1.0), the naming carries it.
+ *
+ * THE HIT BLOB (version 1, little-endian, fixed field order — not a struct
+ * copy): "ATKUTHIT", u16 version, u16 sections (1 hit, 2 bootstrap, 4 chips),
+ * u32 total length; the context (f64 t_unix, rf_center_hz, fs_survey, char
+ * source[40]); the hit (atkdsp_undertow_cell's fields in order, without its
+ * reserved word); the bootstrap (psync result, dsss_code result, then the
+ * bootstrap's own fields, harmonic after support_start); u32 nchips and the chips; u32 CRC-32 (IEEE, as
+ * zlib's) over everything before it. The catalogue that keeps blobs is ATK's
+ * (rf_data, never C:\ or AppData). */
+typedef struct {
+    double  period, ratio, log10_pfa;     /* period in samples (parabolic)    */
+    int32_t lag, reserved;
+} atkdsp_dsss_lag;            /* 32 bytes */
+/* The k = cap strongest; returns the count written (0 in warm-up). */
+ATKDSP_API ptrdiff_t atkdsp_dsss_det_lags(const atkdsp_dsss_det *h, atkdsp_dsss_lag *out, size_t cap);
+
+typedef struct {
+    double  fc_hz, bw_hz, fs_cell, period_s, ratio, log10_pfa;   /* log10_pfa: CELL-level */
+    int32_t scale, chan, lag, reserved;
+} atkdsp_undertow_cand;       /* 64 bytes */
+/* Returns the count available (all of them); out holds the first min(count,
+ * cap) in order. per_cell 1..8. */
+ATKDSP_API ptrdiff_t atkdsp_undertow_candidates(const atkdsp_undertow *u, double max_log10, int per_cell,
+                                                atkdsp_undertow_cand *out, size_t cap);
+
+#define ATKDSP_PS_DETECT  1u
+#define ATKDSP_PS_RATE    2u      /* a period-rate grid was searched          */
+#define ATKDSP_PS_EDGE    4u      /* level 0's winner sat at the edge of tol  */
+#define ATKDSP_PS_BUDGET  8u      /* level 0 stopped at n0_max unconvinced    */
+#define ATKDSP_PS_MULTI   16u     /* several comparable components            */
+#define ATKDSP_PS_RECUT   32u     /* windows re-cut half a period later       */
+typedef struct {
+    double  fs;               /* the stream's rate                              */
+    double  period_s;         /* the candidate period T0 / fs                   */
+    double  tol;              /* +- samples searched around T0 (1.0)            */
+    double  rate_max;         /* |dT/dt| / T searched, 1/s (0: none)            */
+    double  pfa;              /* the detection (1e-3)                           */
+    double  esc_pfa;          /* level 0's escalation stop (1e-3)               */
+    int32_t n0, n0_max;       /* level 0's first span and cap, periods (64, 4096) */
+    int32_t nref;             /* references, even, 8..64 (32)                   */
+    int32_t max_periods;      /* cap on periods used (0: all)                   */
+    int32_t reserved[4];
+} atkdsp_psync_cfg;           /* 80 bytes */
+typedef struct {
+    double  period_s, period_samples, rate;
+    double  lambda1, lambda2, ref_mean, ref_sd, z, log10_pfa;
+    double  snr_db;           /* per sample: (lambda1 - ref) / (T sigma2)      */
+    double  sigma2, dominance, window_offset;
+    int32_t nperiods, n0_used, levels, evals, window;
+    uint32_t flags;           /* ATKDSP_PS_*                                  */
+    int32_t method[4];
+} atkdsp_psync_result;        /* 144 bytes */
+ATKDSP_API void atkdsp_psync_defaults(atkdsp_psync_cfg *cfg, double fs, double period_s);
+/* wave receives `window` samples (cap >= 2 round(T0)); ATKDSP_E_EMPTY when the
+ * stream holds fewer than n0 periods. */
+ATKDSP_API int  atkdsp_psync(const atkdsp_cf32 *x, size_t n, const atkdsp_psync_cfg *cfg,
+                             atkdsp_cf32 *wave, size_t cap, atkdsp_psync_result *out);
+
+#define ATKDSP_BS_DETECT   1u
+#define ATKDSP_BS_CODE     2u     /* chips recovered                         */
+#define ATKDSP_BS_REFUSED  4u     /* no detection, MULTI, or no chip count    */
+#define ATKDSP_BS_RC_GIVEN 8u
+#define ATKDSP_BS_HARMONIC 16u    /* MULTI at the candidate, a clean code at candidate / harmonic */
+typedef struct {
+    atkdsp_psync_cfg ps;
+    double  bw_hz;            /* the survey cell's bandwidth (Rc window)        */
+    double  rc_hz;            /* a known chip rate (0: search)                  */
+    int32_t chip_mod, vote_passes, poly_max_degree, reserved0;
+    double  code_pfa;
+    int32_t reserved[4];
+} atkdsp_bootstrap_cfg;       /* 136 bytes */
+typedef struct {
+    atkdsp_psync_result     ps;
+    atkdsp_dsss_code_result code;
+    double  cfo_hz, rc_hz, fs_code, line_ratio;
+    int32_t L, support_start;
+    uint32_t flags;           /* ATKDSP_BS_*                                  */
+    int32_t method[4];
+    int32_t harmonic;         /* the candidate was this multiple of the period (1: as given) */
+} atkdsp_bootstrap_result;    /* 408 bytes */
+ATKDSP_API void      atkdsp_bootstrap_defaults(atkdsp_bootstrap_cfg *cfg, double fs, double period_s, double bw_hz);
+/* chips: cap >= the code's length (2x for QPSK); returns the chip count
+ * written, 0 when refused (flags say why), or an error. */
+ATKDSP_API ptrdiff_t atkdsp_bootstrap(const atkdsp_cf32 *x, size_t n, const atkdsp_bootstrap_cfg *cfg,
+                                      int8_t *chips, size_t cap, atkdsp_bootstrap_result *out);
+
+#define ATKDSP_UT_BLOB_VERSION 1
+typedef struct {
+    double t_unix, rf_center_hz, fs_survey;
+    char   source[40];
+} atkdsp_undertow_ctx;        /* 64 bytes */
+/* bs and chips may be NULL / 0. Returns the bytes written; with buf NULL, the
+ * size needed. */
+ATKDSP_API ptrdiff_t atkdsp_undertow_hit_export(const atkdsp_undertow_ctx *ctx, const atkdsp_undertow_cell *hit,
+                                                const atkdsp_bootstrap_result *bs, const int8_t *chips,
+                                                size_t nchips, uint8_t *buf, size_t cap);
+/* Checks magic, version, length and CRC (ATKDSP_E_DECODE on any mismatch).
+ * *has_bs is set to 0/1; chips up to cap, *nchips the stored count. */
+ATKDSP_API int       atkdsp_undertow_hit_import(const uint8_t *buf, size_t n, atkdsp_undertow_ctx *ctx,
+                                                atkdsp_undertow_cell *hit, atkdsp_bootstrap_result *bs,
+                                                int *has_bs, int8_t *chips, size_t cap, size_t *nchips);
 
 #ifdef __cplusplus
 }

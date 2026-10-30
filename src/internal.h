@@ -166,4 +166,10 @@ struct atkdsp_lte {
     int32_t     *vit_bp;      /* ATK_LTE_VIT_LAPS*40*64 Viterbi backpointers */
 };
 
+/* dsss_code.c: the frequency (cycles per sample) of the one tone in q
+ * (len complex values as interleaved doubles) — zero-padded FFT peak, then a
+ * parabola through exact double DFTs at the peak and its neighbours. Shared
+ * with the bootstrap (psync.c). */
+int atk_code_tone(const double *q2, size_t len, double *f_out);
+
 #endif

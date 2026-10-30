@@ -9775,8 +9775,9 @@ METHOD_NONE = 0
  METHOD_CFO_EIGEN, METHOD_VOTE, METHOD_VOTE_MARGIN, METHOD_BM, METHOD_PARITY_COUNT,
  METHOD_PCPS, METHOD_MBAPDI, METHOD_DOPPLER_GRID, METHOD_M2M4, METHOD_NWPR, METHOD_PD_MONITOR,
  METHOD_FUSION, METHOD_ACF_CHIP, METHOD_QPSK_SPLIT, METHOD_MSC, METHOD_PHASE_REF,
- METHOD_LATTICE, METHOD_DECHIRP) = range(1, 24)
-METHOD_COUNT = 24
+ METHOD_LATTICE, METHOD_DECHIRP, METHOD_SCALE_SURVEY, METHOD_ACF_CFAR,
+ METHOD_SCALE_CYC, METHOD_PSYNC, METHOD_LAG_RATE, METHOD_BOOTSTRAP) = range(1, 30)
+METHOD_COUNT = 30
 
 _METHODS = {
     METHOD_BUREL_FLUCT: ("fluctuation-of-correlation detector", "G. Burel", "2000", "FR"),
@@ -9802,6 +9803,12 @@ _METHODS = {
     METHOD_PHASE_REF: ("phase referencing on a calibrator", "radio astronomy (VLBI)", "—", "—"),
     METHOD_LATTICE: ("consistency lattice and common-oscillator test", "ATK", "2026", "ATK"),
     METHOD_DECHIRP: ("dechirp detection of chirp spread spectrum", "Semtech; open descriptions", "2013/2017", "US/CH"),
+    METHOD_SCALE_SURVEY: ("scale-space survey over a dyadic filterbank", "ATK (Undertow)", "2026", "ATK"),
+    METHOD_ACF_CFAR: ("chip-shape autocorrelation vs neighbouring cells (predictive t)", "ATK", "2026", "ATK"),
+    METHOD_SCALE_CYC: ("scale-constrained cyclic chip line", "ATK (Undertow)", "2026", "ATK"),
+    METHOD_PSYNC: ("period-synchronous eigen watch vs off-period references", "ATK (Undertow)", "2026", "ATK"),
+    METHOD_LAG_RATE: ("lag-rate period refinement (radar's keystone idea)", "ATK (Undertow)", "2026", "ATK"),
+    METHOD_BOOTSTRAP: ("bootstrap code recovery over the recording", "ATK (Undertow)", "2026", "ATK"),
 }
 
 
@@ -9947,6 +9954,30 @@ class DsssDet:
         if self.handles & DSSS_H_ACF:
             self._acf(out)
         out["llr"] = llr
+        return out
+
+    def lags(self, k: int = 3) -> list:
+        """Twin of atkdsp_dsss_det_lags (§30): the k strongest INTERIOR local
+        maxima of rho over period_min..max_lag-1 (a strict peak on both sides),
+        strongest first (ties: the shorter lag), each with its parabolic period
+        in samples, rho/mean and the same Bonferroni Gamma tail the fluctuation
+        handle reports — candidate periods for psync even when the handle has
+        not fired."""
+        ML, PM = self.max_lag, self.period_min
+        if self._nw < 2 or not (self.handles & DSSS_H_FLUCT) or k < 1:
+            return []
+        rho = self._rho
+        nl = ML - PM + 1
+        nw = float(self._nw)
+        mean = float(np.mean(rho[PM:ML + 1])) or 1e-300
+        lo = PM if PM >= 1 else 1
+        peaks = [t for t in range(lo, ML) if rho[t] > rho[t - 1] and rho[t] > rho[t + 1]]
+        peaks.sort(key=lambda t: (-rho[t], t))
+        out = []
+        for t in peaks[:k]:
+            ratio = float(rho[t] / mean)
+            l10 = min(0.0, _logq_chi2(nw, nw * ratio) / _m.log(10.0) + _m.log10(nl))
+            out.append(dict(lag=int(t), period=float(_parab(rho, t)), ratio=ratio, log10_pfa=l10))
         return out
 
     @staticmethod
@@ -10343,15 +10374,23 @@ def _support_start(v, N):
     return kb
 
 
-def _kay_freq(q):
-    N = q.size
-    if N < 3:
-        return 0.0
-    i = np.arange(N - 1)
-    prod = q[1:] * np.conj(q[:-1])
-    t = i - (N / 2.0 - 1.0)
-    w = 1.5 * N / (N * N - 1.0) * (1.0 - (t / (N / 2.0)) ** 2)
-    return float(np.sum(w * np.arctan2(prod.imag, prod.real))) / (2.0 * np.pi)
+def _code_tone(q):
+    """Frequency (cycles per sample of q) of the one tone in q: the peak of a
+    zero-padded FFT (>= 8 len, a power of two), refined by a parabola on the
+    magnitudes. Magnitude-weighted, so near-zero samples (chip transitions,
+    noise) do not steer it the way they steer a phase-difference estimator."""
+    q = np.asarray(q, np.complex128)
+    nfft = 1
+    while nfft < 8 * q.size:
+        nfft <<= 1
+    Q = np.abs(np.fft.fft(q, nfft))
+    k = int(np.argmax(Q))
+    a, b, c = Q[(k - 1) % nfft], Q[k], Q[(k + 1) % nfft]
+    den = a - 2.0 * b + c
+    off = 0.5 * (a - c) / den if den < 0 else 0.0
+    off = max(-0.5, min(0.5, off))
+    f = (k + off) / nfft
+    return f - 1.0 if f >= 0.5 else f
 
 
 def dsss_code(iq, cfg: dict) -> tuple:
@@ -10426,16 +10465,28 @@ def dsss_code(iq, cfg: dict) -> tuple:
     alpha = 0.0
     nm = res["method"]
     for pass_ in range(2):
-        q = np.sum(xd ** P, 0)
         if pass_ == 0 and not c.get("no_cfo", 0):
-            alpha = _kay_freq(q) / P
+            # The offset in two steps, both on the eigenvector (v0.22; the
+            # period-summed P-th power used before cancels itself once the
+            # carrier turns across the capture, and then returned garbage):
+            # coarse from the P-th power of v1's full-period support (a tone at
+            # P alpha, coherent by construction), fine from the periods
+            # despread with v1 — d_m^P is a tone at P delta N cycles a period.
+            seg = v1[t0:t0 + N]
+            ac = _code_tone(seg ** P) / P
+            idx = np.arange(Mp * N).reshape(Mp, N)
+            xd = xd * np.exp(-2j * np.pi * ac * idx)
+            segd = seg * np.exp(-2j * np.pi * ac * np.arange(N))
+            d = xd @ segd.conj()
+            dl = _code_tone(d ** P) / (P * N)
+            xd = xd * np.exp(-2j * np.pi * dl * idx)
+            alpha = ac + dl
             if abs(alpha) > 1e-12:
-                idx = np.arange(Mp * N).reshape(Mp, N)
-                xd = xd * np.exp(-2j * np.pi * alpha * idx)
                 res["flags"] |= CODE_CFO
                 res["cfo_hz"] = alpha * fs
                 nm.append(METHOD_CFO_EIGEN)
             continue
+        q = np.sum(xd ** P, 0)
         sr = np.sum(q[inst])
         theta = _m.atan2(sr.imag, sr.real)
         if two:
@@ -11340,8 +11391,16 @@ class Pfb:
         return 0
 
     def _rot(self, b):
+        """Reference hop b's bins to input sample 0. The block hop b transforms
+        starts at input sample (b+1)*hop - L, and L = K*nchan, so its FFT
+        carries exp(+2 pi i k ((b+1) hop mod N)/N); this removes it. Each bin is
+        then the true baseband of its channel at ANY oversampling. (Until
+        v0.21.0 this was exp(+2 pi i k (b hop mod N)/N): right at 2x up to a
+        constant (-1)^k per bin, which DF never sees, and wrong at every other
+        ratio — odd bins shifted by half the output rate at 4x. Found by the
+        trunking work, ATK TRUNKED_RADIO_PLAN.md §4A.)"""
         k = np.arange(self.nchan)
-        return np.exp(2j * np.pi * k * ((b * self.hop) % self.nchan) / self.nchan)
+        return np.exp(-2j * np.pi * k * (((b + 1) * self.hop) % self.nchan) / self.nchan)
 
     def process_n(self, ins, nel):
         """ins: list of nel complex arrays, sample-aligned, equal length.
@@ -11446,6 +11505,7 @@ class Osx:
     def reset(self):
         self.hist = [np.zeros(self.ov, np.complex128) for _ in range(self.max_nel)]
         self.pending = [np.zeros(0, np.complex128) for _ in range(self.max_nel)]
+        self.blk = 0               # blocks so far (block i starts at i*hop - ov)
         for c in self.chans:
             if c:
                 for rs in c["rs"]:
@@ -11505,7 +11565,7 @@ class Osx:
         return c["out_rate"] if c else 0.0
 
     def _bin(self, offset):
-        return int(round(offset / self.fs * self.nfft))
+        return int(_m.floor(offset / self.fs * self.nfft + 0.5))
 
     def process_n(self, ins, nel):
         nel = int(nel)
@@ -11529,9 +11589,20 @@ class Osx:
                     M = self.nfft // c["decim"]
                     Yf = Y.reshape(c["decim"], M).sum(axis=0)
                     ys = np.fft.ifft(Yf) / c["decim"]
-                    raw[ci][e].append(ys[self.ov // c["decim"]:])
+                    # the roll mixed by s bins relative to THIS block's start: take
+                    # it to absolute time and remove the residual delta at each
+                    # sample's absolute input index (see the C, §28a).
+                    d = c["decim"]
+                    valid = ys[self.ov // d:]
+                    start = self.blk * self.hop - self.ov
+                    smod = (s % self.nfft) * start % self.nfft
+                    delta = c["offset"] - s * self.fs / self.nfft
+                    nabs = self.blk * self.hop + np.arange(valid.size, dtype=np.int64) * d
+                    ph = -2.0 * np.pi * (smod / self.nfft + delta * nabs.astype(np.float64) / self.fs)
+                    raw[ci][e].append(valid * np.exp(1j * ph))
                 self.hist[e] = block[self.hop:]
                 self.pending[e] = self.pending[e][self.hop:]
+            self.blk += 1
         outs = [None] * nslots
         counts = [0] * nslots
         for ci, c in enumerate(self.chans):
@@ -11552,3 +11623,855 @@ class Osx:
     def process(self, x):
         outs, counts = self.process_n([x], 1)
         return [o[0] if o is not None else None for o in outs], counts
+
+
+# ============================================================================
+# §29  UNDERTOW — the scale-space survey  (v0.21.0, ABI 22)
+# Twin of atkdsp_undertow (src/undertow.c); docs/ATKDSP_PLAN.md §B6c piece 1.
+# A composition of tested kernels: one Pfb per dyadic scale (nchan0 << s
+# channels, spacing B = fs/nchan, 2x oversampled, cell rate 2B); per cell one
+# DsssDet running ONLY the fluctuation handle (the wall-free, fourth-order,
+# period statistic) with period_min past the channelized noise's correlation
+# length; plus a chunk-invariant ACF-shape accumulator and a cyclic |y|^2
+# alpha-spectrum accumulator. At read time the ACF shape and the cyclic line
+# are tested against the cell's neighbours at the same scale (a predictive
+# Student-t — honest under white noise; coloured noise is the SNR wall and
+# is documented, not hidden), every handle is corrected for the number of
+# cells and handles (survey-wide Pfa), and hits are merged across scales.
+# Measured (docs, tests): ACF localises to ~-10 dB in coloured noise in
+# seconds; the fluctuation is wall-free and deepens with the watch.
+# ============================================================================
+
+UT_FLUCT, UT_ACF, UT_CYC, UT_PERIOD, UT_CONSISTENT, UT_WARMUP = 1, 2, 4, 8, 16, 32
+
+
+def _betacf(a, b, x):
+    """Continued fraction for the incomplete beta (Lentz). C does the same."""
+    MAXIT, EPS, FPMIN = 300, 3.0e-16, 1.0e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN: d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN: c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN: d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN: c = FPMIN
+        d = 1.0 / d
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < EPS:
+            break
+    return h
+
+
+def _log_betai(a, b, x):
+    """ln of the regularized incomplete beta I_x(a, b)."""
+    if x <= 0.0:
+        return -_m.inf
+    if x >= 1.0:
+        return 0.0
+    lbt = (_m.lgamma(a + b) - _m.lgamma(a) - _m.lgamma(b) + a * _m.log(x) + b * _m.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return lbt + _m.log(_betacf(a, b, x)) - _m.log(a)
+    # symmetry: I_x(a,b) = 1 - I_{1-x}(b,a)
+    v = 1.0 - _m.exp(lbt + _m.log(_betacf(b, a, 1.0 - x)) - _m.log(b))
+    return _m.log(v) if v > 0.0 else -_m.inf
+
+
+def t_log10_sf2(t, nu):
+    """log10 of the two-sided Student-t tail P(|T| > t), nu dof."""
+    if nu < 1:
+        return 0.0
+    t = abs(float(t))
+    return _log_betai(0.5 * nu, 0.5, nu / (nu + t * t)) / _m.log(10.0)
+
+
+def _ut_pow2_at_least(n):
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def undertow_defaults(fs, nscales=4, lmax=64):
+    """Survey config for codes up to lmax chips. At the MATCHED scale a code's
+    period in cell samples is T = L * 2B / Rc, in [2L, 4L] whatever the scale,
+    so one lag range serves every scale."""
+    max_lag = 4 * int(lmax)
+    return dict(fs=float(fs), nscales=int(nscales), nchan0=8,
+                win=_ut_pow2_at_least(2 * max_lag), max_lag=max_lag,
+                period_min=16, acf_lags=4, seg_len=256, taps_per_poly=12,
+                atten_db=80.0, pfa=1e-3)
+
+
+class Undertow:
+    def __init__(self, cfg: dict):
+        c = dict(cfg)
+        self.fs = float(c["fs"]); self.nscales = int(c["nscales"]); self.nchan0 = int(c["nchan0"])
+        self.win = int(c["win"]); self.max_lag = int(c["max_lag"]); self.period_min = int(c["period_min"])
+        self.K = int(c["acf_lags"]); self.seg = int(c["seg_len"]); self.taps = int(c["taps_per_poly"])
+        self.atten = float(c["atten_db"]); self.pfa = float(c["pfa"])
+        if not self.fs > 0 or not 1 <= self.nscales <= 12:
+            raise ValueError("undertow: fs, nscales")
+        if self.nchan0 < 4 or self.nchan0 & (self.nchan0 - 1):
+            raise ValueError("undertow: nchan0 must be a power of two >= 4")
+        if not 1 <= self.period_min < self.max_lag < self.win or self.win & (self.win - 1):
+            raise ValueError("undertow: period_min < max_lag < win (win a power of two)")
+        if not 1 <= self.K <= 32 or self.seg < 32 or self.seg & (self.seg - 1):
+            raise ValueError("undertow: acf_lags, seg_len")
+        if not 0.0 < self.pfa < 0.5:
+            raise ValueError("undertow: pfa")
+        self.scales = [self.nchan0 << s for s in range(self.nscales)]
+        self.ncells = sum(self.scales)
+        self.pfbs = [Pfb(self.fs, nc, 2, self.taps, self.atten, 1) for nc in self.scales]
+        self.reset()
+
+    def _cell_det(self, B):
+        d = dsss_det_defaults(2.0 * B, self.win, self.max_lag)
+        d["period_min"] = self.period_min
+        d["handles"] = DSSS_H_FLUCT
+        d["pfa"] = self.pfa
+        return DsssDet(d)
+
+    def reset(self):
+        for p in self.pfbs:
+            p.reset()
+        self.det = [[self._cell_det(self.fs / nc) for _ in range(nc)] for nc in self.scales]
+        self.R = [np.zeros((nc, self.K + 1), np.complex128) for nc in self.scales]
+        self.tail = [np.zeros((nc, self.K), np.complex128) for nc in self.scales]
+        self.cnt = [0 for _ in self.scales]
+        self.segbuf = [np.zeros((nc, self.seg), np.complex128) for nc in self.scales]
+        self.fill = [0 for _ in self.scales]
+        self.S = [np.zeros((nc, self.seg)) for nc in self.scales]
+        self.nseg = [0 for _ in self.scales]
+        self.samples = 0
+
+    def process(self, x):
+        x = np.asarray(x, np.complex128).ravel()
+        self.samples += x.size
+        for si, nc in enumerate(self.scales):
+            y = self.pfbs[si].process(x)                       # (nc, m)
+            m = y.shape[1]
+            if m == 0:
+                continue
+            for k in range(nc):
+                v = y[k]
+                self.det[si][k].process(v)
+                w = np.concatenate([self.tail[si][k], v])
+                for t in range(self.K + 1):
+                    self.R[si][k, t] += np.sum(w[self.K:] * np.conj(w[self.K - t: w.size - t]))
+                self.tail[si][k] = w[-self.K:]
+            self.cnt[si] += m
+            # cyclic segments (all channels of a scale fill in lock-step)
+            pos = 0
+            while pos < m:
+                take = min(self.seg - self.fill[si], m - pos)
+                self.segbuf[si][:, self.fill[si]:self.fill[si] + take] = y[:, pos:pos + take]
+                self.fill[si] += take; pos += take
+                if self.fill[si] == self.seg:
+                    e = np.abs(self.segbuf[si]) ** 2
+                    e = e - e.mean(axis=1, keepdims=True)
+                    self.S[si] += np.abs(np.fft.fft(e, axis=1)) ** 2
+                    self.nseg[si] += 1
+                    self.fill[si] = 0
+
+    # -- the verdicts ----------------------------------------------------------
+    @staticmethod
+    def _refs(k, nc):
+        r = min(4, max(1, (nc - 3) // 2))
+        return [(k + d) % nc for d in list(range(-1 - r, -1)) + list(range(2, 2 + r))]
+
+    def _pred_t(self, v, refs_vals):
+        n = len(refs_vals)
+        if n < 3:
+            return 0.0
+        mu = float(np.mean(refs_vals)); sd = float(np.std(refs_vals, ddof=1))
+        if not sd > 0.0:
+            return 0.0
+        t = (v - mu) / (sd * _m.sqrt(1.0 + 1.0 / n))
+        return t_log10_sf2(t, n - 1)
+
+    def cells(self) -> list:
+        out = []
+        corr = _m.log10(self.ncells) + _m.log10(3.0)
+        for si, nc in enumerate(self.scales):
+            B = self.fs / nc
+            cnt = self.cnt[si]
+            R = self.R[si]
+            shape = np.zeros((nc, self.K))
+            p0 = np.zeros(nc)
+            for k in range(nc):
+                r0 = R[k, 0].real
+                p0[k] = r0 / cnt if cnt else 0.0
+                shape[k] = np.abs(R[k, 1:]) / r0 if r0 > 0 else 0.0
+            ns = self.nseg[si]
+            a = np.fft.fftfreq(self.seg, d=1.0 / (2.0 * B))
+            win = (np.abs(a) >= 0.5 * B) & (np.abs(a) <= B)
+            wbins = np.nonzero(win)[0]
+            if ns:
+                Sn = self.S[si] / ns / np.maximum(p0[:, None] ** 2, 1e-300)
+            for k in range(nc):
+                rd = self.det[si][k].read()
+                cell = dict(scale=si, chan=k, fc_hz=k * B if k < nc // 2 else (k - nc) * B, bw_hz=B,
+                            fluct_log10_pfa=0.0, period_s=0.0, acf_log10_pfa=0.0, acf_z=0.0,
+                            cyc_log10_pfa=0.0, cyc_alpha_hz=0.0, cyc_z=0.0, rc_hz=0.0, L=0.0,
+                            log10_pfa=0.0, flags=0, nwin=int(rd.get("nwin", 0)), nseen=1,
+                            method=[METHOD_SCALE_SURVEY, METHOD_BUREL_FLUCT, METHOD_ACF_CFAR, METHOD_SCALE_CYC])
+                if cnt < self.win or rd.get("flags", 0) & DSSS_WARMUP:
+                    cell["flags"] |= UT_WARMUP
+                cell["fluct_log10_pfa"] = min(0.0, rd.get("fluct_log10_pfa", 0.0) + corr)
+                if rd.get("flags", 0) & DSSS_PERIOD:
+                    cell["period_s"] = rd["period_s"]; cell["flags"] |= UT_PERIOD
+                refs = self._refs(k, nc)
+                # ACF shape: the most significant lag, predictive t vs the neighbours
+                best = 0.0; bz = 0.0
+                for t in range(self.K):
+                    lp = self._pred_t(shape[k, t], shape[refs, t])
+                    if lp < best:
+                        best = lp
+                        mu = shape[refs, t].mean(); sd = shape[refs, t].std(ddof=1)
+                        bz = (shape[k, t] - mu) / sd if sd > 0 else 0.0
+                cell["acf_log10_pfa"] = min(0.0, best + _m.log10(self.K) + corr)
+                cell["acf_z"] = float(bz)
+                # cyclic line in the scale window, predictive t per bin vs the neighbours
+                if ns:
+                    best = 0.0; bb = -1
+                    for j in wbins:
+                        lp = self._pred_t(Sn[k, j], Sn[refs, j])
+                        if lp < best and Sn[k, j] > np.mean(Sn[refs, j]):
+                            best = lp; bb = j
+                    cell["cyc_log10_pfa"] = min(0.0, best + _m.log10(max(1, wbins.size)) + corr)
+                    if bb >= 0:
+                        cell["cyc_alpha_hz"] = float(abs(a[bb]))
+                        mu = Sn[refs, bb].mean(); sd = Sn[refs, bb].std(ddof=1)
+                        cell["cyc_z"] = float((Sn[k, bb] - mu) / sd) if sd > 0 else 0.0
+                lp = _m.log10(self.pfa)
+                if cell["fluct_log10_pfa"] < lp: cell["flags"] |= UT_FLUCT
+                if cell["acf_log10_pfa"] < lp:   cell["flags"] |= UT_ACF
+                if cell["cyc_log10_pfa"] < lp:   cell["flags"] |= UT_CYC
+                cell["log10_pfa"] = min(cell["fluct_log10_pfa"], cell["acf_log10_pfa"], cell["cyc_log10_pfa"])
+                if cell["flags"] & UT_CYC:
+                    cell["rc_hz"] = cell["cyc_alpha_hz"]
+                    if cell["period_s"] > 0:
+                        L = cell["period_s"] * cell["rc_hz"]
+                        cell["L"] = L
+                        if L >= 2.0 and abs(L - round(L)) <= 0.05 * max(1.0, L) ** 0.5:
+                            cell["flags"] |= UT_CONSISTENT
+                out.append(cell)
+        return out
+
+    def read(self) -> list:
+        """Hits: cells with a handle fired, strongest first, merged across scales
+        and neighbouring channels (one hit per emitter; nseen = cells merged)."""
+        lit = [c for c in self.cells() if c["flags"] & (UT_FLUCT | UT_ACF | UT_CYC)]
+        lit.sort(key=lambda c: (c["log10_pfa"], -c["scale"]))
+        hits = []
+        for c in lit:
+            lo, hi = c["fc_hz"] - c["bw_hz"], c["fc_hz"] + c["bw_hz"]
+            for h in hits:
+                if lo < h["fc_hz"] + h["bw_hz"] and h["fc_hz"] - h["bw_hz"] < hi:
+                    h["nseen"] += 1
+                    h["flags"] |= c["flags"] & (UT_FLUCT | UT_ACF | UT_CYC | UT_CONSISTENT)
+                    # each handle keeps its best evidence across the merged cells;
+                    # where/how-wide (fc, bw, period) stay the strongest cell's
+                    for key in ("fluct_log10_pfa", "acf_log10_pfa", "cyc_log10_pfa"):
+                        h[key] = min(h[key], c[key])
+                    if c["cyc_log10_pfa"] <= h["cyc_log10_pfa"] and c["cyc_alpha_hz"] > 0:
+                        h["cyc_alpha_hz"] = c["cyc_alpha_hz"]; h["cyc_z"] = c["cyc_z"]
+                        if c["flags"] & UT_CYC:
+                            h["rc_hz"] = c["rc_hz"]
+                            if h["period_s"] > 0:
+                                h["L"] = h["period_s"] * h["rc_hz"]
+                    if c["acf_log10_pfa"] <= h["acf_log10_pfa"]:
+                        h["acf_z"] = c["acf_z"]
+                    break
+            else:
+                hits.append(dict(c))
+        return hits
+
+    def candidates(self, max_log10: float = -1.0, per_cell: int = 3) -> list:
+        """Twin of atkdsp_undertow_candidates (§30): each cell's per_cell
+        strongest fluctuation lags whose CELL-level tail (Bonferroni over the
+        cell's lags only, not over the survey) is at or below max_log10 — the
+        seeds psync takes below the survey's own threshold. Sorted by
+        log10_pfa, then the finer scale, then the cell, then the lag."""
+        if per_cell < 1:
+            raise ValueError("undertow: per_cell >= 1")
+        out = []
+        idx = 0
+        for si, nc in enumerate(self.scales):
+            B = self.fs / nc
+            for k in range(nc):
+                for lg in self.det[si][k].lags(per_cell):
+                    if lg["log10_pfa"] <= max_log10:
+                        out.append(dict(scale=si, chan=k, fc_hz=k * B if k < nc // 2 else (k - nc) * B,
+                                        bw_hz=B, fs_cell=2.0 * B, lag=lg["lag"],
+                                        period_s=lg["period"] / (2.0 * B), ratio=lg["ratio"],
+                                        log10_pfa=lg["log10_pfa"], _i=idx))
+                idx += 1
+        out.sort(key=lambda c: (c["log10_pfa"], -c["scale"], c["_i"], c["lag"]))
+        for c in out:
+            del c["_i"]
+        return out
+
+    def describe(self) -> str:
+        return (f"Undertow {self.fs/1e6:.6g} MSPS: {self.nscales} scales "
+                f"({self.scales[0]}..{self.scales[-1]} chan, B {self.fs/self.scales[-1]/1e3:.4g}"
+                f"..{self.fs/self.scales[0]/1e3:.4g} kHz), {self.ncells} cells, win {self.win}, "
+                f"lags {self.period_min}..{self.max_lag}, Pfa {self.pfa:g} survey-wide")
+
+
+# ============================================================================
+# §30 Undertow pieces 2 + 4 + 6 — the twin of src/psync.c: the
+# period-synchronous watch (psync), the bootstrap (psync -> the code), and the
+# hit blob. The candidates accessors (DsssDet.lags, Undertow.candidates) are
+# above, beside their classes.
+# ============================================================================
+PS_DETECT, PS_RATE, PS_EDGE, PS_BUDGET, PS_MULTI, PS_RECUT = 1, 2, 4, 8, 16, 32
+_PS_CHUNK = 64          # level-0 grid points per warm-start chain (thread-count independent)
+_PS_IT0, _PS_ITP, _PS_ITR, _PS_ITREF = 6, 30, 10, 30
+
+
+def psync_defaults(fs: float, period_s: float) -> dict:
+    return dict(fs=float(fs), period_s=float(period_s), tol=1.0, rate_max=0.0, pfa=1e-3, esc_pfa=1e-3,
+                n0=64, n0_max=4096, nref=32, max_periods=0)
+
+
+def _ps_starts(n, T, r, fs, off=0.0):
+    i = np.arange(n, dtype=np.float64)
+    return np.floor(off + i * T + 0.5 * r * T * T / fs * i * i + 0.5).astype(np.int64)
+
+
+def _ps_lam(y, s, W, v, iters, deflate=None):
+    """Fixed-count power iteration on the windows y[s_i : s_i + W]:
+    v <- (1/n) sum_i y_i (y_i^H v) / |.|; returns (|R v|, v)."""
+    X = y[s[:, None] + np.arange(W)[None, :]]
+    n = X.shape[0]
+    lam = 0.0
+    for _ in range(iters):
+        u = (X.T @ (X.conj() @ v)) / n
+        if deflate is not None:
+            u = u - deflate * np.vdot(deflate, u)
+        nu = float(np.sqrt(np.sum(u.real ** 2 + u.imag ** 2)))
+        if not nu > 0.0:
+            return 0.0, v
+        v = u / nu
+        lam = nu
+    return lam, v
+
+
+def _ps_cold(y, W):
+    v = np.array(y[:W], np.complex128)
+    nv = float(np.sqrt(np.sum(v.real ** 2 + v.imag ** 2)))
+    return v / nv if nv > 0 else np.ones(W, np.complex128) / _m.sqrt(W)
+
+
+def _ps_avail(N, W, T, tol, r, fs):
+    """Periods whose wide window fits, with the period stretched by tol and the rate."""
+    n = int((N - W - 2) // (T + tol))
+    while n > 0 and _ps_starts(n, T + tol, abs(r), fs)[-1] + W > N:
+        n -= 1
+    return max(0, n)
+
+
+def _ps_eps(nref):
+    """The references' relative period offsets: +-(0.010 + 0.003 j), j < nref/2
+    — symmetric, so the noise eigenvalue's trend with the window overlap is
+    fitted rather than mistaken for signal; the smallest offset already slips
+    a code by a chip within a few windows."""
+    return [sg * (0.010 + 0.003 * j) for j in range(nref // 2) for sg in (-1.0, 1.0)]
+
+
+def _ps_eps_max(nref):
+    return 0.010 + 0.003 * (nref // 2 - 1)
+
+
+def _ps_refs(y, fs, Tc, n, W, nref):
+    """H0 model around Tc: lambda1 at the mistuned periods Tc (1 + eps), and a
+    line lambda = a + b (T - Tc) by least squares. Returns
+    (a, b, sd, xbar, sxx, k), sd the residual standard deviation (k - 2 dof)."""
+    xs, ls = [], []
+    for e in _ps_eps(nref):
+        Tr = Tc * (1.0 + e)
+        st = _ps_starts(n, Tr, 0.0, fs)
+        if st[-1] + W > y.size:
+            continue
+        ls.append(_ps_lam(y, st, W, _ps_cold(y, W), _PS_ITREF)[0])
+        xs.append(Tr - Tc)
+    k = len(ls)
+    if k < 4:
+        return (0.0, 0.0, 0.0, 0.0, 0.0, k)
+    x = np.array(xs); l = np.array(ls)
+    xbar = float(np.mean(x)); lbar = float(np.mean(l))
+    sxx = float(np.sum((x - xbar) ** 2))
+    bb = float(np.sum((x - xbar) * (l - lbar)) / sxx) if sxx > 0 else 0.0
+    aa = lbar - bb * xbar
+    sd = float(np.sqrt(np.sum((l - (aa + bb * x)) ** 2) / (k - 2)))
+    return (aa, bb, sd, xbar, sxx, k)
+
+
+def _ps_tail(lam, T, Tc, h0, nhyp):
+    """log10 of the one-sided predictive-t tail (k - 2 dof) of lam against the
+    H0 line h0 at period T, times nhyp hypotheses (clamped at 0); and t."""
+    aa, bb, sd, xbar, sxx, k = h0
+    if k < 4 or not sd > 0.0:
+        return 0.0, 0.0
+    x = T - Tc
+    lev = 1.0 / k + ((x - xbar) ** 2 / sxx if sxx > 0 else 0.0)
+    t = (lam - (aa + bb * x)) / (sd * _m.sqrt(1.0 + lev))
+    if not t > 0.0:
+        return 0.0, t
+    l10 = t_log10_sf2(t, k - 2) - _m.log10(2.0) + _m.log10(max(1.0, nhyp))
+    return min(0.0, l10), t
+
+
+def psync(y, cfg: dict):
+    """Twin of atkdsp_psync (§30). y: one narrowband stream (a survey cell, or
+    any channel holding the candidate); cfg: psync_defaults(). Returns
+    (result dict, wave) — wave is the principal eigenvector of the 2-period
+    wide windows (2 round(T0) samples): the code waveform and its pieces.
+
+    The H0 model: lambda1 at nref mistuned periods T (1 +- eps) (the noise
+    bulk, coloured noise and the signal's stationary part included), fitted
+    as a line in the period — the noise eigenvalue trends with how much the
+    wide windows overlap, and a one-sided reference set reads that trend as
+    signal. Each lambda1 is scored as a one-sided predictive Student t
+    against the line (k - 2 dof, reported as z), times the hypotheses
+    searched.
+
+    Search: level 0 sweeps T0 +- tol at step 0.5/n over n periods (scored
+    against the line, so the trend cannot pick an edge), warm-started in
+    chains of 64 grid points, and escalates n (x2) until the winner's tail
+    times the grid size is at most esc_pfa, or n reaches n0_max (BUDGET).
+    Then the span doubles to all the data (less the longest reference's
+    stretch), each level trying 13 periods (+-6 steps) at step 0.5/n — and, when
+    rate_max > 0 and the period's drift could slip a quarter sample, a grid
+    of rates (dT/dt)/T at step 0.5 fs / (T^2 n^2). The final tail counts
+    4 tol n hypotheses per rate (conservative). Then lambda2 (deflated): when
+    it stands nearly as high as lambda1 (dominance > 0.7) the windows are
+    re-cut half a period later — a code whose start meets the window start
+    ties — and if it still does, MULTI: several comparable components,
+    symbol-clocked data rather than one repeating code."""
+    c = dict(cfg)
+    fs = float(c["fs"]); T0 = float(c["period_s"]) * fs
+    tol = float(c.get("tol", 1.0)); rmax = float(c.get("rate_max", 0.0))
+    pfa = float(c.get("pfa", 1e-3)); esc = float(c.get("esc_pfa", 1e-3))
+    n0 = int(c.get("n0", 64)); n0max = int(c.get("n0_max", 4096)); nref = int(c.get("nref", 32))
+    maxp = int(c.get("max_periods", 0))
+    if not fs > 0 or not T0 >= 4.0 or not 0.0 < tol <= 0.25 * T0 or rmax < 0 or not 0.0 < pfa < 0.5:
+        raise ValueError("psync: fs > 0, period >= 4 samples, 0 < tol <= period/4, rate_max >= 0, pfa")
+    if not 8 <= n0 <= n0max or not 8 <= nref <= 64 or nref % 2 or not 0.0 < esc < 0.5 or maxp < 0:
+        raise ValueError("psync: 8 <= n0 <= n0_max, nref even in 8..64, 0 < esc_pfa < 0.5")
+    y = np.asarray(y, np.complex64).astype(np.complex128).ravel()
+    W = 2 * int(_m.floor(T0 + 0.5))
+    em = _ps_eps_max(nref)
+    res = dict(period_s=0.0, period_samples=0.0, rate=0.0, lambda1=0.0, lambda2=0.0, ref_mean=0.0,
+               ref_sd=0.0, z=0.0, log10_pfa=0.0, snr_db=-99.0, sigma2=0.0, dominance=0.0,
+               window_offset=0.0, nperiods=0, n0_used=0, levels=0, evals=0, window=W, flags=0,
+               method=[METHOD_PSYNC, METHOD_EIGEN_WIDE, 0, 0])
+    navail = _ps_avail(y.size, W, (T0 + tol) * (1.0 + em), 0.0, 0.0, fs)
+    if maxp:
+        navail = min(navail, maxp)
+    if navail < n0:
+        raise ValueError("psync: fewer periods than n0 in the stream")
+    evals = 0
+    n = n0
+    while True:                                           # ---- level 0, escalating
+        step = 0.5 / n
+        K = int(_m.floor(tol / step + 1e-9))
+        h0 = _ps_refs(y, fs, T0, n, W, nref)
+        evals += h0[5]
+        bslope = h0[1]
+        best = (-np.inf, 0, None, 0.0)
+        for c0 in range(-K, K + 1, _PS_CHUNK):
+            v = _ps_cold(y, W)
+            for kk in range(c0, min(c0 + _PS_CHUNK, K + 1)):
+                l, v = _ps_lam(y, _ps_starts(n, T0 + kk * step, 0.0, fs), W, v, _PS_IT0)
+                evals += 1
+                sc = l - bslope * (kk * step)
+                if sc > best[0]:
+                    best = (sc, kk, v.copy(), l)
+        T = T0 + best[1] * step
+        lam, v = _ps_lam(y, _ps_starts(n, T, 0.0, fs), W, best[2], _PS_ITP)
+        evals += 1
+        l10_0, z = _ps_tail(lam, T, T0, h0, 2 * K + 1)
+        res["levels"] += 1
+        edge = abs(best[1]) >= K
+        ok0 = l10_0 <= _m.log10(esc)
+        if ok0 or n >= min(n0max, navail):
+            break
+        n = min(2 * n, n0max, navail)
+    res["n0_used"] = n
+    if edge:
+        res["flags"] |= PS_EDGE
+    r = 0.0
+    nrate = 1
+    Tc = T0
+    if not ok0:
+        res["flags"] |= PS_BUDGET
+    else:                                                 # ---- refine to all the data
+        nall = navail if not rmax > 0 else min(navail, _ps_avail(y.size, W, (T + 0.5) * (1.0 + em), 0.0, rmax, fs))
+        while n < nall:
+            n = min(2 * n, nall)
+            step = 0.5 / n
+            rates = [r]
+            if rmax > 0:
+                rstep = 0.5 * fs / (T * T * n * n)
+                # active once rmax could slip a quarter sample (rmax >= rstep); then
+                # always +-6 steps, so a rate the coarse level chose by noise can walk back
+                kr = 6 if rmax >= rstep else 0
+                if kr >= 1:
+                    rates = [r + j * rstep for j in range(-kr, kr + 1) if abs(r + j * rstep) <= rmax * (1 + 1e-12)]
+                    res["flags"] |= PS_RATE
+                    nrate = max(nrate, int(1 + 2 * rmax / rstep))
+            best = (-1.0, T, r, v)
+            for rr in rates:
+                for j in range(-6, 7):
+                    Tc_ = T + j * step
+                    l, vv = _ps_lam(y, _ps_starts(n, Tc_, rr, fs), W, v, _PS_ITR)
+                    evals += 1
+                    if l > best[0]:
+                        best = (l, Tc_, rr, vv)
+            _, T, r, v = best
+            res["levels"] += 1
+        lam, v = _ps_lam(y, _ps_starts(n, T, r, fs), W, v, _PS_ITP)
+        h0 = _ps_refs(y, fs, T, n, W, nref)
+        evals += 1 + h0[5]
+        Tc = T
+    # ---- lambda2, the re-cut and the dominance
+    mu = h0[0] + h0[1] * (T - Tc)
+    off = 0.0
+    s = _ps_starts(n, T, r, fs)
+    v2 = _ps_cold(y[int(T):], W) if y.size > int(T) + W else _ps_cold(y, W)
+    v2 = v2 - v * np.vdot(v, v2); v2 /= max(np.linalg.norm(v2), 1e-300)
+    lam2, _ = _ps_lam(y, s, W, v2, _PS_ITP, deflate=v)
+    evals += 1
+    dom = (lam2 - mu) / (lam - mu) if lam > mu else 0.0
+    s2 = _ps_starts(n, T, r, fs, 0.5 * T)
+    if ok0 and dom > 0.7 and s2[-1] + W <= y.size:
+        l1b, vb = _ps_lam(y, s2, W, v, _PS_ITP)
+        v2b = v2 - vb * np.vdot(vb, v2); v2b /= max(np.linalg.norm(v2b), 1e-300)
+        l2b, _ = _ps_lam(y, s2, W, v2b, _PS_ITP, deflate=vb)
+        evals += 2
+        domb = (l2b - mu) / (l1b - mu) if l1b > mu else 0.0
+        if domb < dom:
+            lam, lam2, v, dom, off, s = l1b, l2b, vb, domb, 0.5 * T, s2
+            res["flags"] |= PS_RECUT
+    X = y[s[:, None] + np.arange(W)[None, :]]
+    sig2 = float(np.mean(X.real ** 2 + X.imag ** 2))
+    neff = max(1.0, 4.0 * tol * n) * nrate
+    l10, z = _ps_tail(lam, T, Tc, h0, neff)
+    res.update(period_samples=T, period_s=T / fs, rate=r, lambda1=lam, lambda2=lam2, ref_mean=mu,
+               ref_sd=h0[2], z=z, log10_pfa=l10, sigma2=sig2, dominance=dom, nperiods=n, evals=evals,
+               window_offset=off)
+    if lam > mu and sig2 > 0:
+        res["snr_db"] = 10.0 * _m.log10((lam - mu) / (T * sig2))
+    if ok0 and l10 <= _m.log10(pfa):
+        res["flags"] |= PS_DETECT
+        if dom > 0.7:
+            res["flags"] |= PS_MULTI
+    if res["flags"] & PS_RATE:
+        res["method"][2] = METHOD_LAG_RATE
+    return res, v
+
+
+# ---- 30b. the bootstrap: psync -> the code ----------------------------------
+BS_DETECT, BS_CODE, BS_REFUSED, BS_RC_GIVEN, BS_HARMONIC = 1, 2, 4, 8, 16
+
+
+def bootstrap_defaults(fs: float, period_s: float, bw_hz: float) -> dict:
+    d = psync_defaults(fs, period_s)
+    d.update(bw_hz=float(bw_hz), rc_hz=0.0, chip_mod=CHIP_BPSK, vote_passes=6, poly_max_degree=14,
+             code_pfa=1e-3)
+    return d
+
+
+def _bs_support(wave, m0):
+    e = np.abs(wave) ** 2
+    cs = np.concatenate([[0.0], np.cumsum(e)])
+    sums = cs[m0:] - cs[:-m0]
+    return int(np.argmax(sums))
+
+
+def _bs_cfo(seg, P):
+    """Carrier offset (cycles/sample) from the P-th power of the code
+    waveform's full-period support: a code chip's P-th power is constant, so
+    seg**P is one tone at P times the offset (BE 2015's observation, on the
+    eigenvector, after the processing gain) — read like dsss_code's."""
+    return _code_tone(np.asarray(seg, np.complex128) ** P) / P
+
+
+_BS_LSLICE = 1024        # periods each shortlisted chip count is decoded on
+_BS_NPHASE = 16          # chip phases tried per candidate L
+
+
+def _bs_scores(seg, f, T, lmin, lmax):
+    """Two chip-count scores per candidate L, from the eigenvector's support
+    (derotated, phase-aligned real):
+    env  — the chip-centre envelope: sampled at L chip centres (best of 16
+           chip phases, linear interpolation, circular), mean |.| over rms.
+           The true L puts every sample on a chip's plateau; a band-limited
+           code dips at its transitions, so a wrong L (or 2L) scores lower.
+    line — the transition line: |sum_t |d[t+1] - d[t]| e^{-2 pi j L t / T}|,
+           the chip boundaries' pulse train at harmonic L. Strong on sharp
+           (unfiltered) chips, where the envelope is flat at every L; weak in
+           a survey cell, whose filter smooths the transitions.
+    Each works where the other fails (measured), so both shortlist.
+    Returns ({L: env}, {L: line})."""
+    m0 = seg.size
+    d = seg * np.exp(-2j * np.pi * f * np.arange(m0))
+    th = 0.5 * _m.atan2(float(np.sum(d ** 2).imag), float(np.sum(d ** 2).real))
+    dr = (d * np.exp(-1j * th)).real
+    rms = float(np.sqrt(np.mean(dr ** 2))) or 1e-300
+    ext = np.append(dr, dr[0])
+    a = np.abs(np.roll(d, -1) - d)
+    t = np.arange(m0)
+    env, line = {}, {}
+    for L in range(lmin, lmax + 1):
+        sps = T / L
+        best = 0.0
+        for j in range(_BS_NPHASE):
+            pos = (j * sps / _BS_NPHASE + np.arange(L) * sps) % m0
+            i0 = np.floor(pos).astype(np.int64)
+            fr = pos - i0
+            v = ext[i0] * (1.0 - fr) + ext[i0 + 1] * fr
+            best = max(best, float(np.mean(np.abs(v))) / rms)
+        env[L] = best
+        line[L] = float(abs(np.sum(a * np.exp(-2j * np.pi * L * t / T))))
+    return env, line
+
+
+def _bs_choose_L(z, fs2, m0, env, line, ccfg_base):
+    """The chip count: the shortlist interleaves the three best envelope and
+    the three best transition-line scores (env 1, line 1, env 2, ...; each L
+    once); each is decoded on a slice (<= 1024 periods), and the first whose
+    chips name a code (m-sequence, Gold, Barker or a believed LFSR — wrong
+    chips essentially never factor into a primitive polynomial) wins, else
+    the best envelope. Returns (L, the winner's envelope over the best other
+    L's)."""
+    if not env:
+        return 0, 0.0
+    eo = sorted(env, key=lambda l: (-env[l], l))[:3]
+    lo = sorted(line, key=lambda l: (-line[l], l))[:3]
+    short = []
+    for i in range(3):
+        for cand in (eo[i] if i < len(eo) else None, lo[i] if i < len(lo) else None):
+            if cand is not None and cand not in short:
+                short.append(cand)
+    zs = z[:min(z.size, _BS_LSLICE * m0 + 2 * m0)].astype(np.complex64)
+    pick = eo[0]
+    for L in short:
+        cc = dict(ccfg_base); cc["rc"] = L * fs2 / m0
+        try:
+            _, r = dsss_code(zs, cc)
+        except ValueError:
+            continue
+        if r["L"] == L and r["flags"] & (CODE_NAMED | CODE_POLY):
+            pick = L
+            break
+    others = [env[l] for l in env if l != pick]
+    return pick, (env[pick] / max(others) if others and max(others) > 0 else 0.0)
+
+
+def bootstrap(y, cfg: dict):
+    """Twin of atkdsp_bootstrap (§30): from one stream holding a candidate to
+    its code. (chips, result). psync finds the period (and its rate) and the
+    wide-window eigenvector; the eigenvector's full-period support gives the
+    carrier offset (its P-th power's tone); the stream is derotated and
+    resampled so a period is exactly m0 = round(T) samples, following the
+    period's drift block by block; the chip count is the L (Rc in [0.4, 1.25]
+    x bw_hz — the survey cell's scale window, widened — unless rc_hz is
+    given) from a shortlist of the eigenvector's chip-centre envelope and
+    transition-line scores, decoded on a 1024-period slice, one that names a
+    code preferred;
+    then atkdsp_dsss_code on everything — the vote, the margins, the
+    generator. line_ratio is the chosen L's envelope over the best other L's
+    (near 1: the chip count is weakly determined). Refused (no code attempted) when psync does not
+    detect, or detects MULTI (symbol-clocked data, not a repeating code)."""
+    c = dict(cfg)
+    fs = float(c["fs"]); bw = float(c.get("bw_hz", 0.0)); rc_given = float(c.get("rc_hz", 0.0))
+    chip_mod = int(c.get("chip_mod", CHIP_BPSK))
+    if not (bw > 0 or rc_given > 0) or chip_mod not in (CHIP_BPSK, CHIP_QPSK, CHIP_OQPSK):
+        raise ValueError("bootstrap: bw_hz or rc_hz, and chip_mod")
+    pcfg = {k: c[k] for k in psync_defaults(fs, 1.0) if k in c}
+    ps, wave = psync(y, pcfg)
+    res = dict(ps=ps, code=None, cfo_hz=0.0, rc_hz=0.0, fs_code=0.0, line_ratio=0.0, L=0,
+               support_start=0, harmonic=1, flags=0, method=[METHOD_BOOTSTRAP, METHOD_PSYNC, 0, 0])
+    if ps["flags"] & PS_DETECT and ps["flags"] & PS_MULTI:
+        # a multiple of the period? try T/2, T/3, T/4 — the first clean detection wins
+        Tm = ps["period_samples"]
+        for k in (2, 3, 4):
+            Tk = Tm / k
+            if Tk < 8.0:
+                break
+            p2, w2 = psync(y, dict(pcfg, period_s=Tk / fs, tol=0.5))
+            if p2["flags"] & PS_DETECT and not p2["flags"] & PS_MULTI:
+                ps, wave = p2, w2
+                res.update(ps=ps, harmonic=k)
+                res["flags"] |= BS_HARMONIC
+                break
+    if not (ps["flags"] & PS_DETECT) or (ps["flags"] & PS_MULTI):
+        res["flags"] |= BS_REFUSED
+        return np.zeros(0, np.int8), res
+    res["flags"] |= BS_DETECT
+    T = ps["period_samples"]; r = ps["rate"]
+    m0 = int(_m.floor(T + 0.5))
+    if m0 < 4 or m0 > wave.size:
+        res["flags"] |= BS_REFUSED
+        return np.zeros(0, np.int8), res
+    t0 = _bs_support(wave, m0)
+    seg = wave[t0:t0 + m0]
+    P = 2 if chip_mod == CHIP_BPSK else 4
+    f = _bs_cfo(seg, P)
+    x = np.asarray(y, np.complex64).astype(np.complex128).ravel()
+    x = x * np.exp(-2j * np.pi * f * np.arange(x.size))
+    fs2 = fs * m0 / T
+    rs = ArbResampler(fs, fs2, 60.0, 64)
+    if r == 0.0:
+        z = rs.process(x)
+    else:
+        parts = []
+        for b0 in range(0, x.size, 4096):
+            tm = (b0 + 2048) / fs
+            rs.set_ratio(m0 / (T * (1.0 + r * tm)))
+            parts.append(rs.process(x[b0:b0 + 4096]))
+        z = np.concatenate(parts)
+    ccfg = dsss_code_defaults(fs2, fs2 / m0, m0 / fs2)
+    ccfg.update(chip_mod=chip_mod, vote_passes=int(c.get("vote_passes", 6)),
+                poly_max_degree=int(c.get("poly_max_degree", 14)), pfa=float(c.get("code_pfa", 1e-3)))
+    if rc_given > 0:
+        L = int(_m.floor(rc_given * T / fs + 0.5)); line = 0.0
+        res["flags"] |= BS_RC_GIVEN
+    else:
+        lmin = max(2, int(_m.ceil(0.4 * bw * T / fs)))
+        lmax = min(int(_m.floor(1.25 * bw * T / fs)), m0)
+        env, lns = _bs_scores(seg, f, T, lmin, lmax) if lmin <= lmax else ({}, {})
+        L, line = _bs_choose_L(z, fs2, m0, env, lns, ccfg)
+    if not 2 <= L <= m0:
+        res.update(cfo_hz=f * fs, fs_code=fs2, support_start=t0)
+        res["flags"] |= BS_REFUSED
+        return np.zeros(0, np.int8), res
+    ccfg["rc"] = L * fs2 / m0
+    chips, code = dsss_code(z.astype(np.complex64), ccfg)
+    res.update(code=code, cfo_hz=f * fs + code["cfo_hz"], rc_hz=L * fs / T, fs_code=fs2, line_ratio=line, L=L,
+               support_start=t0)
+    if code["L"] > 0 and not (code["flags"] & CODE_REFUSED) and chips.size:
+        res["flags"] |= BS_CODE
+    return chips, res
+
+
+
+# ---- 30c. the hit blob ----------------------------------------------------------
+UT_BLOB_VERSION = 1
+_UT_MAGIC = b"ATKUTHIT"
+_HIT_F = ("fc_hz", "bw_hz", "fluct_log10_pfa", "period_s", "acf_log10_pfa", "acf_z", "cyc_log10_pfa",
+          "cyc_alpha_hz", "cyc_z", "rc_hz", "L", "log10_pfa")
+_HIT_I = ("scale", "chan", "nwin", "nseen")
+_PS_F = ("period_s", "period_samples", "rate", "lambda1", "lambda2", "ref_mean", "ref_sd", "z", "log10_pfa",
+         "snr_db", "sigma2", "dominance", "window_offset")
+_PS_I = ("nperiods", "n0_used", "levels", "evals", "window")
+_CODE_I = ("L", "nperiods", "periods_needed", "start")
+_CODE_F = ("cfo_hz", "lambda1", "lambda2", "noise_var", "ident_margin", "snr_db", "vote_min", "vote_mean")
+_BS_F = ("cfo_hz", "rc_hz", "fs_code", "line_ratio")
+
+
+def _pad_bytes(text, n):
+    b = (text or "").encode("utf-8")[: n - 1]
+    return b + b"\0" * (n - len(b))
+
+
+def hit_export(ctx: dict, hit: dict, bs: dict | None = None, chips=None) -> bytes:
+    """Twin of atkdsp_undertow_hit_export: the versioned, CRC-checked byte blob
+    of one hit (and its bootstrap and chips) — little-endian, fixed field order
+    (atkdsp.h §30). ctx: t_unix, rf_center_hz, fs_survey, source."""
+    import struct, zlib
+    chips = np.zeros(0, np.int8) if chips is None else np.asarray(chips, np.int8).ravel()
+    sections = 1 | (2 if bs is not None else 0) | (4 if chips.size else 0)
+    out = bytearray(_UT_MAGIC)
+    out += struct.pack("<HHI", UT_BLOB_VERSION, sections, 0)
+    out += struct.pack("<3d", float(ctx.get("t_unix", 0.0)), float(ctx.get("rf_center_hz", 0.0)),
+                       float(ctx.get("fs_survey", 0.0)))
+    out += _pad_bytes(ctx.get("source", ""), 40)
+    out += struct.pack("<12d", *[float(hit.get(k, 0.0)) for k in _HIT_F])
+    out += struct.pack("<4i", *[int(hit.get(k, 0)) for k in _HIT_I])
+    out += struct.pack("<I4i", int(hit.get("flags", 0)), *list(hit.get("method", [0, 0, 0, 0]))[:4])
+    if bs is not None:
+        p = bs["ps"]
+        out += struct.pack("<13d", *[float(p.get(k, 0.0)) for k in _PS_F])
+        out += struct.pack("<5iI4i", *[int(p.get(k, 0)) for k in _PS_I], int(p.get("flags", 0)),
+                           *list(p.get("method", [0, 0, 0, 0]))[:4])
+        c = bs.get("code") or {}
+        meth = (list(c.get("method", [])) + [0] * 8)[:8]
+        out += struct.pack("<4i", *[int(c.get(k, 0)) for k in _CODE_I])
+        out += struct.pack("<8d", *[float(c.get(k, 0.0)) for k in _CODE_F])
+        out += struct.pack("<iiQd", int(c.get("poly_method", 0)), int(c.get("poly_degree", 0)),
+                           int(c.get("poly", 0)), float(c.get("poly_z", 0.0)))
+        out += struct.pack("<iiI8i", int(c.get("lc", 0)), int(c.get("lc_plateau", 0)), int(c.get("flags", 0)), *meth)
+        out += _pad_bytes(c.get("name", ""), 48)
+        out += struct.pack("<4d", *[float(bs.get(k, 0.0)) for k in _BS_F])
+        out += struct.pack("<iiiI4i", int(bs.get("L", 0)), int(bs.get("support_start", 0)),
+                           int(bs.get("harmonic", 1)), int(bs.get("flags", 0)), *list(bs.get("method", [0, 0, 0, 0]))[:4])
+    if chips.size:
+        out += struct.pack("<I", chips.size) + chips.tobytes()
+    total = len(out) + 4
+    out[12:16] = struct.pack("<I", total)
+    out += struct.pack("<I", zlib.crc32(bytes(out)) & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def hit_import(blob: bytes):
+    """Twin of atkdsp_undertow_hit_import: (ctx, hit, bs or None, chips);
+    ValueError on a wrong magic, version, length or CRC."""
+    import struct, zlib
+    b = bytes(blob)
+    if len(b) < 20 or b[:8] != _UT_MAGIC:
+        raise ValueError("hit blob: not an Undertow hit")
+    ver, sections, total = struct.unpack_from("<HHI", b, 8)
+    if ver != UT_BLOB_VERSION or total != len(b) or not sections & 1 or sections & ~7:
+        raise ValueError("hit blob: version, length or sections")
+    if zlib.crc32(b[:-4]) & 0xFFFFFFFF != struct.unpack_from("<I", b, len(b) - 4)[0]:
+        raise ValueError("hit blob: CRC")
+    at = 16
+    t, rf, fsv = struct.unpack_from("<3d", b, at); at += 24
+    src = b[at:at + 40].split(b"\0", 1)[0].decode("utf-8", "replace"); at += 40
+    ctx = dict(t_unix=t, rf_center_hz=rf, fs_survey=fsv, source=src)
+    f = struct.unpack_from("<12d", b, at); at += 96
+    i = struct.unpack_from("<4i", b, at); at += 16
+    fl, *meth = struct.unpack_from("<I4i", b, at); at += 20
+    hit = dict(zip(_HIT_F, f)); hit.update(zip(_HIT_I, i)); hit.update(flags=fl, method=list(meth))
+    bs = None
+    if sections & 2:
+        pf = struct.unpack_from("<13d", b, at); at += 104
+        pi = struct.unpack_from("<5iI4i", b, at); at += 40
+        ps = dict(zip(_PS_F, pf)); ps.update(zip(_PS_I, pi[:5])); ps.update(flags=pi[5], method=list(pi[6:]))
+        ci = struct.unpack_from("<4i", b, at); at += 16
+        cf = struct.unpack_from("<8d", b, at); at += 64
+        pm, pdg, poly, pz = struct.unpack_from("<iiQd", b, at); at += 24
+        lc, lcp, cfl, *cm = struct.unpack_from("<iiI8i", b, at); at += 44
+        name = b[at:at + 48].split(b"\0", 1)[0].decode("utf-8", "replace"); at += 48
+        code = dict(zip(_CODE_I, ci)); code.update(zip(_CODE_F, cf))
+        code.update(poly_method=pm, poly_degree=pdg, poly=poly, poly_z=pz, lc=lc, lc_plateau=lcp, flags=cfl,
+                    method=list(cm), name=name)
+        bf = struct.unpack_from("<4d", b, at); at += 32
+        L, sup, hm, bfl, *bm = struct.unpack_from("<iiiI4i", b, at); at += 32
+        bs = dict(ps=ps, code=code); bs.update(zip(_BS_F, bf))
+        bs.update(L=L, support_start=sup, harmonic=hm, flags=bfl, method=list(bm))
+    chips = np.zeros(0, np.int8)
+    if sections & 4:
+        k, = struct.unpack_from("<I", b, at); at += 4
+        chips = np.frombuffer(b[at:at + k], np.int8).copy(); at += k
+    if at != len(b) - 4:
+        raise ValueError("hit blob: trailing bytes")
+    return ctx, hit, bs, chips

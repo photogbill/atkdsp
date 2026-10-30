@@ -22,11 +22,18 @@
  *     principal eigenvalue must clear it, or the vector is noise and the
  *     call refuses — with the number of periods that would clear it at the
  *     signal power the excess implies.
- *  3. Aligned periods y_m = x[t0 + mN .. +N). The carrier offset from the
- *     period-averaged P-th power (P = 2 BPSK, 4 QPSK): q(i) = sum_m y_m(i)^P
- *     is one tone at P x alpha cycles per sample at the chip centres (the
- *     symbols' signs vanish under the power), and Kay's weighted phase
- *     estimate reads it; the data are derotated. Then the constellation
+ *  3. Aligned periods y_m = x[t0 + mN .. +N). The carrier offset, on the
+ *     eigenvector (BE 2015's observation: an offset only rotates it), in two
+ *     steps (v0.22): COARSE from v1's full-period support raised to the P-th
+ *     power (P = 2 BPSK, 4 QPSK) — one tone at P alpha, coherent by
+ *     construction — and FINE from the periods despread with that support,
+ *     d_m = v1^H y_m, whose P-th power is a tone at P delta N cycles a period
+ *     (resolution 1 / the capture). Each tone is read by a zero-padded FFT
+ *     peak and a parabola (code_tone). Before v0.22 the offset came from
+ *     q(i) = sum_m y_m(i)^P, which cancels itself once the carrier turns
+ *     across the capture: offsets from about 1/(capture) up to the in-period
+ *     limit returned confident wrong chips, and no test had an offset in
+ *     it. tests/test_phase6.py now runs nine. Then the constellation
  *     phase theta from the same power's argument (sum over chip centres:
  *     for BPSK c^2 e^{2j theta} > 0 real; for QPSK (a c_I + j b c_Q)^4 with
  *     |c| = 1 is -4 e^{4j theta}), and the data are rotated real.
@@ -111,19 +118,59 @@ static size_t support_start(const cd *v, size_t len, size_t N) {
     return kb;
 }
 
-/* Kay's weighted phase average on a tone q (len values): cycles per sample. */
-static double kay_freq(const cd *q, size_t len) {
-    if (len < 3) return 0.0;
-    const double Nn = (double)len;
-    double sum = 0.0;
-    for (size_t i = 0; i + 1 < len; i++) {
-        const double pr = q[i + 1].re * q[i].re + q[i + 1].im * q[i].im;
-        const double pi = q[i + 1].im * q[i].re - q[i + 1].re * q[i].im;
-        const double t = (double)i - (Nn / 2.0 - 1.0);
-        const double w = 1.5 * Nn / (Nn * Nn - 1.0) * (1.0 - (t / (Nn / 2.0)) * (t / (Nn / 2.0)));
-        sum += w * atan2(pi, pr);
+/* The frequency (cycles per sample) of the one tone in q[0..len): the peak of a
+ * zero-padded FFT (a power of two >= 8 len; the float FFT finds the bin), then
+ * a parabola through the magnitudes at the peak and its neighbours, each an
+ * exact double-precision DFT (so C and the twin agree to rounding, not to the
+ * float FFT). Magnitude-weighted: near-zero samples do not steer it. */
+int atk_code_tone(const double *q2, size_t len, double *f_out) {
+    const cd *q = (const cd *)q2;
+    size_t nfft = 1;
+    while (nfft < 8 * len) nfft <<= 1;
+    atkdsp_fft *pl = atkdsp_fft_create(nfft);
+    atkdsp_cf32 *in = (atkdsp_cf32 *)calloc(nfft, sizeof *in), *ou = (atkdsp_cf32 *)malloc(nfft * sizeof *ou);
+    if (!pl || !in || !ou) { atkdsp_fft_destroy(pl); free(in); free(ou); return ATKDSP_E_NOMEM; }
+    double scale = 0.0;
+    for (size_t i = 0; i < len; i++) { const double a = fabs(q[i].re) + fabs(q[i].im); if (a > scale) scale = a; }
+    if (!(scale > 0.0)) scale = 1.0;
+    for (size_t i = 0; i < len; i++) { in[i].re = (float)(q[i].re / scale); in[i].im = (float)(q[i].im / scale); }
+    atkdsp_fft_exec(pl, in, ou, 0);
+    size_t k = 0; double best = -1.0;
+    for (size_t i = 0; i < nfft; i++) {
+        const double m2 = (double)ou[i].re * ou[i].re + (double)ou[i].im * ou[i].im;
+        if (m2 > best) { best = m2; k = i; }
     }
-    return sum / (2.0 * ATK_PI);
+    atkdsp_fft_destroy(pl); free(in); free(ou);
+    double mag[3];
+    for (int j = -1; j <= 1; j++) {
+        const size_t kk = (k + nfft + (size_t)(j + 1) - 1) % nfft;
+        double sr = 0.0, si = 0.0;
+        for (size_t i = 0; i < len; i++) {
+            const double ph = -2.0 * ATK_PI * (double)((i * kk) % nfft) / (double)nfft;
+            const double cr = cos(ph), ci = sin(ph);
+            sr += q[i].re * cr - q[i].im * ci;
+            si += q[i].re * ci + q[i].im * cr;
+        }
+        mag[j + 1] = sqrt(sr * sr + si * si);
+    }
+    const double den = mag[0] - 2.0 * mag[1] + mag[2];
+    double off = den < 0.0 ? 0.5 * (mag[0] - mag[2]) / den : 0.0;
+    if (off > 0.5) off = 0.5;
+    if (off < -0.5) off = -0.5;
+    double f = ((double)k + off) / (double)nfft;
+    if (f >= 0.5) f -= 1.0;
+    *f_out = f;
+    return ATKDSP_OK;
+}
+
+/* x[i] *= exp(-2 pi j alpha i), i = 0..n-1 (the aligned periods' own index). */
+static void derotate(atkdsp_cf32 *x, size_t n, double alpha) {
+    if (!(fabs(alpha) > 0.0)) return;
+    for (size_t i = 0; i < n; i++) {
+        const double ph = -2.0 * ATK_PI * alpha * (double)i, cr = cos(ph), ci = sin(ph);
+        const double re = x[i].re * cr - x[i].im * ci, im = x[i].re * ci + x[i].im * cr;
+        x[i].re = (float)re; x[i].im = (float)im;
+    }
 }
 
 /* ---- real power iteration and the vote ---------------------------------------- */
@@ -334,21 +381,21 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         return 0;
     }
     out->flags |= ATKDSP_CODE_IDENTIFIABLE;
-    free(v1); free(v2); free(u);
+    free(v2); free(u);                                     /* v1 is kept for the offset (step 3) */
 
     /* ---- 3. aligned periods, the carrier offset, the constellation phase ------- */
     const size_t a0 = off + t0;
     const int Mp = (int)((n - a0) / N);
-    if (Mp < 3) return ATKDSP_E_EMPTY;
+    if (Mp < 3) { free(v1); return ATKDSP_E_EMPTY; }
     cd *q = (cd *)calloc(N, sizeof *q);
     atkdsp_cf32 *xd = (atkdsp_cf32 *)malloc((size_t)Mp * N * sizeof *xd);
-    if (!q || !xd) { free(q); free(xd); return ATKDSP_E_NOMEM; }
+    if (!q || !xd) { free(q); free(xd); free(v1); return ATKDSP_E_NOMEM; }
     memcpy(xd, iq + a0, (size_t)Mp * N * sizeof *xd);
     const int P = two ? 4 : 2;
     double alpha = 0.0;
     /* chip instants within the period */
     int *inst = (int *)malloc((size_t)L * 2 * sizeof *inst);
-    if (!inst) { free(q); free(xd); return ATKDSP_E_NOMEM; }
+    if (!inst) { free(q); free(xd); free(v1); return ATKDSP_E_NOMEM; }
     for (int k = 0; k < L; k++) {
         inst[k] = (int)floor((k + 0.5) * sps);
         if (inst[k] >= (int)N) inst[k] = (int)N - 1;
@@ -357,6 +404,58 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         if (inst[L + k] >= (int)N) inst[L + k] -= (int)N;        /* the late Q chip wraps */
     }
     for (int pass = 0; pass < 2; pass++) {
+        if (pass == 0) {
+            if (!cfg->no_cfo) {
+                /* The offset in two steps, both on the eigenvector (v0.22; the
+                   period-summed P-th power used before cancels itself once the
+                   carrier turns across the capture, and then returned garbage):
+                   coarse from the P-th power of v1's full-period support (a tone
+                   at P alpha, coherent by construction), fine from the periods
+                   despread with v1 — d_m^P is a tone at P delta N per period. */
+                const cd *seg = v1 + t0;
+                const size_t ND = (size_t)Mp > N ? (size_t)Mp : N;
+                cd *tq = (cd *)malloc(ND * sizeof *tq);
+                cd *segd = (cd *)malloc(N * sizeof *segd);
+                if (!tq || !segd) { free(tq); free(segd); free(q); free(xd); free(inst); free(v1); return ATKDSP_E_NOMEM; }
+                for (size_t i = 0; i < N; i++) {
+                    double wr = seg[i].re, wi = seg[i].im;
+                    for (int p = 1; p < P; p++) { const double tr = wr * seg[i].re - wi * seg[i].im; wi = wr * seg[i].im + wi * seg[i].re; wr = tr; }
+                    tq[i].re = wr; tq[i].im = wi;
+                }
+                double ac;
+                if (atk_code_tone((const double *)tq, N, &ac) != ATKDSP_OK) { free(tq); free(segd); free(q); free(xd); free(inst); free(v1); return ATKDSP_E_NOMEM; }
+                ac /= (double)P;
+                derotate(xd, (size_t)Mp * N, ac);
+                for (size_t i = 0; i < N; i++) {
+                    const double ph = -2.0 * ATK_PI * ac * (double)i, cr = cos(ph), ci = sin(ph);
+                    segd[i].re = seg[i].re * cr - seg[i].im * ci;
+                    segd[i].im = seg[i].re * ci + seg[i].im * cr;
+                }
+                for (int m = 0; m < Mp; m++) {                /* d_m = segd^H y_m, then ^P */
+                    double dr = 0.0, di = 0.0;
+                    for (size_t i = 0; i < N; i++) {
+                        const double yr0 = xd[(size_t)m * N + i].re, yi0 = xd[(size_t)m * N + i].im;
+                        dr += segd[i].re * yr0 + segd[i].im * yi0;
+                        di += segd[i].re * yi0 - segd[i].im * yr0;
+                    }
+                    double wr = dr, wi = di;
+                    for (int p = 1; p < P; p++) { const double tr = wr * dr - wi * di; wi = wr * di + wi * dr; wr = tr; }
+                    tq[m].re = wr; tq[m].im = wi;
+                }
+                double dl;
+                if (atk_code_tone((const double *)tq, (size_t)Mp, &dl) != ATKDSP_OK) { free(tq); free(segd); free(q); free(xd); free(inst); free(v1); return ATKDSP_E_NOMEM; }
+                dl /= (double)P * (double)N;
+                derotate(xd, (size_t)Mp * N, dl);
+                free(tq); free(segd);
+                alpha = ac + dl;
+                if (fabs(alpha) > 1e-12) {
+                    out->flags |= ATKDSP_CODE_CFO;
+                    out->cfo_hz = alpha * cfg->fs;
+                    out->method[nm++] = ATKDSP_METHOD_CFO_EIGEN;
+                }
+            }
+            continue;
+        }
         /* q(i) = sum_m y_m(i)^P */
         for (size_t i = 0; i < N; i++) {
             double sr = 0.0, si = 0.0;
@@ -367,25 +466,6 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
                 sr += wr; si += wi;
             }
             q[i].re = sr; q[i].im = si;
-        }
-        if (pass == 0) {
-            if (!cfg->no_cfo) {
-                alpha = kay_freq(q, N) / (double)P;
-                if (fabs(alpha) > 1e-12) {
-                    for (int m = 0; m < Mp; m++)
-                        for (size_t i = 0; i < N; i++) {
-                            const double ph = -2.0 * ATK_PI * alpha * (double)((size_t)m * N + i);
-                            const double cr = cos(ph), ci = sin(ph);
-                            atkdsp_cf32 *z = &xd[(size_t)m * N + i];
-                            const double re = z->re * cr - z->im * ci, im = z->re * ci + z->im * cr;
-                            z->re = (float)re; z->im = (float)im;
-                        }
-                    out->flags |= ATKDSP_CODE_CFO;
-                    out->cfo_hz = alpha * cfg->fs;
-                    out->method[nm++] = ATKDSP_METHOD_CFO_EIGEN;
-                }
-                continue;                                     /* recompute q on the derotated data */
-            }
         }
         /* theta from the chip-centre samples of q */
         double sr = 0.0, si = 0.0;
@@ -400,7 +480,7 @@ ptrdiff_t atkdsp_dsss_code(const atkdsp_cf32 *iq, size_t n, const atkdsp_dsss_co
         }
         break;
     }
-    free(q);
+    free(q); free(v1);
 
     /* ---- 4. the code waveform(s) and the vote ----------------------------------- */
     double *yr = (double *)malloc((size_t)Mp * N * sizeof *yr);

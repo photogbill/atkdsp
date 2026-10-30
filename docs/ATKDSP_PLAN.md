@@ -167,6 +167,29 @@ and B5), MDC-1200 / FleetSync (phase 3b), C4 strong-signal removal, and the
 learned fuser (`docs/DSSS_LITERATURE.md` §K). The Windows run is owed
 (`build.bat /only atkdsp /test`).
 
+**Phase 6b, Undertow piece 1, is BUILT (2026-10-30)** — atkdsp v0.21.0 /
+ABI 22: §B6c's scale-space survey (`atkdsp_undertow`, header §29, twin
+`reference.py` §29, 13 tests in `tests/test_undertow.py`, smoke lines), with
+two channelizer corrections and two bit-identical PFB speedups riding along
+(§A4's note). One receiver; no false alarms on empty coloured noise at a
+survey-wide Pfa of 1e-3; a 31-chip code at −6 dB in-band found in 2 s with
+its exact period. What changed from the design is in §B6c piece 1's note.
+Next: piece 2 as measured (its note) — the period-synchronous long watch
+with (T, Ṫ) refinement, fused with piece 4's bootstrap; then piece 6's
+kernel half (the hit blob).
+
+**Phase 6b, Undertow pieces 2, 4 and 6 (kernel half), are BUILT
+(2026-10-30)** — atkdsp v0.22.0 / ABI 23: the survey's candidate periods, the
+period-synchronous search `atkdsp_psync` (period and period rate), the
+bootstrap `atkdsp_bootstrap` (psync -> the code), and the versioned hit blob
+(header §30, twin `reference.py` §30, 18 tests in `tests/test_psync.py`,
+smoke lines), with a correction to `atkdsp_dsss_code`'s carrier offset. At
+the real survey rate, 2 s: the exact code, named, at −16 and −18 dB in-band,
+where the fluctuation handle is silent. What building them changed is in
+piece 2's and piece 4's notes. Not here: the catalogue (ATK, `rf_data`), the
+radiometer in the cells, a full blind scan of every lag (GPU), and
+`dsss_code`'s 2-adic decimation and Frobenius parity stack (v0.23).
+
 **What building phase 6a changed in this plan** (the README and
 `docs/DSSS_LITERATURE.md` have the detail):
 - The detector's thresholds are the chi-square tail of the Gamma-distributed
@@ -515,6 +538,25 @@ shows RAM.
 > Verified: in-band unit gain (matches a DDC), −111 dB stopband, C == twin
 > 5.8e-7, add/retune/remove leaves others bit-identical, chunk invariance
 > exact, W4 inter-element phase 0.008°. Both channelizer tools are now in.
+>
+> **Corrections (2026-10-30, v0.21.0 / ABI 22).** (1) The PFB's per-hop bin
+> rotation had the wrong sign and referenced each hop to its own start: right
+> at 2× only up to a constant (−1)^k per bin, wrong at 3× and 4× (a tone 3 kHz
+> above bin 1 came out at −197 kHz). Found by ATK's trunking work
+> (`TRUNKED_RADIO_PLAN.md` §4A); fixed as written there — every bin is now the
+> true baseband referenced to input sample 0, at any oversampling. At 2× the
+> output changes by exactly (−1)^k, so W1/W2 and every DF covariance are
+> unchanged bit for bit. (2) The extractor mixed relative to each block's
+> start: an odd bin shift flipped the sign every block and up to half a bin of
+> residual offset stayed in. Now one absolute-time phase per output sample —
+> on centre and phase-continuous across blocks and calls, like a DDC. The old
+> tests checked magnitude at 2× and an even bin; 14 new ones check frequency
+> and phase at 2×/3×/4× and odd and fractional offsets (verified to fail
+> against the old code). **Speed:** `_process_n` runs elements in parallel
+> and the fold reads windows in place (both bit-identical): the Kraken DF
+> case went from 1.0× to 1.5× real time on 2 cores (kernel alone; unchanged
+> single-threaded — the fold's arithmetic is the cost, so its vectorisation
+> is the follow-on for 40 MSPS).
 >
 > **Still not here:** the band-edge guard marking (caller-side, R4), and W3
 > (the channel-grid CFAR gate, wiring on the `atkdf` side over W2 + the
@@ -1327,6 +1369,49 @@ been made.
    bin of every α-spectrum" to one window per cell. The three statistics
    are then one χ²-tested verdict per cell (literature A4's max-statistic
    form gives the true Pfa over the whole survey).
+
+   > **BUILT (2026-10-30), atkdsp v0.21.0 — and what building it changed.**
+   > One PFB per dyadic scale (`nchan0 << s`), cells = (scale, channel). Three
+   > handles per cell, each a calibrated tail probability, then one survey-wide
+   > correction (cells × handles), so `pfa` is the survey's, not the cell's:
+   > **FLUCT** — Burel's fluctuation (§25) on the cell, the period-giver;
+   > **ACF** — the chip-shape |R(τ)|/R(0) for τ ≤ a few lags, scored by a
+   > predictive Student-t against the cells either side (not against zero: a
+   > channelized cell's noise is not white); **CYC** — the |y|² α-spectrum
+   > line, searched only in the scale's window [B/2, B]. A hit merges every
+   > cell and scale one emitter lights, keeps the strongest cell's fc, bw
+   > and period and each handle's best evidence, and with Rc and the period
+   > gives L and the CONSISTENT bit. Measured against that design:
+   > - **ACF has an SNR wall.** It localises to about −10 dB in coloured
+   >   noise within seconds and *never deeper*: its reference is the
+   >   neighbouring cells, whose noise is alike but not identical, and the
+   >   worst empty cell's score grew with the watch. Kept for where and how
+   >   wide above −10 dB; not a depth handle.
+   > - **The fluctuation statistic is the wall-free one** (noise has no
+   >   period whatever its colour): −6 dB in 0.5 s, about −10 dB in 2 s. It
+   >   is the survey's depth, and it is fourth order — each 10× of watch
+   >   buys ~2.5 dB (−18 dB ≈ an hour on Burel's law). It is blind to code
+   >   phase, so drift does not smear it (1 ppm moves a 1023-chip period
+   >   peak by 0.002 samples); piece 2's note says what does go deeper.
+   > - **The cyclic line is above-the-floor only** (strong at 0 dB, gone by
+   >   −6 dB, SNR² as theory says) and aliases into the window at scales
+   >   narrower than the signal; it gives Rc where it is seen and is
+   >   cross-checked by the period, never trusted alone.
+   > - **`period_min` must clear the channelized noise's correlation
+   >   length.** Burel's statistic with `period_min = 4` fired on every
+   >   empty cell (log10 Pfa −145): a 2× cell's noise is correlated to
+   >   lag ~10, and with hundreds of windows the Gamma model reads that bump
+   >   as a period. The survey uses 16. A test pins both halves.
+   > - **Not built from this paragraph:** the PSD-shape fit against B5's
+   >   learned floor (B5 is not built), the x²/x⁴ carrier lines (B6's chain
+   >   does them on a hit), and one χ² verdict over the three statistics (a
+   >   min-p with the Bonferroni factor is what is honest when the three
+   >   are this unlike in depth). Single receiver only; the radiometer
+   >   (piece 3, v0.18.0) is not yet in the cells. The built API is header
+   >   §29 (`atkdsp_undertow_cfg`, one stream), not the sketch below.
+   > - Throughput: 0.5× real time on one core at 2.4 MSPS, 4 scales, 120
+   >   cells; 0.9–1.07× on two; deterministic at any thread count. 40 MSPS
+   >   live needs the PFB fold vectorised.
 2. **The long watch with drift compensation — how long.** Below the floor,
    time is the only free gain, and the first draft threw it away by
    working per capture. Undertow accumulates each cell's statistics for
@@ -1342,6 +1427,61 @@ been made.
    the emitter is on; a million 1 ms windows on a 1023-chip code puts the
    Burel deflection at −25 dB in-band well above threshold on paper, and
    the measured number is what the acceptance records.
+
+   > **Measured while building piece 1 (2026-10-30): the drift argument is
+   > right, the statistic it was aimed at is not.** Burel's fluctuation
+   > squares each window's correlation, so it is blind to code phase: a
+   > clock offset only moves its peak by ε·T samples (1 ppm on a 1023-chip
+   > period is 0.002 samples), and it does not need drift compensation. It
+   > is also fourth order with data on the code, so it buys ~2.5 dB per 10×
+   > of watch however long it runs — the −25 dB above was optimistic for it.
+   > What *is* second order is the period-synchronous eigenvector (the wide
+   > window of B6 step 4): learn the code from every period-aligned window
+   > at once. Measured on the survey's own cells (31-chip code, one bit per
+   > period, 2 s at 600 kS/s): at the known period, λ₁ against the same
+   > statistic at a mistuned period gives **−18 dB at z ≈ 44 and −22 dB at
+   > z ≈ 8**, where the fluctuation handle loses the period by −14 dB; from
+   > 0.5 s to 2 s its evidence grows faster than √N (BBP: the spike clears
+   > the noise bulk when T·SNR > √(2T/n), so depth ∝ 1/√N, ~5 dB per 10×,
+   > about √T short of knowing the code). Its price is the drift problem
+   > exactly as stated above: the windows must stay aligned to a fraction
+   > of a chip over n periods, so T must be known to ~chip/n — about one
+   > part in a million for those 2 s — and its rate Ṫ held over minutes. So
+   > piece 2 is rebuilt as the **period-synchronous long watch**: the
+   > survey's hits and near-threshold period candidates seed accumulators,
+   > each refined in (T, Ṫ) by maximising λ₁ (the lag-rate search, on the
+   > statistic that needs it), with a stated Pfa against the off-period
+   > reference (which also absorbs the cell's coloured-noise eigen-spread).
+   > The eigenvector it ends with is piece 4's starting code, so 2 and 4
+   > are one stage. The coherent cyclic line has the same need, in (α, α̇).
+   >
+   > **BUILT (2026-10-30), atkdsp v0.22.0 — `atkdsp_psync`, and what building
+   > it changed.** The survey supplies candidates (`atkdsp_undertow_candidates`:
+   > each cell's strongest fluctuation peaks below its own threshold — the true
+   > period is usually in a cell's top 8 to ~2 dB under where the handle fires,
+   > often behind its multiples). psync searches T₀ ± 1 sample, escalating the
+   > span until a look-elsewhere-corrected gate passes, then refines period and
+   > rate to all the data. Measured, and built in:
+   > - **The references must be fitted as a line in the period.** λ₁ of pure
+   >   noise trends with how much the wide windows overlap; references all on
+   >   one side read that trend as signal and stopped the escalation early on
+   >   noise. Symmetric references, a least-squares line, a predictive
+   >   Student t against it — the grid is scored against the line too.
+   > - **λ₂ separates a repeating code from symbol-clocked data.** Plain QPSK
+   >   bursts fire the fluctuation handle at their symbol clock (log10 Pfa
+   >   −120); psync at those lags finds several comparable components or
+   >   nothing (MULTI / no detection). Survey false hits are refuted here.
+   > - **Candidates are often 2T or 3T**, where psync also says MULTI
+   >   (dominance 0.9, 0.8) — the bootstrap tries T/2, T/3, T/4.
+   > - **The rate search** (the lag-rate idea): on a 20 ppm/s ramp λ₁ +9 %
+   >   and the rate to about ±30 % — λ₁ is bumpy at 1–2 % over the rate
+   >   because window starts are nearest-sample, which bounds the precision.
+   >   Its first active level could choose a rate by noise and, with the step
+   >   count capped at rate_max/step, never walk back (measured, fixed: ±6
+   >   steps at every level).
+   > - Depth at the real rate, 2 s: −16 and −18 dB detected (z 35–79), period
+   >   to 2.4·10⁻⁶ samples. Cost ~25 s per candidate on 2 cores — a
+   >   per-candidate job; the first stage's grid is the GPU's best target.
 3. **The correlation radiometer — the second-order centre.** For every
    receiver pair, the averaged cross-spectrum ⟨X₁(f)·X₂*(f)⟩ over the
    survey band. Independent noise averages to zero; a common signal
@@ -1380,6 +1520,32 @@ been made.
    emitter is found by acquisition at known-code sensitivity, 10–15 dB
    below where blind detection first saw it. The system gets better at
    finding what it has seen.
+
+   > **BUILT (2026-10-30), atkdsp v0.22.0 — `atkdsp_bootstrap` (the kernel
+   > half; the loop over the ring and the catalogue entry are ATK's).** psync
+   > (with the harmonic retry), then the carrier from the eigenvector's P-th
+   > power, the stream derotated and resampled so a period is exactly ⌊T⌉
+   > samples (following the rate), the chip count, and `atkdsp_dsss_code`.
+   > The chip rate below the floor falls out: L ÷ period. What it took:
+   > - **The chip count is the hard part.** In a survey cell the filter cuts
+   >   the code's spectrum at ~2/3 of the chip rate, so the chip-rate line is
+   >   weak; vote margins cannot choose (a consistent waveform votes
+   >   consistently at any sampling). Two scores of the eigenvector — the
+   >   chip-centre envelope (band-limited chips) and the transition line
+   >   (sharp chips), each failing where the other works — are shortlisted,
+   >   decoded on a slice, and a NAMED code wins. The margin is thin at depth
+   >   (envelope ratio ≈ 1.0); for a code with no LFSR generator the count is
+   >   weakly determined and `line_ratio` says so.
+   > - **`dsss_code`'s carrier offset was broken** for offsets from about
+   >   1/(capture) to the in-period limit (the period-summed P-th power
+   >   cancels itself); now read on the eigenvector in two steps. Found here;
+   >   no earlier test had an offset.
+   > - Measured at the real rate, 2 s, +40 kHz: the exact code named
+   >   (x⁵+x²+1) at −16 and −18 dB, the offset read to the hertz.
+   > Next (v0.23): `dsss_code` averaging an m-sequence's 2-adic decimations
+   > (c[2ᵐn mod L] is a cyclic shift of c[n]: each chip seen r times, ~10·log₁₀
+   > r dB) and the Frobenius parity stack (a check polynomial's squares are
+   > checks too) for naming the generator through more chip errors.
 5. **The consistency lattice — the false-alarm killer and the fingerprint.**
    Five quantities are estimated by independent statistics: Tc from the
    ACF triangle, Rc from the PSD nulls, Rc from the cyclic line, T from
@@ -1407,6 +1573,11 @@ been made.
    snippets at detection and at best SNR. The catalogue is the known-code
    list the next session starts from, and the thing a report is written
    from.
+
+   > **Kernel half BUILT (2026-10-30), atkdsp v0.22.0:** the versioned hit
+   > blob (`atkdsp_undertow_hit_export` / `_import`; little-endian, fixed field
+   > order, CRC-32; context, hit, bootstrap, chips). The dossier, the occupancy
+   > schedule, the snippets and the catalogue view are ATK's.
 
 **What is new, stated carefully.** Against the literature read today:
 (a) the scale-constrained cyclic line in a dyadic bank — wideband
@@ -2378,7 +2549,9 @@ checked first).
 | 5 | **Demod and quality:** C1 linear chain + equalizer, C2 EVM/MER | L | Completes the soft path into phase 1's Viterbi |
 | 6a ✅ v0.18.0 | **Spread spectrum:** B6 blind + known-code paths, B6b LoRa, B6c's receiver pair / align / lattice (BUILT 2026-10-29) | L | Uses B4, D2; the survey + catalogue of B6c wait for A4 and B5 |
 | 6 | **Below the floor (rest):** B6c's scale-space survey and catalogue, C4 strong-signal removal, MDC/FleetSync (3b), the learned fuser | M–L | After A4 (the channelizer) and B5 (the baseline) |
-| 6b | **Undertow:** B6c — the scale-space survey, the long watch, the correlation radiometer, bootstrap despreading, the catalogue | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
+| 6b-1 ✅ v0.21.0 | **Undertow piece 1:** B6c's scale-space survey over the dyadic PFB — fluctuation, ACF and scale-window cyclic handles per cell, survey-wide Pfa, merged hits (BUILT 2026-10-30) | M | Single receiver; ACF is −10 dB-walled, the fluctuation handle carries the depth |
+| 6b-2 ✅ v0.22.0 | **Undertow pieces 2, 4, 6 (kernel):** survey candidates, the period-synchronous search with period-rate refinement, the bootstrap to the code, the hit blob; `dsss_code`'s offset fix (BUILT 2026-10-30) | M | −18 dB to the named code in 2 s at the real rate; ~25 s a candidate on 2 cores |
+| 6b | **Undertow (rest):** B6c — the radiometer in the cells, a full blind lag scan (GPU), `dsss_code`'s decimation averaging + Frobenius stack (v0.23), the catalogue and survey view (ATK) | L | After B6, A4 (the dyadic bank), B5 (the baseline); two receivers for the centre piece; Bill's planted emitter and a step attenuator for the acceptance |
 | 7 | **The long watch and identity:** B5 occupancy + baseline, C5 fingerprint features | M | Uses B2, C2 and C3 |
 | 8 | **Intercept audio:** F1, F2, and the F3 wiring into the Workshop | M | Independent; the Workshop's radio door is waiting for it |
 | 9 | **Propagation:** E1 ITM | M | Independent; moves up if DF footprints are wanted sooner |

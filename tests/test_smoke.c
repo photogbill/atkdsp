@@ -614,7 +614,7 @@ int main(void) {
     /* ---- §25-27 spread spectrum (v0.18.0, ABI 19) ---------------------------- */
     {
         /* a 31-chip m-sequence (x^5+x^2+1), 4 samples/chip, BPSK data, at -6 dB */
-        const int r = 5, sps = 4, L = 31, N = L * sps, nsym = 4000;
+        const int sps = 4, L = 31, N = L * sps, nsym = 4000;
         int8_t code[31]; int st5[5] = {1, 0, 0, 0, 0};
         for (int k = 0; k < L; ++k) {           /* taps bit0,bit2 -> x^5+x^2+1 */
             code[k] = (int8_t)(1 - 2 * st5[0]);
@@ -722,6 +722,117 @@ int main(void) {
         CHECK(ox != NULL && ch == 0 && ns > 0 && fabs(mag - 1.0) < 1e-2,
               "osx: an in-band tone extracted at unit gain");
         atkdsp_osx_destroy(ox); free(ix); free(oc);
+    }
+
+    /* §29 Undertow: a 31-chip code (data-modulated, 0 dB in-band) found by the
+     * survey with its period, in noise; nothing found in noise alone */
+    {
+        const double fs = 240e3, rc = 10e3, fcode = 31.2e3;
+        const size_t nn = 240000;
+        int8_t code[31]; { int reg[5] = {1, 0, 0, 0, 0};
+            for (int i = 0; i < 31; ++i) { code[i] = reg[4] ? 1 : -1;
+                const int fb = reg[4] ^ reg[1];
+                for (int j = 4; j > 0; --j) reg[j] = reg[j - 1];
+                reg[0] = fb; } }
+        uint64_t st = 0x9E3779B97F4A7C15ULL;
+        #define UT_U01 ((double)((st = st * 6364136223846793005ULL + 1442695040888963407ULL) >> 11) / 9007199254740992.0)
+        const double sg = sqrt((1.0 / rc) * fs / 2.0);      /* 0 dB in a bandwidth of rc */
+        atkdsp_cf32 *ux = (atkdsp_cf32 *)malloc(nn * sizeof *ux);
+        atkdsp_cf32 *un = (atkdsp_cf32 *)malloc(nn * sizeof *un);
+        int bit = 1;
+        for (size_t i = 0; i < nn; ++i) {
+            const size_t chip = (size_t)((double)i * rc / fs);
+            if (chip % 31 == 0 && (double)i * rc / fs - (double)chip < rc / fs) bit = UT_U01 < 0.5 ? -1 : 1;
+            const double a = (double)(code[chip % 31] * bit);
+            const double ph = 2.0 * ATK_SMOKE_PI * fcode / fs * (double)i;
+            const double u1 = UT_U01 + 1e-12, u2 = UT_U01, rr = sqrt(-2.0 * log(u1));
+            const double nr = sg * rr * cos(2.0 * ATK_SMOKE_PI * u2), ni = sg * rr * sin(2.0 * ATK_SMOKE_PI * u2);
+            un[i].re = (float)nr; un[i].im = (float)ni;
+            ux[i].re = (float)(a * cos(ph) + nr); ux[i].im = (float)(a * sin(ph) + ni);
+        }
+        #undef UT_U01
+        atkdsp_undertow_cfg ucfg; atkdsp_undertow_defaults(&ucfg, fs, 4, 64);
+        atkdsp_undertow *ut = atkdsp_undertow_create(&ucfg);
+        atkdsp_undertow *un0 = atkdsp_undertow_create(&ucfg);
+        atkdsp_undertow_cell hits[8];
+        ptrdiff_t nh = -1, nh0 = -1;
+        if (ut && un0) {
+            atkdsp_undertow_process(ut, ux, nn);
+            atkdsp_undertow_process(un0, un, nn);
+            nh = atkdsp_undertow_read(ut, hits, 8);
+            atkdsp_undertow_cell h0[8];
+            nh0 = atkdsp_undertow_read(un0, h0, 8);
+        }
+        CHECK(ut != NULL && atkdsp_undertow_ncells(ut) == 120, "undertow: 4 scales, 120 cells");
+        CHECK(nh >= 1 && (hits[0].flags & ATKDSP_UT_FLUCT) && fabs(hits[0].period_s - 31.0 / rc) < 0.01 * 31.0 / rc,
+              "undertow: a 31-chip code found with its period (3.1 ms)");
+        CHECK(nh0 == 0, "undertow: nothing found in noise alone");
+        atkdsp_undertow_destroy(ut); atkdsp_undertow_destroy(un0); free(ux); free(un);
+    }
+
+    /* §30 psync, the bootstrap, the hit blob: a 31-chip code (4 samples a
+     * chip, one bit a period, -6 dB in-band, 300 Hz off) — the period found
+     * from a seed a third of a sample off, the code recovered and named; noise
+     * alone stays quiet; the blob round-trips and refuses a flipped bit. */
+    {
+        const double fs = 48e3, rc = 12e3, foff = 300.0;
+        const size_t nn = 48000;
+        int8_t code[31]; { int reg[5] = {1, 0, 0, 0, 0};
+            for (int i = 0; i < 31; ++i) { code[i] = reg[4] ? 1 : -1;
+                const int fb = reg[4] ^ reg[1];
+                for (int j = 4; j > 0; --j) reg[j] = reg[j - 1];
+                reg[0] = fb; } }
+        uint64_t st = 0xD1B54A32D192ED03ULL;
+        #define PS_U01 ((double)((st = st * 6364136223846793005ULL + 1442695040888963407ULL) >> 11) / 9007199254740992.0)
+        const double sg = sqrt(pow(10.0, 0.6) / rc * fs / 2.0);   /* -6 dB in a bandwidth of rc */
+        atkdsp_cf32 *px = (atkdsp_cf32 *)malloc(nn * sizeof *px), *pn = (atkdsp_cf32 *)malloc(nn * sizeof *pn);
+        int bit = 1;
+        for (size_t i = 0; i < nn; ++i) {
+            const size_t chip = i / 4;
+            if (chip % 31 == 0 && i % 4 == 0) bit = PS_U01 < 0.5 ? -1 : 1;
+            const double a = (double)(code[chip % 31] * bit), ph = 2.0 * ATK_SMOKE_PI * foff / fs * (double)i;
+            const double u1 = PS_U01 + 1e-12, u2 = PS_U01, rr = sqrt(-2.0 * log(u1));
+            const double nr = sg * rr * cos(2.0 * ATK_SMOKE_PI * u2), ni = sg * rr * sin(2.0 * ATK_SMOKE_PI * u2);
+            pn[i].re = (float)nr; pn[i].im = (float)ni;
+            px[i].re = (float)(a * cos(ph) + nr); px[i].im = (float)(a * sin(ph) + ni);
+        }
+        #undef PS_U01
+        atkdsp_psync_cfg pc; atkdsp_psync_defaults(&pc, fs, (124.0 + 0.33) / fs);
+        atkdsp_cf32 wave[256]; atkdsp_psync_result pr, pr0;
+        const int rc1 = atkdsp_psync(px, nn, &pc, wave, 256, &pr);
+        const int rc0 = atkdsp_psync(pn, nn, &pc, wave, 256, &pr0);
+        CHECK(rc1 == ATKDSP_OK && (pr.flags & ATKDSP_PS_DETECT) && fabs(pr.period_samples - 124.0) < 1e-3,
+              "psync: the period found from a seed a third of a sample off");
+        CHECK(rc0 == ATKDSP_OK && !(pr0.flags & ATKDSP_PS_DETECT), "psync: noise alone stays quiet");
+        atkdsp_bootstrap_cfg bc; atkdsp_bootstrap_defaults(&bc, fs, (124.0 + 0.33) / fs, rc / 0.75);
+        int8_t ch[64]; atkdsp_bootstrap_result br;
+        const ptrdiff_t nc = atkdsp_bootstrap(px, nn, &bc, ch, 64, &br);
+        int match = 0;
+        if (nc == 31)
+            for (int sh = 0; sh < 31 && !match; ++sh) {
+                int same = 1, neg = 1;
+                for (int k = 0; k < 31; ++k) { same &= ch[k] == code[(k + sh) % 31]; neg &= ch[k] == -code[(k + sh) % 31]; }
+                match = same || neg;
+            }
+        CHECK(match && (br.flags & ATKDSP_BS_CODE) && strncmp(br.code.name, "m-sequence (31)", 15) == 0
+              && fabs(br.cfo_hz - foff) < 20.0, "bootstrap: the code recovered and named, the offset read");
+        atkdsp_undertow_ctx cx; memset(&cx, 0, sizeof cx); cx.t_unix = 1.7e9; cx.fs_survey = fs;
+        strcpy(cx.source, "smoke");
+        atkdsp_undertow_cell hc; memset(&hc, 0, sizeof hc); hc.period_s = pr.period_s; hc.nseen = 2; hc.flags = 9;
+        const ptrdiff_t need = atkdsp_undertow_hit_export(&cx, &hc, &br, ch, nc > 0 ? (size_t)nc : 0, NULL, 0);
+        uint8_t *blob = need > 0 ? (uint8_t *)malloc((size_t)need) : NULL;
+        int okrt = 0, okbad = 0;
+        if (blob && atkdsp_undertow_hit_export(&cx, &hc, &br, ch, (size_t)nc, blob, (size_t)need) == need) {
+            atkdsp_undertow_ctx c2; atkdsp_undertow_cell h2; atkdsp_bootstrap_result b2; int hb = 0;
+            int8_t c3[64]; size_t n3 = 0;
+            okrt = atkdsp_undertow_hit_import(blob, (size_t)need, &c2, &h2, &b2, &hb, c3, 64, &n3) == ATKDSP_OK
+                   && hb && n3 == 31 && memcmp(c3, ch, 31) == 0 && h2.nseen == 2 && strcmp(c2.source, "smoke") == 0
+                   && strcmp(b2.code.name, br.code.name) == 0;
+            blob[need / 2] ^= 1;
+            okbad = atkdsp_undertow_hit_import(blob, (size_t)need, &c2, &h2, &b2, &hb, c3, 64, &n3) == ATKDSP_E_DECODE;
+        }
+        CHECK(okrt && okbad, "hit blob: round-trips, and a flipped bit is refused");
+        free(blob); free(px); free(pn);
     }
 
     free(x); free(y); free(z); free(win); free(line); free(fm); free(scratch);

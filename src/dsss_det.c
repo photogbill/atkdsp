@@ -87,6 +87,12 @@ static const atkdsp_method_info METHODS[ATKDSP_METHOD_COUNT] = {
     {"consistency lattice and common-oscillator test", "ATK", "2026", "atkdsp", "ATK"},
     {"dechirp detection of chirp spread spectrum", "Semtech (LoRa); open descriptions (gr-lora, LoRa-SDR)",
      "2013 / 2017", "patent / open source", "US/CH"},
+    {"scale-space survey over a dyadic filterbank", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
+    {"chip-shape autocorrelation vs neighbouring cells (predictive t)", "ATK", "2026", "atkdsp", "ATK"},
+    {"scale-constrained cyclic chip line", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
+    {"period-synchronous eigen watch vs off-period references", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
+    {"lag-rate period refinement (radar's keystone idea)", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
+    {"bootstrap code recovery over the recording", "ATK (Undertow)", "2026", "atkdsp", "ATK"},
 };
 
 const atkdsp_method_info *atkdsp_method(int method_id) {
@@ -236,6 +242,47 @@ double atkdsp_cav_threshold(int lags, double ns, double pfa) {
     const double den = 1.0 - z / s;
     if (!(den > 0.0)) return HUGE_VAL;
     return (1.0 + (double)(lags - 1) * 0.886226925452758 / s) / den;
+}
+
+/* §30: the k strongest interior local maxima of rho over period_min..max_lag-1,
+ * strongest first (ties: the shorter lag), each with its parabolic period and
+ * the fluctuation handle's own Bonferroni Gamma tail — candidate periods for
+ * atkdsp_psync even when the handle has not fired. Twin: DsssDet.lags. */
+ptrdiff_t atkdsp_dsss_det_lags(const atkdsp_dsss_det *h, atkdsp_dsss_lag *out, size_t cap) {
+    if (!h || (!out && cap)) return ATKDSP_E_ARG;
+    const atkdsp_dsss_det_config *c = &h->cfg;
+    const int ML = c->max_lag, PM = c->period_min;
+    if (h->windows < 2 || !(c->handles & ATKDSP_DSSS_H_FLUCT) || cap == 0) return 0;
+    const int nl = ML - PM + 1;
+    const double nw = (double)h->windows;
+    double mean = 0.0;
+    for (int tau = PM; tau <= ML; tau++) mean += h->rho[tau];
+    mean /= (double)nl;
+    if (!(mean > 0.0)) mean = 1e-300;
+    const int lo = PM >= 1 ? PM : 1;
+    size_t got = 0;
+    /* selection by insertion into out (cap is small) */
+    for (int t = lo; t < ML; t++) {
+        const double r = h->rho[t];
+        if (!(r > h->rho[t - 1] && r > h->rho[t + 1])) continue;
+        size_t pos = got;
+        while (pos > 0 && r > out[pos - 1].period) pos--;   /* raw rho held in .period while selecting;
+                                                              strictly stronger moves up, a tie keeps the shorter lag first */
+        if (pos >= cap) continue;
+        const size_t last = got < cap ? got : cap - 1;
+        for (size_t q = last; q > pos; q--) out[q] = out[q - 1];
+        out[pos].lag = t; out[pos].reserved = 0;
+        out[pos].period = r;
+        if (got < cap) got++;
+    }
+    for (size_t i = 0; i < got; i++) {
+        const int t = out[i].lag;
+        out[i].ratio = h->rho[t] / mean;
+        out[i].period = parabola(h->rho, t);
+        double l10 = atk_log_igamc(nw, nw * out[i].ratio) / log(10.0) + log10((double)nl);
+        out[i].log10_pfa = l10 > 0.0 ? 0.0 : l10;
+    }
+    return (ptrdiff_t)got;
 }
 
 int atkdsp_dsss_det_read(const atkdsp_dsss_det *h, atkdsp_dsss_det_result *out) {

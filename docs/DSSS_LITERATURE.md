@@ -699,3 +699,55 @@ is **ATK**) — can replace hand-set fusion weights and classify what fired
 replaces the statistics, it never runs in C99, and it is judged in the
 same harness, against the same planted emitter, by the same three numbers
 (depth, time-to-detect, false alarms over a night).
+
+## L. Addendum, 2026-10-30 — blind chip-rate estimation, and two Frobenius ideas
+
+Bill asked (02:41) for a search on blind chip-rate detectors, after the
+bootstrap (`atkdsp.h` §30) showed the chip count is the hard part below the
+floor: in a survey cell the filter cuts the code's spectrum at ~2/3 of the
+chip rate, so the chip-rate line is weak.
+
+- **Bandpass filtering before the cyclic moment — KR 2020** (Kim, Yoon, Kang,
+  Moon, Park; *J. KICS* 45(3), 568–576; abstract read). A DSSS signal's
+  cyclic spectrum has lines at every multiple of the code rate, which bury
+  the chip-rate line; they restrict the search to a band set by a bandwidth
+  estimate. **Confirms** the trap the bootstrap met, and the survey's scale
+  window is the same remedy. No SNR floor stated.
+- **Carrier-aggregated DSSS, cyclostationary — TR 2024** (Görçin, ITU /
+  TÜBİTAK BİLGEM; *Electronics* 13(18), 3743). Carrier count, spacing and
+  chip rate jointly; tested to 0 dB only. Above the floor.
+- **Time–frequency energy squeeze — CN 2025** (Zhao, Sun, Cai, Liu, Guilin UET;
+  *Sensors* 25(3), 596). Already in §J; rectangular chips only.
+- **Le Nir & Scheers — BE** (Royal Military Academy; *Electronics Letters*).
+  The eigenvector-carrier idea `dsss_code` uses; it does **not** estimate the
+  chip rate (one sample a chip assumed).
+- Reading the chip rate off the principal eigenvector: **CN 2017** (§C6). The
+  bootstrap's two scores of the eigenvector — the chip-centre envelope and
+  the transition line, decoded and confirmed by naming — are ATK's form.
+
+Nothing found handles band-limited chips below the floor.
+
+**Two ideas Bill relayed (03:08), sound, for `dsss_code` (v0.23):**
+1. **2-adic decimation averaging.** For an m-sequence of length L = 2^r − 1,
+   c[2^m n mod L] is a cyclic shift of c[n] (the Frobenius automorphism). So
+   the r decimations of the soft-chip vector, aligned by their cyclic shifts
+   (found by correlation, which is itself evidence of an m-sequence), give
+   each chip r looks at *different* samples — independent noise — about
+   10·log₁₀ r dB per chip (7 dB at 31 chips, 10 dB at 1023). Not for Gold
+   codes (each component shifts differently). The technique is known in
+   coding as permutation / automorphism-ensemble decoding.
+2. **The Frobenius parity stack.** Over GF(2), g(x)^(2^m) = g(x^(2^m)): every
+   parity check's squares are checks too, at power-of-two lags — the
+   low-weight-multiple trick of fast correlation attacks (Meier &
+   Staffelbach, CH 1989; already cited for parity counting). Summing the
+   parity statistic over the orbit gives about √r more deflection when
+   naming the generator through chip errors.
+
+Rejected from the same exchange, with reasons in the conversation: quantile /
+Wasserstein envelope tests (a robust variant of the chip-rate envelope
+feature, not deeper), modulational-instability "amplification" (it amplifies
+noise in its gain band equally), a Bessel-score band concentration (linear at
+low SNR: a radiometer), a two-channel geometric phase (a high-order statistic
+from three samples; the averaged cross-spectrum is the right two-receiver
+statistic), and min-sum parity on raw chips (the piling-up lemma it cites is
+the cubic loss).

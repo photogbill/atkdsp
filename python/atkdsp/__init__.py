@@ -21,6 +21,7 @@ processed here holds the interpreter lock for none of those 50 ms.
 from __future__ import annotations
 
 import ctypes as C
+import math
 import os
 import sys
 from pathlib import Path
@@ -53,7 +54,7 @@ __all__ = [
 #: 18 adds phase 3 (§22-24): pulse runs (Pulses), the cyclic probes (Cyclic,
 #:    CpProbe), the analog radio IDs (ToneId); the CFAR config's rho2 (the
 #:    window's bin correlation) and block_code_id's fixed_bits.
-ABI_VERSION = 21
+ABI_VERSION = 23
 
 FMT = {"cu8": 0, "ci8": 1, "ci16": 2, "ci16_le": 2, "cs16": 2,
        "ci16q11": 3, "cf32": 4, "cf32_le": 4}
@@ -3643,6 +3644,40 @@ def _bind_osx(lib) -> None:
 _BIND_EXTRA.append(_bind_osx)
 
 
+class _UndertowCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("nscales", C.c_int32), ("nchan0", C.c_int32), ("win", C.c_int32),
+                ("max_lag", C.c_int32), ("period_min", C.c_int32), ("acf_lags", C.c_int32),
+                ("seg_len", C.c_int32), ("taps_per_poly", C.c_int32), ("atten_db", C.c_double),
+                ("pfa", C.c_double), ("max_block", C.c_int32), ("reserved", C.c_int32 * 3)]
+
+
+class _UndertowCell(C.Structure):
+    _fields_ = [("fc_hz", C.c_double), ("bw_hz", C.c_double), ("fluct_log10_pfa", C.c_double),
+                ("period_s", C.c_double), ("acf_log10_pfa", C.c_double), ("acf_z", C.c_double),
+                ("cyc_log10_pfa", C.c_double), ("cyc_alpha_hz", C.c_double), ("cyc_z", C.c_double),
+                ("rc_hz", C.c_double), ("L", C.c_double), ("log10_pfa", C.c_double),
+                ("scale", C.c_int32), ("chan", C.c_int32), ("nwin", C.c_int32), ("nseen", C.c_int32),
+                ("flags", C.c_uint32), ("method", C.c_int32 * 4), ("reserved", C.c_int32)]
+
+
+def _bind_undertow(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d = C.c_void_p, C.c_size_t, C.c_int, C.c_double
+    lib.atkdsp_undertow_defaults.argtypes = [P(_UndertowCfg), d, i, i]; lib.atkdsp_undertow_defaults.restype = None
+    lib.atkdsp_undertow_create.argtypes = [P(_UndertowCfg)]; lib.atkdsp_undertow_create.restype = vp
+    lib.atkdsp_undertow_destroy.argtypes = [vp]; lib.atkdsp_undertow_destroy.restype = None
+    lib.atkdsp_undertow_reset.argtypes = [vp]; lib.atkdsp_undertow_reset.restype = None
+    lib.atkdsp_undertow_process.argtypes = [vp, P(_Cf32), sz]; lib.atkdsp_undertow_process.restype = i
+    lib.atkdsp_undertow_ncells.argtypes = [vp]; lib.atkdsp_undertow_ncells.restype = i
+    lib.atkdsp_undertow_cells.argtypes = [vp, P(_UndertowCell), sz]; lib.atkdsp_undertow_cells.restype = C.c_ssize_t
+    lib.atkdsp_undertow_read.argtypes = [vp, P(_UndertowCell), sz]; lib.atkdsp_undertow_read.restype = C.c_ssize_t
+    lib.atkdsp_undertow_describe.argtypes = [vp, C.c_char_p, sz]; lib.atkdsp_undertow_describe.restype = i
+    lib.atkdsp_t_log10_sf2.argtypes = [d, d]; lib.atkdsp_t_log10_sf2.restype = d
+
+
+_BIND_EXTRA.append(_bind_undertow)
+
+
 def method(method_id: int):
     """(name, authors, year, country) or None — the twin of atkdsp_method()."""
     p = load().atkdsp_method(int(method_id))
@@ -3757,6 +3792,17 @@ class DsssDet:
         r = _DsssDetResult()
         _check(self._lib.atkdsp_dsss_det_read(self._h, C.byref(r)), "dsss_det_read")
         return _struct_dict(r)
+
+    def lags(self, k: int = 3) -> list:
+        """The k strongest interior fluctuation peaks (atkdsp_dsss_det_lags, §30):
+        candidate periods for psync even when the handle has not fired."""
+        k = int(k)
+        if k < 1:
+            return []
+        buf = (_DsssLag * k)()
+        n = _check(self._lib.atkdsp_dsss_det_lags(self._h, buf, k), "dsss_det_lags")
+        return [dict(lag=int(buf[i].lag), period=float(buf[i].period), ratio=float(buf[i].ratio),
+                     log10_pfa=float(buf[i].log10_pfa)) for i in range(n)]
 
     def rho(self) -> np.ndarray:
         buf = (C.c_double * (self._max_lag + 1))()
@@ -4284,3 +4330,317 @@ class Osx:
 
 
 __all__ += ["Osx"]
+
+
+# -- §29 Undertow: the scale-space survey --------------------------------------
+UT_FLUCT, UT_ACF, UT_CYC, UT_PERIOD, UT_CONSISTENT, UT_WARMUP = 1, 2, 4, 8, 16, 32
+
+
+def undertow_defaults(fs, nscales=4, lmax=64) -> dict:
+    """The survey config (a dict, the twin's keys) for codes up to lmax chips."""
+    lib = load()
+    c = _UndertowCfg()
+    lib.atkdsp_undertow_defaults(C.byref(c), float(fs), int(nscales), int(lmax))
+    out = _struct_dict(c)
+    out.pop("reserved", None)
+    return out
+
+
+def t_log10_sf2(t, nu) -> float:
+    """log10 P(|T| > t), Student's t with nu dof (atkdsp_t_log10_sf2)."""
+    return float(load().atkdsp_t_log10_sf2(float(t), float(nu)))
+
+
+class Undertow:
+    """The scale-space survey (atkdsp_undertow). cfg: undertow_defaults(...)
+    with any field changed. Twin: atkdsp.reference.Undertow."""
+
+    def __init__(self, cfg: dict):
+        self._lib = load()
+        c = _UndertowCfg()
+        self._lib.atkdsp_undertow_defaults(C.byref(c), float(cfg["fs"]), int(cfg.get("nscales", 4)), 64)
+        for k, v in cfg.items():
+            if k in ("reserved",):
+                continue
+            if not hasattr(c, k):
+                raise AtkDspError(f"undertow: unknown config key {k!r}")
+            setattr(c, k, type(getattr(c, k))(v))
+        self._p = self._lib.atkdsp_undertow_create(C.byref(c))
+        if not self._p:
+            raise AtkDspError("undertow_create refused the config (see atkdsp.h §29)")
+        self.ncells = int(self._lib.atkdsp_undertow_ncells(self._p))
+
+    def __del__(self):
+        p = getattr(self, "_p", None)
+        if p:
+            self._lib.atkdsp_undertow_destroy(p); self._p = None
+
+    def reset(self):
+        self._lib.atkdsp_undertow_reset(self._p)
+
+    def process(self, x):
+        a = np.ascontiguousarray(np.asarray(x).ravel(), np.complex64)
+        _check(self._lib.atkdsp_undertow_process(self._p, _cfp(a), a.size), "undertow_process")
+
+    def cells(self) -> list:
+        buf = (_UndertowCell * self.ncells)()
+        n = self._lib.atkdsp_undertow_cells(self._p, buf, self.ncells)
+        _check(n if n >= 0 else int(n), "undertow_cells")
+        return [self._d(buf[i]) for i in range(n)]
+
+    def read(self) -> list:
+        buf = (_UndertowCell * self.ncells)()
+        n = self._lib.atkdsp_undertow_read(self._p, buf, self.ncells)
+        _check(n if n >= 0 else int(n), "undertow_read")
+        return [self._d(buf[i]) for i in range(n)]
+
+    @staticmethod
+    def _d(c):
+        d = _struct_dict(c)
+        d.pop("reserved", None)
+        return d
+
+    def candidates(self, max_log10: float = -1.0, per_cell: int = 3) -> list:
+        """Every cell's per_cell strongest fluctuation lags with a CELL-level
+        tail <= max_log10 (atkdsp_undertow_candidates, §30) — psync's seeds."""
+        n = self._lib.atkdsp_undertow_candidates(self._p, float(max_log10), int(per_cell), None, 0)
+        _check(n if n >= 0 else int(n), "undertow_candidates")
+        if n == 0:
+            return []
+        buf = (_UndertowCand * n)()
+        n = self._lib.atkdsp_undertow_candidates(self._p, float(max_log10), int(per_cell), buf, n)
+        _check(n if n >= 0 else int(n), "undertow_candidates")
+        out = []
+        for i in range(n):
+            d = _struct_dict(buf[i]); d.pop("reserved", None); out.append(d)
+        return out
+
+    def describe(self) -> str:
+        buf = C.create_string_buffer(256)
+        n = self._lib.atkdsp_undertow_describe(self._p, buf, 256)
+        return buf.value.decode() if n > 0 else ""
+
+
+__all__ += ["Undertow", "undertow_defaults", "t_log10_sf2", "UT_FLUCT", "UT_ACF", "UT_CYC",
+            "UT_PERIOD", "UT_CONSISTENT", "UT_WARMUP"]
+
+
+# ---- §30 Undertow pieces 2, 4, 6: psync, the bootstrap, the hit blob ----------
+class _DsssLag(C.Structure):
+    _fields_ = [("period", C.c_double), ("ratio", C.c_double), ("log10_pfa", C.c_double),
+                ("lag", C.c_int32), ("reserved", C.c_int32)]
+
+
+class _UndertowCand(C.Structure):
+    _fields_ = [("fc_hz", C.c_double), ("bw_hz", C.c_double), ("fs_cell", C.c_double), ("period_s", C.c_double),
+                ("ratio", C.c_double), ("log10_pfa", C.c_double), ("scale", C.c_int32), ("chan", C.c_int32),
+                ("lag", C.c_int32), ("reserved", C.c_int32)]
+
+
+class _PsyncCfg(C.Structure):
+    _fields_ = [("fs", C.c_double), ("period_s", C.c_double), ("tol", C.c_double), ("rate_max", C.c_double),
+                ("pfa", C.c_double), ("esc_pfa", C.c_double), ("n0", C.c_int32), ("n0_max", C.c_int32),
+                ("nref", C.c_int32), ("max_periods", C.c_int32), ("reserved", C.c_int32 * 4)]
+
+
+class _PsyncResult(C.Structure):
+    _fields_ = [(k, C.c_double) for k in ("period_s", "period_samples", "rate", "lambda1", "lambda2", "ref_mean",
+                                          "ref_sd", "z", "log10_pfa", "snr_db", "sigma2", "dominance",
+                                          "window_offset")] + \
+               [(k, C.c_int32) for k in ("nperiods", "n0_used", "levels", "evals", "window")] + \
+               [("flags", C.c_uint32), ("method", C.c_int32 * 4)]
+
+
+class _BootstrapCfg(C.Structure):
+    _fields_ = [("ps", _PsyncCfg), ("bw_hz", C.c_double), ("rc_hz", C.c_double), ("chip_mod", C.c_int32),
+                ("vote_passes", C.c_int32), ("poly_max_degree", C.c_int32), ("reserved0", C.c_int32),
+                ("code_pfa", C.c_double), ("reserved", C.c_int32 * 4)]
+
+
+class _BootstrapResult(C.Structure):
+    _fields_ = [("ps", _PsyncResult), ("code", _DsssCodeResult), ("cfo_hz", C.c_double), ("rc_hz", C.c_double),
+                ("fs_code", C.c_double), ("line_ratio", C.c_double), ("L", C.c_int32),
+                ("support_start", C.c_int32), ("flags", C.c_uint32), ("method", C.c_int32 * 4),
+                ("harmonic", C.c_int32)]
+
+
+class _UndertowCtx(C.Structure):
+    _fields_ = [("t_unix", C.c_double), ("rf_center_hz", C.c_double), ("fs_survey", C.c_double),
+                ("source", C.c_char * 40)]
+
+
+def _bind_psync(lib) -> None:
+    P = C.POINTER
+    vp, sz, i, d, ss = C.c_void_p, C.c_size_t, C.c_int, C.c_double, C.c_ssize_t
+    lib.atkdsp_dsss_det_lags.argtypes = [vp, P(_DsssLag), sz]; lib.atkdsp_dsss_det_lags.restype = ss
+    lib.atkdsp_undertow_candidates.argtypes = [vp, d, i, P(_UndertowCand), sz]
+    lib.atkdsp_undertow_candidates.restype = ss
+    lib.atkdsp_psync_defaults.argtypes = [P(_PsyncCfg), d, d]; lib.atkdsp_psync_defaults.restype = None
+    lib.atkdsp_psync.argtypes = [P(_Cf32), sz, P(_PsyncCfg), P(_Cf32), sz, P(_PsyncResult)]
+    lib.atkdsp_psync.restype = i
+    lib.atkdsp_bootstrap_defaults.argtypes = [P(_BootstrapCfg), d, d, d]; lib.atkdsp_bootstrap_defaults.restype = None
+    lib.atkdsp_bootstrap.argtypes = [P(_Cf32), sz, P(_BootstrapCfg), P(C.c_int8), sz, P(_BootstrapResult)]
+    lib.atkdsp_bootstrap.restype = ss
+    lib.atkdsp_undertow_hit_export.argtypes = [P(_UndertowCtx), P(_UndertowCell), P(_BootstrapResult),
+                                               P(C.c_int8), sz, P(C.c_uint8), sz]
+    lib.atkdsp_undertow_hit_export.restype = ss
+    lib.atkdsp_undertow_hit_import.argtypes = [P(C.c_uint8), sz, P(_UndertowCtx), P(_UndertowCell),
+                                               P(_BootstrapResult), P(C.c_int), P(C.c_int8), sz, P(sz)]
+    lib.atkdsp_undertow_hit_import.restype = i
+
+
+_BIND_EXTRA.append(_bind_psync)
+
+PS_DETECT, PS_RATE, PS_EDGE, PS_BUDGET, PS_MULTI, PS_RECUT = 1, 2, 4, 8, 16, 32
+BS_DETECT, BS_CODE, BS_REFUSED, BS_RC_GIVEN, BS_HARMONIC = 1, 2, 4, 8, 16
+UT_BLOB_VERSION = 1
+
+
+def psync_defaults(fs: float, period_s: float) -> dict:
+    c = _PsyncCfg()
+    load().atkdsp_psync_defaults(C.byref(c), float(fs), float(period_s))
+    d = _struct_dict(c); d.pop("reserved", None)
+    return d
+
+
+def _fill(c, cfg, skip=()):
+    for k, v in cfg.items():
+        if k in skip or k == "reserved":
+            continue
+        if not hasattr(c, k):
+            raise AtkDspError(f"unknown config key {k!r}")
+        setattr(c, k, type(getattr(c, k))(v))
+
+
+def _ps_dict(r) -> dict:
+    return _struct_dict(r)
+
+
+def psync(y, cfg: dict):
+    """(result, wave) — binding of atkdsp_psync (§30). Twin: reference.psync."""
+    lib = load()
+    a = _cf32(y)
+    c = _PsyncCfg()
+    lib.atkdsp_psync_defaults(C.byref(c), float(cfg["fs"]), float(cfg["period_s"]))
+    _fill(c, cfg)
+    W = 2 * int(math.floor(c.period_s * c.fs + 0.5))
+    wave = np.zeros(max(W, 1), np.complex64)
+    r = _PsyncResult()
+    _check(lib.atkdsp_psync(_cfp(a), a.size, C.byref(c), _cfp(wave), wave.size, C.byref(r)), "psync")
+    return _ps_dict(r), wave[:r.window].copy()
+
+
+def bootstrap_defaults(fs: float, period_s: float, bw_hz: float) -> dict:
+    c = _BootstrapCfg()
+    load().atkdsp_bootstrap_defaults(C.byref(c), float(fs), float(period_s), float(bw_hz))
+    d = _struct_dict(c.ps); d.pop("reserved", None)
+    for k in ("bw_hz", "rc_hz", "chip_mod", "vote_passes", "poly_max_degree", "code_pfa"):
+        d[k] = getattr(c, k)
+    return d
+
+
+def _bs_dict(r) -> dict:
+    d = {k: _struct_dict(getattr(r, k)) for k in ("ps", "code")}
+    for n, _t in r._fields_:
+        if n in ("ps", "code", "reserved"):
+            continue
+        v = getattr(r, n)
+        d[n] = [int(x) for x in v] if isinstance(v, C.Array) else (int(v) if isinstance(v, int) else float(v))
+    return d
+
+
+def bootstrap(y, cfg: dict):
+    """(chips, result) — binding of atkdsp_bootstrap (§30). Twin: reference.bootstrap."""
+    lib = load()
+    a = _cf32(y)
+    c = _BootstrapCfg()
+    lib.atkdsp_bootstrap_defaults(C.byref(c), float(cfg["fs"]), float(cfg["period_s"]), float(cfg.get("bw_hz", 0.0)))
+    _fill(c.ps, {k: v for k, v in cfg.items() if hasattr(c.ps, k)})
+    _fill(c, {k: v for k, v in cfg.items() if not hasattr(c.ps, k)})
+    cap = 2 * int(math.floor(c.ps.period_s * c.ps.fs + 0.5)) + 2
+    buf = (C.c_int8 * cap)()
+    r = _BootstrapResult()
+    n = lib.atkdsp_bootstrap(_cfp(a), a.size, C.byref(c), buf, cap, C.byref(r))
+    _check(n if n >= 0 else int(n), "bootstrap")
+    return np.ctypeslib.as_array(buf)[:n].copy(), _bs_dict(r)
+
+
+def _cell_struct(hit: dict) -> "_UndertowCell":
+    h = _UndertowCell()
+    for n, _t in h._fields_:
+        if n == "reserved" or n not in hit:
+            continue
+        v = hit[n]
+        if n == "method":
+            for i, m in enumerate(list(v)[:4]):
+                h.method[i] = int(m)
+        else:
+            setattr(h, n, type(getattr(h, n))(v))
+    return h
+
+
+def _bs_struct(bs: dict) -> "_BootstrapResult":
+    r = _BootstrapResult()
+    for part in ("ps", "code"):
+        st = getattr(r, part)
+        for n, _t in st._fields_:
+            if n not in (bs.get(part) or {}):
+                continue
+            v = bs[part][n]
+            if isinstance(getattr(st, n), C.Array):
+                for i, m in enumerate(list(v)[:len(getattr(st, n))]):
+                    getattr(st, n)[i] = int(m)
+            elif isinstance(getattr(st, n), bytes):
+                setattr(st, n, str(v).encode()[:47])
+            else:
+                setattr(st, n, type(getattr(st, n))(v))
+    for n, _t in r._fields_:
+        if n in ("ps", "code", "reserved") or n not in bs:
+            continue
+        if n == "method":
+            for i, m in enumerate(list(bs[n])[:4]):
+                r.method[i] = int(m)
+        else:
+            setattr(r, n, type(getattr(r, n))(bs[n]))
+    return r
+
+
+def hit_export(ctx: dict, hit: dict, bs: dict | None = None, chips=None) -> bytes:
+    """The versioned hit blob (atkdsp_undertow_hit_export, §30). Twin: reference.hit_export."""
+    lib = load()
+    cx = _UndertowCtx(float(ctx.get("t_unix", 0.0)), float(ctx.get("rf_center_hz", 0.0)),
+                      float(ctx.get("fs_survey", 0.0)), str(ctx.get("source", "")).encode()[:39])
+    h = _cell_struct(hit)
+    b = _bs_struct(bs) if bs is not None else None
+    ch = np.zeros(0, np.int8) if chips is None else np.ascontiguousarray(chips, np.int8).ravel()
+    chp = ch.ctypes.data_as(C.POINTER(C.c_int8)) if ch.size else None
+    bp = C.byref(b) if b is not None else None
+    need = lib.atkdsp_undertow_hit_export(C.byref(cx), C.byref(h), bp, chp, ch.size, None, 0)
+    _check(need if need >= 0 else int(need), "hit_export")
+    out = (C.c_uint8 * need)()
+    n = lib.atkdsp_undertow_hit_export(C.byref(cx), C.byref(h), bp, chp, ch.size, out, need)
+    _check(n if n >= 0 else int(n), "hit_export")
+    return bytes(out)
+
+
+def hit_import(blob: bytes):
+    """(ctx, hit, bs or None, chips) — atkdsp_undertow_hit_import; AtkDspError on
+    a wrong magic, version, length or CRC."""
+    lib = load()
+    raw = (C.c_uint8 * len(blob)).from_buffer_copy(bytes(blob))
+    cx, h, b = _UndertowCtx(), _UndertowCell(), _BootstrapResult()
+    has, nch = C.c_int(0), C.c_size_t(0)
+    cap = max(1, len(blob))
+    chips = (C.c_int8 * cap)()
+    rc = lib.atkdsp_undertow_hit_import(raw, len(blob), C.byref(cx), C.byref(h), C.byref(b), C.byref(has),
+                                        chips, cap, C.byref(nch))
+    _check(rc, "hit_import")
+    ctx = dict(t_unix=cx.t_unix, rf_center_hz=cx.rf_center_hz, fs_survey=cx.fs_survey,
+               source=cx.source.decode(errors="replace"))
+    hit = _struct_dict(h); hit.pop("reserved", None)
+    return ctx, hit, (_bs_dict(b) if has.value else None), np.ctypeslib.as_array(chips)[:nch.value].copy()
+
+
+__all__ += ["psync_defaults", "psync", "bootstrap_defaults", "bootstrap", "hit_export", "hit_import",
+            "PS_DETECT", "PS_RATE", "PS_EDGE", "PS_BUDGET", "PS_MULTI", "PS_RECUT",
+            "BS_DETECT", "BS_CODE", "BS_REFUSED", "BS_RC_GIVEN", "BS_HARMONIC", "UT_BLOB_VERSION"]

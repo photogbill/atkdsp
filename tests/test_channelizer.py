@@ -275,3 +275,83 @@ def test_osx_multi_element_phase_coherent():
     o2 = atkdsp.Osx(FS, OSX_NFFT, max_nel=5); o2.add(OSX_OFF, OSX_BW, OSX_RATE)
     yy = o2.process_n([base] * 5, 5)[0][0]
     assert all(np.array_equal(yy[0], yy[e]) for e in range(5))
+
+
+# ---- phase: every bin a true baseband at any oversampling; the extractor in
+# absolute time. Regression for two v0.19-0.20 bugs: the PFB's per-hop bin
+# rotation had the wrong sign and reference (right at 2x only, up to (-1)^k;
+# odd bins shifted by half the output rate at 4x — found by ATK's trunking work,
+# TRUNKED_RADIO_PLAN.md §4A), and the extractor mixed relative to each block's
+# start (an odd bin flipped the sign every block) and left up to half a bin of
+# residual offset. The old tests checked magnitude only; these check frequency
+# and phase continuity.
+def _peak_hz(y, rate):
+    y = np.asarray(y)[200:-50]
+    n = 1 << int(np.floor(np.log2(len(y))))
+    Y = np.abs(np.fft.fft(y[:n] * np.blackman(n)))
+    f = np.fft.fftfreq(n, 1.0 / rate)
+    return f[np.argmax(Y)], rate / n
+
+
+PFB_CASES = [(1, 3e3), (5, -4e3)]          # (bin, offset from its centre), 24 x 100 kHz bins
+
+
+@pytest.mark.parametrize("os_", [2, 3, 4])
+def test_pfb_twin_bins_are_true_baseband_at_any_oversampling(os_):
+    for b, df in PFB_CASES:
+        p = ref.Pfb(FS, 24, oversample=os_)
+        y = p.process(_tone(b * FS / 24 + df, 24 * 2500))
+        f, res = _peak_hz(y[b], p.out_rate())
+        assert abs(f - df) <= res, f"{os_}x bin {b}: tone at {f:.0f} Hz, want {df:.0f}"
+
+
+@needs_lib
+@pytest.mark.parametrize("os_", [2, 3, 4])
+def test_pfb_c_bins_are_true_baseband_at_any_oversampling(os_):
+    for b, df in PFB_CASES:
+        x = _tone(b * FS / 24 + df, 24 * 4000)
+        p = atkdsp.Pfb(FS, 24, oversample=os_)
+        y = p.process(x)
+        f, res = _peak_hz(y[b], p.out_rate())
+        assert abs(f - df) <= res, f"{os_}x bin {b}: tone at {f:.0f} Hz, want {df:.0f}"
+        yt = ref.Pfb(FS, 24, oversample=os_).process(x[: 24 * 1500])
+        m = min(y.shape[1], yt.shape[1])
+        assert np.max(np.abs(y[:, :m] - yt[:, :m])) / np.max(np.abs(yt[:, :m])) < 1e-4
+
+
+# even bin, odd bin, a fractional offset, a negative fractional offset
+OSX_HARD = [300e3, 513 * FS / 4096, 300200.0, -411737.3]
+
+
+@needs_lib
+@pytest.mark.parametrize("off", OSX_HARD)
+def test_osx_lands_on_centre_and_is_phase_continuous(off):
+    x = _tone(off + 7e3, 4096 * 50)
+    o = atkdsp.Osx(FS, 4096); c = o.add(off, OSX_BW, OSX_RATE)
+    y = o.process(x)[0][c]
+    f, res = _peak_hz(y, OSX_RATE)
+    assert abs(f - 7e3) <= res, f"offset {off}: tone at {f:.1f} Hz, want 7000"
+    k = np.arange(len(y))
+    d = np.unwrap(np.angle(y * np.exp(-2j * np.pi * 7e3 / OSX_RATE * k)))[300:-50]
+    assert np.std(d) < 1e-3, f"offset {off}: phase not continuous (std {np.std(d):.2e} rad)"
+
+
+@needs_lib
+@pytest.mark.parametrize("off", OSX_HARD[1:])
+def test_osx_c_matches_twin_at_hard_offsets(off):
+    x = _tone(off + 7e3, 4096 * 30, noise=0.01, seed=21)
+    oc = atkdsp.Osx(FS, 4096); ci = oc.add(off, OSX_BW, OSX_RATE); yc = oc.process(x)[0][ci]
+    ot = ref.Osx(FS, 4096); ti = ot.add(off, OSX_BW, OSX_RATE); yt = ot.process(x)[0][ti]
+    m = min(len(yc), len(yt))
+    assert np.max(np.abs(yc[:m] - yt[:m])) / np.max(np.abs(yt[:m])) < 1e-4
+
+
+@needs_lib
+def test_osx_retune_to_an_odd_bin_stays_on_centre():
+    o = atkdsp.Osx(FS, 4096); c = o.add(300e3, OSX_BW, OSX_RATE)
+    o.process(_tone(300e3 + 7e3, 4096 * 10))
+    off = 513 * FS / 4096 + 123.0
+    o.retune(c, off)
+    y = o.process(_tone(off + 7e3, 4096 * 50))[0][c]
+    f, res = _peak_hz(y[400:], OSX_RATE)
+    assert abs(f - 7e3) <= res

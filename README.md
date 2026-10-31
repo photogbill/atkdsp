@@ -101,7 +101,7 @@ They are in `include/atkdsp.h` and enforced by the tests; in short:
 
 ## What it provides
 
-`v0.25.0`, ABI 26. One header, `include/atkdsp.h`, is the whole surface;
+`v0.25.1`, ABI 26. One header, `include/atkdsp.h`, is the whole surface;
 every kernel below has a numpy twin in `python/atkdsp/reference.py` and a
 cross-check test that holds the two to each other. Grouped by what they are
 for:

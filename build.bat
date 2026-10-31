@@ -61,7 +61,25 @@ goto :smoke
 rem  Ninja (single-config, writes straight into bin\) when it is available -
 rem  ATK's env has it - otherwise the Visual Studio generator, which puts the
 rem  outputs under a Release\ subfolder that is copied up afterwards.
-"%CMAKE%" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release >nul 2>nul
+rem
+rem  atkdsp is built with MSVC. Two things stop CMake picking another compiler:
+rem   - a FRESH build\ is told to use cl. Without it, Ninja took the first C
+rem     compiler on PATH: Strawberry Perl's MinGW gcc (2026-10-31, the vendored
+rem     copy in ATK's test install), which could not link the DLL;
+rem   - a build\ whose cache names another compiler is started again. CMake
+rem     keeps the compiler it chose first for as long as build\ exists, so
+rem     that copy failed the same way on every update.
+if not exist build\CMakeCache.txt goto :cmake_configure
+findstr /r /i /c:"^CMAKE_C_COMPILER:[A-Z]*=" build\CMakeCache.txt >nul 2>nul
+if errorlevel 1 goto :cmake_configure
+findstr /r /i /c:"^CMAKE_C_COMPILER:[A-Z]*=.*cl\.exe" build\CMakeCache.txt >nul 2>nul
+if not errorlevel 1 goto :cmake_configure
+echo atkdsp: build\ was set up with another compiler, not MSVC - starting it again
+rd /s /q build
+:cmake_configure
+set "CC_ARG="
+if not exist build\CMakeCache.txt set "CC_ARG=-DCMAKE_C_COMPILER=cl"
+"%CMAKE%" -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release %CC_ARG% >nul 2>nul
 if errorlevel 1 (
   if exist build rd /s /q build
   "%CMAKE%" -S . -B build -DCMAKE_BUILD_TYPE=Release || exit /b 1

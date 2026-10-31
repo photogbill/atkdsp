@@ -1,5 +1,8 @@
 /* Identity, threads, allocation. */
 #include "internal.h"
+#if defined(_WIN32)
+#  include <malloc.h>                /* _aligned_malloc / _aligned_free */
+#endif
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -76,9 +79,13 @@ int atkdsp_get_threads(void) {
 #endif
 }
 
+/* Windows has no posix_memalign under ANY compiler: MinGW's gcc (Strawberry
+ * Perl's, found on PATH) failed to link with it (2026-10-31, a vendored build
+ * in ATK's test install). _aligned_malloc is in MSVC's and MinGW's runtime
+ * alike, so the test is _WIN32, not _MSC_VER. */
 void *atk_aligned_malloc(size_t bytes) {
     if (bytes == 0) bytes = 64;
-#ifdef _MSC_VER
+#if defined(_WIN32)
     return _aligned_malloc(bytes, 64);
 #else
     void *p = NULL;
@@ -89,7 +96,7 @@ void *atk_aligned_malloc(size_t bytes) {
 
 void atk_aligned_free(void *p) {
     if (!p) return;
-#ifdef _MSC_VER
+#if defined(_WIN32)
     _aligned_free(p);
 #else
     free(p);

@@ -5,6 +5,27 @@ what each ABI added, what it measured, and what it found. `ATKDSP_ABI_VERSION`
 in `include/atkdsp.h` bumps on any change to an existing function, and the
 Python binding refuses a mismatched library with a sentence.
 
+## v0.25.1 (ABI 26 — a fix, no ABI change)
+
+**The vendored build in ATK's test install could not link** (2026-10-31,
+`get_atkdsp.bat` from ATK's Optional components and its update: "did not
+finish the install — still missing atkdsp.dll"). Two causes, both fixed:
+- **The wrong compiler.** That copy's `build\` had been set up by CMake with
+  the first C compiler on PATH — Strawberry Perl's MinGW gcc, not MSVC — and
+  CMake keeps its first choice for as long as `build\` exists, so every update
+  failed the same way. `build.bat` now tells CMake to use `cl` when it sets up
+  a fresh `build\`, and starts `build\` again when its cache names another
+  compiler. A `build\` already on MSVC is left alone (no rebuild).
+- **`posix_memalign` on Windows.** `atk_aligned_malloc` chose
+  `_aligned_malloc` only for MSVC; under MinGW it called `posix_memalign`,
+  which Windows does not have — the link error in the log. It now uses
+  `_aligned_malloc` on every Windows compiler. Reproduced here with MinGW gcc
+  13 (the same undefined reference, at the same offset) and fixed: the DLL
+  links.
+
+The copy ATK loads on Bill's machine (`D:\Analyst_Toolkit\atkdsp`, built by
+`build.bat /only atkdsp` with MSVC) was never affected.
+
 ## v0.25.0 (ABI 26)
 
 **Analog video (`atkdsp_video`, header §32, twin `reference.py` §32, 51 tests
